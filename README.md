@@ -1,0 +1,19 @@
+# ZPL to PDF
+
+This project will hopefully eventually turn into a ZPL drawer into PDFs.  
+It is a mono repo with multiple packages, some of these might be useful for when
+you want to do anything with ZPLs.
+
+## Structure
+
+- ./zpl-tokenizer - A tokenizer built for lossy tokenization of the ZPL format
+
+## Todo
+
+- [x] ZPL tokenizer - A tokenizer for ZPL
+- [ ] ZPL Parser - A parser for ZPL which will take the tokens from the tokenizer
+and turn them into command specific structures.
+- [ ] PDF ZPL drawer - Draw ZPLs into a pdf file based on the commands from the parser.
+- [ ] REST api - REST api that uses above libraries to take in a ZPL and respond
+a PDF (goal: sub 15ms processing time).
+- [ ] CLI tool - Command Line Interface for turning ZPLs into PDFs.

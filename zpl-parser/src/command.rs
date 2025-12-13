@@ -7,7 +7,7 @@ pub enum Command {
     FieldOrigin {
         x: u32,
         y: u32,
-        justification: Justification,
+        justification: Option<Justification>,
     },
 
     LabelHome {
@@ -43,7 +43,7 @@ pub enum Command {
     FieldTypeset {
         x: u32,
         y: u32,
-        justification: Justification,
+        justification: Option<Justification>,
     },
 
     BarcodeFieldDefaults {
@@ -211,9 +211,8 @@ pub enum Orientation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Justification {
     Left,
-    Center,
     Right,
-    Justified,
+    Auto,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

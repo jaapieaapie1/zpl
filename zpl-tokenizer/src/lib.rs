@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
@@ -341,7 +341,12 @@ mod tests {
 
         assert_eq!(tokens.len(), 1);
         match &tokens[0] {
-            Token::Command { prefix, name, params, .. } => {
+            Token::Command {
+                prefix,
+                name,
+                params,
+                ..
+            } => {
                 assert_eq!(*prefix, CommandPrefix::Caret);
                 assert_eq!(*name, "FX");
                 assert_eq!(params.len(), 0);
@@ -357,7 +362,12 @@ mod tests {
 
         assert_eq!(tokens.len(), 1);
         match &tokens[0] {
-            Token::Command { prefix, name, params, .. } => {
+            Token::Command {
+                prefix,
+                name,
+                params,
+                ..
+            } => {
                 assert_eq!(*prefix, CommandPrefix::Caret);
                 assert_eq!(*name, "LT");
                 assert_eq!(params, &vec!["120"]);
@@ -373,7 +383,12 @@ mod tests {
 
         assert_eq!(tokens.len(), 1);
         match &tokens[0] {
-            Token::Command { prefix, name, params, .. } => {
+            Token::Command {
+                prefix,
+                name,
+                params,
+                ..
+            } => {
                 assert_eq!(*prefix, CommandPrefix::Caret);
                 assert_eq!(*name, "FO");
                 assert_eq!(params, &vec!["50", "173"]);
@@ -389,7 +404,12 @@ mod tests {
 
         assert_eq!(tokens.len(), 1);
         match &tokens[0] {
-            Token::Command { prefix, name, params, .. } => {
+            Token::Command {
+                prefix,
+                name,
+                params,
+                ..
+            } => {
                 assert_eq!(*prefix, CommandPrefix::Caret);
                 assert_eq!(*name, "FB");
                 assert_eq!(params, &vec!["542", "1", "0", "N", "0"]);
@@ -405,7 +425,12 @@ mod tests {
 
         assert_eq!(tokens.len(), 1);
         match &tokens[0] {
-            Token::Command { prefix, name, params, .. } => {
+            Token::Command {
+                prefix,
+                name,
+                params,
+                ..
+            } => {
                 assert_eq!(*prefix, CommandPrefix::Tilde);
                 assert_eq!(*name, "SD");
                 assert_eq!(params, &vec!["15"]);

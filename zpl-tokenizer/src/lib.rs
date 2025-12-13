@@ -86,19 +86,23 @@ impl<'a> Tokenizer<'a> {
 
     fn parse_command_name(&mut self) -> Option<&'a str> {
         let start = self.position;
-        let mut len = 0;
 
-        while len < 2 {
-            match self.peek() {
-                Some(c) if c.is_ascii_alphabetic() => {
-                    self.consume();
-                    len += 1;
-                }
-                _ => break,
+        if let Some(first_char) = self.peek()
+            && first_char.eq_ignore_ascii_case(&'A')
+        {
+            self.consume();
+            return Some(&self.input[start..self.position]);
+        }
+
+        while let Some(c) = self.peek() {
+            if c.is_ascii_alphabetic() {
+                self.consume();
+            } else {
+                break;
             }
         }
 
-        if len > 0 {
+        if self.position > start {
             Some(&self.input[start..self.position])
         } else {
             None

@@ -85,9 +85,7 @@ impl<'a> Parser<'a> {
             (CommandPrefix::Caret, "FT") => self.parse_field_typeset(params, span),
             (CommandPrefix::Caret, "LH") => self.parse_label_home(params, span),
 
-            (CommandPrefix::Caret, "A") | (CommandPrefix::Caret, name) if name.starts_with("A") => {
-                self.parse_font(name, params, span);
-            }
+            (CommandPrefix::Caret, "A") => self.parse_font(name, params, span),
         }
     }
 

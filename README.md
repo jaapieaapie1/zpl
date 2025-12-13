@@ -13,7 +13,10 @@ you want to do anything with ZPLs.
 - [x] ZPL tokenizer - A tokenizer for ZPL
 - [ ] ZPL Parser - A parser for ZPL which will take the tokens from the tokenizer
 and turn them into command specific structures.
+- [ ] ZPL State Machine - Stateful processor that tracks ZPL settings and defaults,
+converting parsed commands into renderer-agnostic draw operations.
 - [ ] PDF ZPL drawer - Draw ZPLs into a pdf file based on the commands from the parser.
 - [ ] REST api - REST api that uses above libraries to take in a ZPL and respond
-a PDF (goal: sub 15ms processing time).
+a PDF (goal: sub 15ms processing time). Could also expose draw operations as JSON
+for custom renderers.
 - [ ] CLI tool - Command Line Interface for turning ZPLs into PDFs.

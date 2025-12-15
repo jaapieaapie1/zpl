@@ -25,9 +25,9 @@ pub enum Command {
 
     Font {
         font: FontName,
-        orientation: Orientation,
-        height: u32,
-        width: u32,
+        orientation: Option<Orientation>,
+        height: Option<u32>,
+        width: Option<u32>,
     },
 
     ChangeFont {

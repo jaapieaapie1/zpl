@@ -16,6 +16,11 @@ pub enum ParseError {
     },
 
     InvalidOrientation,
+
+    InvalidJustification {
+        value: String,
+        span: Span,
+    },
 }
 
 impl Display for ParseError {
@@ -30,6 +35,13 @@ impl Display for ParseError {
                     f,
                     "Command ^{} missing required parameter '{}' at position {}-{}",
                     command, parameter, span.start, span.end
+                )
+            }
+            Self::InvalidJustification { value, span } => {
+                write!(
+                    f,
+                    "Invalid justification received, gotten {} at position {}-{}",
+                    value, span.start, span.end
                 )
             }
             _ => write!(f, "{:?}", self),

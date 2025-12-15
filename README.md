@@ -20,3 +20,14 @@ converting parsed commands into renderer-agnostic draw operations.
 a PDF (goal: sub 15ms processing time). Could also expose draw operations as JSON
 for custom renderers.
 - [ ] CLI tool - Command Line Interface for turning ZPLs into PDFs.
+
+## Design choices
+
+To keep a project like this maintainable we must have a clear seperation of concern.  
+To achieve this we split this project into multiple semi independent libraries.  
+Every library of the core pdf renderer is part of a pipeline which is the following:
+- tokenizer
+- parser
+- PDF renderer
+
+Each step in this pipeline may depend on the one before it. But must not expose anything of the previous step to the next step.

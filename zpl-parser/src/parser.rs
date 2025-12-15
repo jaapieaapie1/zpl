@@ -1,7 +1,7 @@
 use zpl_tokenizer::{CommandPrefix, Span, Token, Tokenizer};
 
 use crate::{
-    command::{Command, Justification},
+    command::{Command, FontName, Justification, Orientation},
     error::ParseError,
 };
 
@@ -96,7 +96,7 @@ impl<'a> Parser<'a> {
         let y = self.parse_u32_param(params, 0, "y", span)?;
 
         let justification = if params.len() >= 3 {
-            Some(self.parse_justification(params[2], span)?)
+            self.parse_justification(params[2], span)?
         } else {
             None
         };
@@ -115,7 +115,7 @@ impl<'a> Parser<'a> {
         let y = self.parse_u32_param(params, 0, "y", span)?;
 
         let justification = if params.len() >= 3 {
-            Some(self.parse_justification(params[2], span)?)
+            self.parse_justification(params[2], span)?
         } else {
             None
         };
@@ -136,12 +136,54 @@ impl<'a> Parser<'a> {
         Ok(Command::LabelHome { x, y })
     }
 
-    fn parse_justification(&self, s: &str, _span: Span) -> Result<Justification, ParseError> {
+    fn parse_font(&self, params: &[&str], span: Span) -> Result<Command, ParseError> {
+        // ^Afo,h,w
+        // This command is a weird, one, since the first argument (f) is written down like part of
+        // the command name and does not have a comma splitting it and the next argument
+        let first_param = params[0];
+    }
+
+    fn parse_font_name_orientation(
+        &self,
+        params: &[&str],
+        index: usize,
+        name: &'static str,
+        span: Span,
+    ) -> Result<(FontName, Option<Orientation>), ParseError> {
+        if index >= params.len() || params[index].is_empty() {
+            return Err(ParseError::MissingRequiredParameter {
+                command: "",
+                parameter: name,
+                span,
+            });
+        }
+
+        let param_chars = params[index].chars();
+
+        let Some(font_name) = param_chars.next() else {
+            return Err(ParseError::MissingRequiredParameter {
+                command: "",
+                parameter: name,
+                span,
+            });
+        };
+
+        let orientation = param_chars.next().map(|orientation_char| {
+            
+        })
+    }
+
+    fn parse_orientation(&self, s: &str) -> Result<Justification, ParseError> {
+
+    }
+
+    fn parse_justification(&self, s: &str, span: Span) -> Result<Option<Justification>, ParseError> {
         match s.to_uppercase().as_str() {
-            "0" | "L" => Ok(Justification::Left),
-            "1" | "R" => Ok(Justification::Right),
-            "2" | "A" => Ok(Justification::Auto),
-            _ => Ok(Justification::Left),
+            "0" | "L" => Ok(Some(Justification::Left)),
+            "1" | "R" => Ok(Some(Justification::Right)),
+            "2" | "A" => Ok(Some(Justification::Auto)),
+            "" => Ok(None),
+            _ => Err(ParseError::InvalidJustification { value: s.to_string(), span }),
         }
     }
 

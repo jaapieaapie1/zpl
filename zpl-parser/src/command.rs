@@ -15,12 +15,17 @@ pub enum Command {
         y: u32,
     },
 
+    LabelTop {
+        offset: i32,
+    },
+
     PrintWidth {
         width: u32,
     },
 
     LabelLength {
         length: u32,
+        apply_to_all_media: Option<bool>,
     },
 
     Font {
@@ -32,12 +37,20 @@ pub enum Command {
 
     ChangeFont {
         font: FontName,
-        height: u32,
-        width: u32,
+        height: Option<u32>,
+        width: Option<u32>,
     },
 
     FielData {
         data: String,
+    },
+
+    FieldBlock {
+        width: u32,
+        max_lines: u32,
+        line_spacing: i32,
+        justification: BlockJustification,
+        hanging_indent: u32,
     },
 
     FieldTypeset {
@@ -53,7 +66,7 @@ pub enum Command {
     },
 
     Code128 {
-        orientation: Orientation,
+        orientation: Option<Orientation>,
         height: Option<u32>,
         print_interpetation_line: bool,
         print_above: bool,
@@ -122,6 +135,10 @@ pub enum Command {
         value: i32,
     },
 
+    Comment {
+        text: String,
+    },
+
     Unknown {
         prefix: CommandPrefix,
         name: String,
@@ -176,6 +193,15 @@ pub enum DiagonalDirection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FontName {
     Font0,
+    Font1,
+    Font2,
+    Font3,
+    Font4,
+    Font5,
+    Font6,
+    Font7,
+    Font8,
+    Font9,
     FontA,
     FontB,
     FontC,
@@ -213,6 +239,14 @@ pub enum Justification {
     Left,
     Right,
     Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockJustification {
+    Left,
+    Center,
+    Right,
+    Justified,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

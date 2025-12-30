@@ -5,31 +5,31 @@ The responsibility of this module is to take the tokens from the ZPL tokenizer a
 To keep things simple, for now we will not be supporting the entire ZPL spec.  
 Most ZPL commands are rarely used and thus not very relevant for our rendering purposes.  
 For now we will support the following commands:
-- ^XA - Start indication
-- ^XZ - End indication
-- ^FS - Field Seperator
-- ^FO - Field origin
-- ^LH - Label Home
-- ^LT - Label Top
-- ^PW - Print Width
-- ^LL - Label Length
-- ^A - Font
-- ^CF - Change default font
-- ^FD - Field Data
-- ^FB - Field Block
-- ^GB - Graphic Box
-- ^GF - Graphic Field
-- ^BC - Code128 Barcode
-- ^BY - Barcode Field Default
-- ^BQ - QR Code
-- ^B3 - Code 39 Barcode
-- ^FT - Field Typeset
-- ^CI - Change International Font
-- ^PQ - Print quantity
-- ^MD - Media Darkness
-- ^FX - Comment
-- ^GC - Graphic Circle
-- ^GD - Graphic Diagonal Line
+- [x] ^XA - Start indication
+- [x] ^XZ - End indication
+- [x] ^FS - Field Seperator
+- [x] ^FO - Field origin
+- [x] ^LH - Label Home
+- [x] ^LT - Label Top
+- [x] ^PW - Print Width
+- [x] ^LL - Label Length
+- [x] ^A - Font
+- [x] ^CF - Change default font
+- [x] ^FD - Field Data
+- [x] ^FB - Field Block
+- [x] ^GB - Graphic Box
+- [x] ^GF - Graphic Field
+- [x] ^BC - Code128 Barcode
+- [x] ^BY - Barcode Field Default
+- [x] ^BQ - QR Code
+- [x] ^B3 - Code 39 Barcode
+- [x] ^FT - Field Typeset
+- [x] ^CI - Change International Font
+- [x] ^PQ - Print quantity
+- [x] ^MD - Media Darkness
+- [x] ^FX - Comment
+- [x] ^GC - Graphic Circle
+- [x] ^GD - Graphic Diagonal Line
 
 This list is semi ordered on priority.
 

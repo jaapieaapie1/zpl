@@ -21,6 +21,31 @@ pub enum ParseError {
         value: String,
         span: Span,
     },
+
+    InvalidYesNo {
+        value: String,
+        span: Span,
+    },
+
+    InvalidBlockJustification {
+        value: String,
+        span: Span,
+    },
+
+    InvalidLineColor {
+        value: String,
+        span: Span,
+    },
+
+    InvalidCompressionType {
+        value: String,
+        span: Span,
+    },
+
+    InvalidCode128Mode {
+        value: String,
+        span: Span,
+    },
 }
 
 impl Display for ParseError {

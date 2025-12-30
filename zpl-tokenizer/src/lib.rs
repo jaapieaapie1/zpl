@@ -87,18 +87,31 @@ impl<'a> Tokenizer<'a> {
     fn parse_command_name(&mut self) -> Option<&'a str> {
         let start = self.position;
 
-        if let Some(first_char) = self.peek()
-            && first_char.eq_ignore_ascii_case(&'A')
-        {
-            self.consume();
+        let first_char = self.peek()?;
+        self.consume();
+
+        if first_char.eq_ignore_ascii_case(&'A') {
             return Some(&self.input[start..self.position]);
         }
 
+        let mut char_count = 1;
         while let Some(c) = self.peek() {
-            if c.is_ascii_alphabetic() {
+            if c.is_ascii_alphabetic() && char_count < 2 {
                 self.consume();
+                char_count += 1;
             } else {
                 break;
+            }
+        }
+
+        if char_count > 0 {
+            let cmd_so_far = &self.input[start..self.position];
+            if cmd_so_far.eq_ignore_ascii_case("B") {
+                if let Some(c) = self.peek() {
+                    if c.is_ascii_digit() {
+                        self.consume();
+                    }
+                }
             }
         }
 
@@ -116,7 +129,6 @@ impl<'a> Tokenizer<'a> {
             self.skip_whitespace();
 
             let start = self.position;
-            let mut param_len = 0;
 
             while let Some(c) = self.peek() {
                 match c {
@@ -124,9 +136,7 @@ impl<'a> Tokenizer<'a> {
                         break;
                     }
                     '^' | '~' => {
-                        if param_len > 0 {
-                            params.push(&self.input[start..self.position]);
-                        }
+                        params.push(&self.input[start..self.position]);
                         return params;
                     }
                     c if c.is_whitespace() => {
@@ -134,14 +144,11 @@ impl<'a> Tokenizer<'a> {
                     }
                     _ => {
                         self.consume();
-                        param_len += 1;
                     }
                 }
             }
 
-            if param_len > 0 {
-                params.push(&self.input[start..self.position]);
-            }
+            params.push(&self.input[start..self.position]);
 
             self.skip_whitespace();
 
@@ -172,6 +179,21 @@ impl<'a> Tokenizer<'a> {
         } else {
             None
         }
+    }
+
+    fn parse_comment_text(&mut self) -> &'a str {
+        let start = self.position;
+
+        while !self.is_eof() {
+            if let Some(c) = self.peek() {
+                if c == '^' || c == '~' {
+                    break;
+                }
+            }
+            self.consume();
+        }
+
+        &self.input[start..self.position]
     }
 
     pub fn next_token(&mut self) -> Option<Token<'a>> {
@@ -236,6 +258,25 @@ impl<'a> Tokenizer<'a> {
                             end: self.position,
                         },
                     }
+                }
+            }
+
+            (CommandPrefix::Caret, "FX") => {
+                let comment_text = self.parse_comment_text();
+                let params = if comment_text.is_empty() {
+                    vec![]
+                } else {
+                    vec![comment_text]
+                };
+
+                Token::Command {
+                    prefix,
+                    name,
+                    params,
+                    span: Span {
+                        start,
+                        end: self.position,
+                    },
                 }
             }
 

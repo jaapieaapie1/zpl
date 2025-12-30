@@ -1,0 +1,13 @@
+[package]
+name = "zpl-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "zpl-cli"
+path = "src/main.rs"
+
+[dependencies]
+zpl-tokenizer = { path = "../zpl-tokenizer" }
+zpl-parser = { path = "../zpl-parser" }
+zpl-state-manager = { path = "../zpl-state-manager" }

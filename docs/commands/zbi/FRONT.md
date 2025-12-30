@@ -1,0 +1,119 @@
+# Front Panel Control
+
+
+```
+
+This example shows how to intercept front panel button presses and write to the display to create a simple
+menu. The buttons used in this demo are set up for a Z4M/Z6M, ZM400/ZM600, or RZ400/RZ600. This
+could be reconfigured to work with any other printer.
+
+
+**Example**
+
+
+This is an example of front panel control.
+
+```
+     1 REM This example shows how to override the functionality of the feed key
+     1 REM and use the front panel display to show a option list
+     AUTONUM 1,1
+     REM CLOSE ALL
+     DECLARE STRING OPTIONS$(5)
+     FOR I = 1 TO 5
+     LET OPTIONS$(I) = "Option " & STR$(I)
+     NEXT I
+     LET ZPLPORT = 1
+     OPEN #ZPLPORT: NAME "ZPL"
+     LET FEEDKEY  = 3
+     LET SELECTKEY = 10
+     LET PLUSKEY  = 6
+     LET MINUSKEY = 7
+     LET EXITKEY  = 9
+     LET TMP = REGISTEREVENT(FEEDKEY, 0, 1)
+     SUB NORMALLOOP
+     DO WHILE 1 = 1
+     LET EVT = HANDLEEVENT()
+     IF EVT = FEEDKEY THEN
+     LET INDEX = 1
+     GOSUB REGISTERKEYS
+     GOSUB SHOWMENU
+     GOTO FEEDLOOP
+     END IF
+     SLEEP 1
+     LOOP
+     SUB FEEDLOOP
+     DO WHILE 1 = 1
+     LET EVT = HANDLEEVENT()
+     IF EVT = FEEDKEY THEN
+     GOSUB RELEASEKEYS
+     GOSUB HIDEMENU
+     GOTO NORMALLOOP
+     ELSE IF EVT = SELECTKEY THEN
+     GOSUB HANDLEOPTION
+     ELSE IF EVT = PLUSKEY THEN
+     LET INDEX = INDEX + 1
+     IF INDEX > 5 THEN
+     LET INDEX = 1
+
+```
+
+597
+
+
+ZBI Commands
+
+```
+END IF
+
+GOSUB SHOWMENU
+ELSE IF EVT = MINUSKEY THEN
+LET INDEX = INDEX - 1
+IF INDEX < 1 THEN
+LET INDEX = 5
+END IF
+GOSUB SHOWMENU
+ELSE IF EVT = EXITKEY THEN
+GOSUB RELEASEKEYS
+GOSUB HIDEMENU
+GOTO NORMALLOOP
+END IF
+SLEEP 1
+LOOP
+REM ******** SUBROUTINE SHOWMENU ***
+SUB SHOWMENU
+LET LINE1$ = "FEED DISPLAY"
+LET LINE2$ = OPTIONS$(INDEX)
+GOSUB UPDATEDISPLAY
+RETURN
+REM ******** SUBROUTINE HIDEMENU ***
+SUB HIDEMENU
+LET LINE1$ = ""
+LET LINE2$ = ""
+GOSUB UPDATEDISPLAY
+RETURN
+SUB UPDATEDISPLAY
+LET A = SETVAR("device.frontpanel.line1",LINE1$)
+LET A = SETVAR("device.frontpanel.line2",LINE2$)
+RETURN
+SUB REGISTERKEYS
+LET TMP = REGISTEREVENT(SELECTKEY, 0, 1)
+LET TMP = REGISTEREVENT(PLUSKEY, 0, 1)
+LET TMP = REGISTEREVENT(MINUSKEY, 0, 1)
+LET TMP = REGISTEREVENT(EXITKEY, 0, 1)
+RETURN
+SUB RELEASEKEYS
+LET TMP = UNREGISTEREVENT(SELECTKEY)
+LET TMP = UNREGISTEREVENT(PLUSKEY)
+LET TMP = UNREGISTEREVENT(MINUSKEY)
+LET TMP = UNREGISTEREVENT(EXITKEY)
+RETURN
+SUB HANDLEOPTION
+PRINT #ZPLPORT: "^XA^FO100,100^A0N,100,100^FD"; OPTIONS$(INDEX);"^XZ"
+RETURN
+
+```
+
+598
+
+
+ZBI Commands

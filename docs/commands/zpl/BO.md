@@ -1,0 +1,57 @@
+# ^BO
+
+
+
+
+ZPL Commands
+
+
+The `^BO` command creates a two-dimensional matrix symbology made up of square modules arranged
+around a bulls-eye pattern at the center.
+
+
+**Aztec Bar Code Parameters**
+
+
+**NOTE:** The Aztec barcode works with firmware version V60.13.0.11A and V50.13.2 or later.
+
+
+**Format:** `^BOa,b,c,d,e,f,g`
+
+
+
+
+
+|Parameters|Details|
+|---|---|
+|`a =` orientation|**Values:**<br>`N =` normal<br>`R =` rotated<br>`I =` inverted 180 degrees<br>`B =` read from the bottom up, 270 degrees<br>**Default:** current`^FW` value|
+|`b =` magnification factor|**Values:** `1` to`10`<br>**Default:**<br>`1` on`150` dpi printers<br>`2` on`200` dpi printers<br>`3` on`300` dpi printers<br>`6` on`600` dpi printers|
+|`c =` extended channel<br>interpretation code<br>indicator|**Values:**<br>`Y =` if data contains ECICs<br>`N` = if data does not contain ECICs.<br>**Default:** `N`|
+|`d =` error control and<br>symbol size/type indicator|**Values:**<br>`0 =` default error correction level<br>`01` to`99 =` error correction percentage (minimum)<br>`101` to`104 =` 1 to 4-layer compact symbol<br>`201` to`232 =` 1 to 32-layer full-range symbol<br>`300 =` a simple Aztec “Rune”<br>**Default:** `0`|
+|`e =` menu symbol<br>indicator|**Values:**<br>`Y =` if this symbol is to be a menu (barcode reader initialization) symbol<br>`N =` if it is not a menu symbol<br>**Default:** `N`|
+|`f =` number of symbols<br>for structured append|**Values:** `1` through`26`<br>**Default:** `1`|
+
+
+124
+
+
+ZPL Commands
+
+
+
+|Parameters|Details|
+|---|---|
+|`g =` optional ID field for<br>structured append|The ID field is a text string with a 24-character maximum**Default:** no ID|
+
+
+**Example**
+
+
+
+
+
+This is an example of the `^B0` command:
+
+
+
+125

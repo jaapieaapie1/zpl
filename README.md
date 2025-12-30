@@ -29,6 +29,7 @@ Every library of the core pdf renderer is part of a pipeline which is the follow
 
 - tokenizer
 - parser
+- State manager
 - PDF renderer
 
 Each step in this pipeline may depend on the one before it. But must not expose anything of the previous step to the next step.

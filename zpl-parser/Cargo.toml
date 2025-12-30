@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 zpl-tokenizer = { path = "../zpl-tokenizer" }
+base64 = "0.22"
+flate2 = "1.0"

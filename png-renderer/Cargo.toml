@@ -1,0 +1,12 @@
+[package]
+name = "png-renderer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zpl-state-manager = { path = "../zpl-state-manager" }
+zpl-parser = { path = "../zpl-parser" }
+image = "0.25"
+imageproc = "0.25"
+qrcode = "0.14"
+ab_glyph = "0.2"

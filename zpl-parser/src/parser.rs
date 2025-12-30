@@ -369,10 +369,15 @@ impl<'a> Parser<'a> {
         let bytes_per_row = self.parse_u32_param(params, 3, "d", span)?;
 
         let data = if params.len() >= 5 {
-            match compression {
-                CompressionType::Ascii => self.decode_hex_data(params[4])?,
-                CompressionType::Binary | CompressionType::CompressedBinary => {
-                    params[4].as_bytes().to_vec()
+            // Check for Z64 compression format (:Z64:data:checksum)
+            if params[4].starts_with(":Z64:") || params[4].starts_with(":B64:") {
+                self.decode_z64_data(params[4])?
+            } else {
+                match compression {
+                    CompressionType::Ascii => self.decode_hex_data(params[4])?,
+                    CompressionType::Binary | CompressionType::CompressedBinary => {
+                        params[4].as_bytes().to_vec()
+                    }
                 }
             }
         } else {
@@ -402,6 +407,60 @@ impl<'a> Parser<'a> {
         }
 
         Ok(bytes)
+    }
+
+    fn decode_z64_data(&self, data: &str) -> Result<Vec<u8>, ParseError> {
+        use base64::{Engine as _, engine::general_purpose};
+
+        // Format is :Z64:base64data:checksum or :B64:base64data:checksum
+        let is_compressed = data.starts_with(":Z64:");
+
+        // Extract the base64 data between the markers
+        let start_marker = if is_compressed { ":Z64:" } else { ":B64:" };
+        let data_part = data.strip_prefix(start_marker)
+            .ok_or_else(|| ParseError::InvalidZ64Data {
+                message: "Missing Z64 or B64 prefix".to_string(),
+            })?;
+
+        // Split by the ending colon to separate data from checksum
+        let parts: Vec<&str> = data_part.split(':').collect();
+        if parts.is_empty() {
+            return Err(ParseError::InvalidZ64Data {
+                message: "Empty Z64 data".to_string(),
+            });
+        }
+
+        let base64_data = parts[0];
+
+        // Decode base64
+        let compressed_bytes = general_purpose::STANDARD
+            .decode(base64_data)
+            .map_err(|e| ParseError::InvalidZ64Data {
+                message: format!("Base64 decode error: {}", e),
+            })?;
+
+        // Decompress if Z64 (compressed), otherwise return as-is if B64 (uncompressed)
+        if is_compressed {
+            self.decompress_lz77(&compressed_bytes)
+        } else {
+            Ok(compressed_bytes)
+        }
+    }
+
+    fn decompress_lz77(&self, compressed: &[u8]) -> Result<Vec<u8>, ParseError> {
+        use flate2::read::ZlibDecoder;
+        use std::io::Read;
+
+        let mut decoder = ZlibDecoder::new(compressed);
+        let mut decompressed = Vec::new();
+
+        decoder
+            .read_to_end(&mut decompressed)
+            .map_err(|e| ParseError::InvalidZ64Data {
+                message: format!("ZLIB decompression error: {}", e),
+            })?;
+
+        Ok(decompressed)
     }
 
     fn parse_code128(&self, params: &[&str], span: Span) -> Result<Command, ParseError> {

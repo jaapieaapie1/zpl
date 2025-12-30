@@ -14,6 +14,7 @@ pub enum DrawInstruction {
         height: u32,
         width: u32,
         orientation: Orientation,
+        justification: Justification,
     },
     DrawBarcode {
         x: u32,
@@ -21,6 +22,7 @@ pub enum DrawInstruction {
         data: String,
         orientation: Orientation,
         height: u32,
+        module_width: u32,
         print_interpretation_line: bool,
         print_interpretation_line_above: bool,
         check_digit: bool,
@@ -33,6 +35,7 @@ pub enum DrawInstruction {
         orientation: Orientation,
         check_digit: bool,
         height: u32,
+        module_width: u32,
         print_interpretation_line: bool,
         print_interpretation_line_above: bool,
     },
@@ -162,6 +165,14 @@ impl StateManager {
         instructions
     }
 
+    /// Get label dimensions (width, height)
+    /// Returns default 4"x6" at 203 DPI if not set: (812, 1218)
+    pub fn get_label_dimensions(&self) -> (u32, u32) {
+        let width = self.print_width.unwrap_or(812);
+        let height = self.label_length.unwrap_or(1218);
+        (width, height)
+    }
+
     fn process_command(&mut self, command: Command) -> Option<DrawInstruction> {
         match command {
             Command::StartFormat => {
@@ -268,6 +279,7 @@ impl StateManager {
                         height: self.current_font_height,
                         width: self.current_font_width,
                         orientation: self.current_font_orientation,
+                        justification: self.field_justification,
                     })
                 } else {
                     None
@@ -283,6 +295,7 @@ impl StateManager {
                         data,
                         orientation: orientation.unwrap_or(Orientation::Normal),
                         height: height.unwrap_or(self.barcode_height),
+                        module_width: self.barcode_module_width,
                         print_interpretation_line: print_interpetation_line,
                         print_interpretation_line_above: print_above,
                         check_digit,
@@ -301,6 +314,7 @@ impl StateManager {
                         orientation,
                         check_digit,
                         height: height.unwrap_or(self.barcode_height),
+                        module_width: self.barcode_module_width,
                         print_interpretation_line: print_interpetation_line,
                         print_interpretation_line_above: print_above,
                     }
@@ -366,7 +380,14 @@ impl StateManager {
                 })
             }
 
-            Command::FieldTypeset { .. } => None,
+            Command::FieldTypeset { x, y, justification } => {
+                self.field_origin_x = x;
+                self.field_origin_y = y;
+                if let Some(j) = justification {
+                    self.field_justification = j;
+                }
+                None
+            }
             Command::PrintQuality { .. } => None,
             Command::Comment { .. } => None,
             Command::Unknown { .. } => None,

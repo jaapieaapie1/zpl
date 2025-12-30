@@ -46,6 +46,10 @@ pub enum ParseError {
         value: String,
         span: Span,
     },
+
+    InvalidZ64Data {
+        message: String,
+    },
 }
 
 impl Display for ParseError {

@@ -37,8 +37,8 @@ impl PngRenderer {
                 }
                 self.render_text(image, *x, *y, text, *height, *width, orientation, justification);
             }
-            DrawInstruction::DrawBarcode { x, y, data, orientation, height, module_width, .. } => {
-                self.render_code128(image, *x, *y, data, orientation, *height, *module_width);
+            DrawInstruction::DrawBarcode { x, y, data, orientation, height, module_width, wide_bar_ratio, .. } => {
+                self.render_code128(image, *x, *y, data, orientation, *height, *module_width, *wide_bar_ratio);
             }
             DrawInstruction::DrawCode39 { x, y, data, orientation, height, module_width, .. } => {
                 self.render_code39(image, *x, *y, data, *orientation, *height, *module_width);
@@ -46,11 +46,11 @@ impl PngRenderer {
             DrawInstruction::DrawQrCode { x, y, data, magnification, .. } => {
                 self.render_qr_code(image, *x, *y, data, *magnification);
             }
-            DrawInstruction::DrawBox { x, y, width, height, thickness, color, rounding } => {
+            DrawInstruction::DrawBox { x, y, width, height, thickness, color, rounding, reverse } => {
                 if self.debug {
                     self.draw_origin_cross(image, *x, *y, Rgb([0, 255, 0]));
                 }
-                self.render_box(image, *x, *y, *width, *height, *thickness, color, *rounding);
+                self.render_box(image, *x, *y, *width, *height, *thickness, color, *rounding, *reverse);
             }
             DrawInstruction::DrawCircle { x, y, diameter, thickness, color } => {
                 self.render_circle(image, *x, *y, *diameter, *thickness, color);
@@ -68,7 +68,7 @@ impl PngRenderer {
     }
 
     fn render_text(&self, image: &mut RgbImage, x: u32, y: u32, text: &str, height: u32, _width: u32, orientation: &Orientation, justification: &Justification) {
-        let font_data = include_bytes!("../fonts/RobotoMono-VariableFont_wght.ttf");
+        let font_data = include_bytes!("../fonts/ATTriumvirate-BoldCd.otf");
         let font = FontRef::try_from_slice(font_data).expect("Error loading font");
 
         let scale = PxScale::from(height as f32);
@@ -174,24 +174,56 @@ impl PngRenderer {
         }
     }
 
-    fn render_code128(&self, image: &mut RgbImage, x: u32, y: u32, data: &str, orientation: &Orientation, height: u32, module_width: u32) {
-        let bar_width = module_width.max(1);
-        let num_bars = data.len() * 11;
-        let barcode_width = num_bars as u32 * bar_width;
+    fn render_code128(&self, image: &mut RgbImage, x: u32, y: u32, data: &str, orientation: &Orientation, height: u32, module_width: u32, wide_bar_ratio: f32) {
+        let cleaned_data = data
+            .replace(">:", "")
+            .replace(">5", "")
+            .replace(">6", "")
+            .replace(">7", "")
+            .replace(">8", "");
 
+        let bar_width = module_width.max(1);
+        let mut pattern = Vec::new();
+
+        pattern.extend_from_slice(&[2, 1, 2, 2, 2, 2]);
+
+        for ch in cleaned_data.chars() {
+            let patterns = match ch {
+                '0' => [2, 1, 2, 2, 2, 2],
+                '1' => [2, 2, 2, 1, 2, 2],
+                '2' => [2, 2, 2, 2, 2, 1],
+                '3' => [1, 2, 1, 2, 2, 3],
+                '4' => [1, 2, 1, 3, 2, 2],
+                '5' => [1, 3, 1, 2, 2, 2],
+                '6' => [1, 2, 2, 2, 1, 3],
+                '7' => [1, 2, 2, 3, 1, 2],
+                '8' => [1, 3, 2, 2, 1, 2],
+                '9' => [3, 1, 1, 2, 2, 2],
+                _ => [2, 1, 2, 2, 2, 2],
+            };
+            pattern.extend_from_slice(&patterns);
+        }
+
+        pattern.extend_from_slice(&[2, 3, 3, 1, 1, 1, 2]);
+
+        let barcode_width: u32 = pattern.iter().map(|&w| w * bar_width).sum();
         let mut temp_image: RgbImage = ImageBuffer::from_pixel(barcode_width, height, Rgb([255, 255, 255]));
 
-        for i in 0..num_bars {
-            if i % 2 == 0 {
-                for w in 0..bar_width {
-                    let offset = (i as u32 * bar_width) + w;
+        let mut x_pos = 0;
+        for (i, &width) in pattern.iter().enumerate() {
+            let is_bar = i % 2 == 0;
+            let pixel_width = width * bar_width;
+
+            if is_bar {
+                for w in 0..pixel_width {
                     for h in 0..height {
-                        if offset < barcode_width {
-                            temp_image.put_pixel(offset, h, Rgb([0, 0, 0]));
+                        if x_pos + w < barcode_width {
+                            temp_image.put_pixel(x_pos + w, h, Rgb([0, 0, 0]));
                         }
                     }
                 }
             }
+            x_pos += pixel_width;
         }
 
         match orientation {
@@ -208,25 +240,34 @@ impl PngRenderer {
             }
             Orientation::Rotated270 => {
                 let rotated = image::imageops::rotate270(&temp_image);
-                self.overlay_image(image, &rotated, x, y);
+                let adjusted_x = x.saturating_sub(rotated.width());
+                let adjusted_y = y.saturating_sub(rotated.height());
+                self.overlay_image(image, &rotated, adjusted_x, adjusted_y);
             }
         }
     }
 
     fn render_code39(&self, image: &mut RgbImage, x: u32, y: u32, data: &str, orientation: Orientation, height: u32, module_width: u32) {
+        use barcoders::sym::code39::Code39;
+
+        let barcode = match Code39::new(data) {
+            Ok(bc) => bc,
+            Err(_) => return,
+        };
+
+        let encoded = barcode.encode();
         let bar_width = module_width.max(1);
-        let num_bars = data.len() * 13;
-        let barcode_width = num_bars as u32 * bar_width;
+        let barcode_width = encoded.len() * bar_width as usize;
 
-        let mut temp_image: RgbImage = ImageBuffer::from_pixel(barcode_width, height, Rgb([255, 255, 255]));
+        let mut temp_image: RgbImage = ImageBuffer::from_pixel(barcode_width as u32, height, Rgb([255, 255, 255]));
 
-        for i in 0..num_bars {
-            if i % 3 != 0 {
+        for (i, &byte) in encoded.iter().enumerate() {
+            if byte == 1 {
                 for w in 0..bar_width {
-                    let offset = (i as u32 * bar_width) + w;
-                    for h in 0..height {
-                        if offset < barcode_width {
-                            temp_image.put_pixel(offset, h, Rgb([0, 0, 0]));
+                    let x_pos = (i * bar_width as usize) + w as usize;
+                    if x_pos < barcode_width {
+                        for h in 0..height {
+                            temp_image.put_pixel(x_pos as u32, h, Rgb([0, 0, 0]));
                         }
                     }
                 }
@@ -247,7 +288,9 @@ impl PngRenderer {
             }
             Orientation::Rotated270 => {
                 let rotated = image::imageops::rotate270(&temp_image);
-                self.overlay_image(image, &rotated, x, y);
+                let adjusted_x = x.saturating_sub(rotated.width());
+                let adjusted_y = y.saturating_sub(rotated.height());
+                self.overlay_image(image, &rotated, adjusted_x, adjusted_y);
             }
         }
     }
@@ -271,13 +314,30 @@ impl PngRenderer {
         }
     }
 
-    fn render_box(&self, image: &mut RgbImage, x: u32, y: u32, width: u32, height: u32, thickness: u32, color: &LineColor, rounding: u32) {
-        let rgb_color = self.line_color_to_rgb(color);
+    fn render_box(&self, image: &mut RgbImage, x: u32, y: u32, width: u32, height: u32, thickness: u32, color: &LineColor, rounding: u32, reverse: bool) {
+        if reverse {
+            for py in y..(y + height).min(image.height()) {
+                for px in x..(x + width).min(image.width()) {
+                    let pixel = image.get_pixel(px, py);
+                    let inverted = Rgb([255 - pixel[0], 255 - pixel[1], 255 - pixel[2]]);
+                    image.put_pixel(px, py, inverted);
+                }
+            }
+        } else {
+            let rgb_color = self.line_color_to_rgb(color);
 
-        for t in 0..thickness {
-            let rect = imageproc::rect::Rect::at(x as i32 + t as i32, y as i32 + t as i32)
-                .of_size(width.saturating_sub(2 * t), height.saturating_sub(2 * t));
-            drawing::draw_hollow_rect_mut(image, rect, rgb_color);
+            for t in 0..thickness {
+                let new_width = width.saturating_sub(2 * t);
+                let new_height = height.saturating_sub(2 * t);
+
+                if new_width == 0 || new_height == 0 {
+                    break;
+                }
+
+                let rect = imageproc::rect::Rect::at(x as i32 + t as i32, y as i32 + t as i32)
+                    .of_size(new_width, new_height);
+                drawing::draw_hollow_rect_mut(image, rect, rgb_color);
+            }
         }
     }
 

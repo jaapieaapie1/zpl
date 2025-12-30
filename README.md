@@ -11,9 +11,9 @@ you want to do anything with ZPLs.
 ## Todo
 
 - [x] ZPL tokenizer - A tokenizer for ZPL
-- [ ] ZPL Parser - A parser for ZPL which will take the tokens from the tokenizer
+- [x] ZPL Parser - A parser for ZPL which will take the tokens from the tokenizer
 and turn them into command specific structures.
-- [ ] ZPL State Machine - Stateful processor that tracks ZPL settings and defaults,
+- [x] ZPL State Machine - Stateful processor that tracks ZPL settings and defaults,
 converting parsed commands into renderer-agnostic draw operations.
 - [ ] PDF ZPL drawer - Draw ZPLs into a pdf file based on the commands from the parser.
 - [ ] REST api - REST api that uses above libraries to take in a ZPL and respond
@@ -26,6 +26,7 @@ for custom renderers.
 To keep a project like this maintainable we must have a clear seperation of concern.  
 To achieve this we split this project into multiple semi independent libraries.  
 Every library of the core pdf renderer is part of a pipeline which is the following:
+
 - tokenizer
 - parser
 - PDF renderer

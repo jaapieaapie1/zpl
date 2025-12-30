@@ -165,8 +165,6 @@ impl StateManager {
         instructions
     }
 
-    /// Get label dimensions (width, height)
-    /// Returns default 4"x6" at 203 DPI if not set: (812, 1218)
     pub fn get_label_dimensions(&self) -> (u32, u32) {
         let width = self.print_width.unwrap_or(812);
         let height = self.label_length.unwrap_or(1218);

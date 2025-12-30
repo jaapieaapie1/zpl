@@ -27,8 +27,6 @@ fn main() {
     let mut state_manager = StateManager::new();
     let draw_instructions = state_manager.process(commands);
 
-    // Get label dimensions from ZPL commands (^PW and ^LL)
-    // Falls back to 4" x 6" at 203 DPI if not specified
     let (width, height) = state_manager.get_label_dimensions();
 
     let renderer = if debug {

@@ -33,7 +33,7 @@ impl PngRenderer {
         match instruction {
             DrawInstruction::DrawText { x, y, text, height, width, orientation, justification, .. } => {
                 if self.debug {
-                    self.draw_origin_cross(image, *x, *y, Rgb([255, 0, 0])); // Red cross for text origin
+                    self.draw_origin_cross(image, *x, *y, Rgb([255, 0, 0]));
                 }
                 self.render_text(image, *x, *y, text, *height, *width, orientation, justification);
             }
@@ -48,7 +48,7 @@ impl PngRenderer {
             }
             DrawInstruction::DrawBox { x, y, width, height, thickness, color, rounding } => {
                 if self.debug {
-                    self.draw_origin_cross(image, *x, *y, Rgb([0, 255, 0])); // Green cross for box origin
+                    self.draw_origin_cross(image, *x, *y, Rgb([0, 255, 0]));
                 }
                 self.render_box(image, *x, *y, *width, *height, *thickness, color, *rounding);
             }
@@ -60,7 +60,7 @@ impl PngRenderer {
             }
             DrawInstruction::DrawGraphicField { x, y, bytes_per_row, data, .. } => {
                 if self.debug {
-                    self.draw_origin_cross(image, *x, *y, Rgb([0, 0, 255])); // Blue cross for graphic field origin
+                    self.draw_origin_cross(image, *x, *y, Rgb([0, 0, 255]));
                 }
                 self.render_graphic_field(image, *x, *y, *bytes_per_row, data);
             }
@@ -68,7 +68,6 @@ impl PngRenderer {
     }
 
     fn render_text(&self, image: &mut RgbImage, x: u32, y: u32, text: &str, height: u32, _width: u32, orientation: &Orientation, justification: &Justification) {
-        // Load the embedded Roboto Mono font
         let font_data = include_bytes!("../fonts/RobotoMono-VariableFont_wght.ttf");
         let font = FontRef::try_from_slice(font_data).expect("Error loading font");
 
@@ -77,7 +76,6 @@ impl PngRenderer {
 
         match orientation {
             Orientation::Normal => {
-                // Normal text (horizontal, left to right)
                 let text_width = self.estimate_text_width(&font, scale, text);
                 let adjusted_x = match justification {
                     Justification::Left => x,
@@ -87,19 +85,15 @@ impl PngRenderer {
                 drawing::draw_text_mut(image, color, adjusted_x as i32, y as i32, scale, &font, text);
             }
             Orientation::Rotated90 => {
-                // Rotated 90 degrees clockwise (vertical, bottom to top)
-                // Create a temporary image for the text
                 let text_width = self.estimate_text_width(&font, scale, text);
-                let text_height = height * 2; // Give extra space for descenders
+                let text_height = height * 2;
 
                 if text_width > 0 && text_height > 0 {
                     let mut temp_image: RgbImage = ImageBuffer::from_pixel(text_width, text_height, Rgb([255, 255, 255]));
                     drawing::draw_text_mut(&mut temp_image, color, 0, 0, scale, &font, text);
 
-                    // Rotate 90 degrees and draw onto main image
                     let rotated = image::imageops::rotate90(&temp_image);
 
-                    // Justification affects X axis even for rotated text (relative to field origin)
                     let adjusted_x = match justification {
                         Justification::Left => x,
                         Justification::Right => x.saturating_sub(rotated.width()),
@@ -109,7 +103,6 @@ impl PngRenderer {
                 }
             }
             Orientation::Rotated180 => {
-                // Rotated 180 degrees (upside down)
                 let text_width = self.estimate_text_width(&font, scale, text);
                 let text_height = height * 2;
 
@@ -117,10 +110,8 @@ impl PngRenderer {
                     let mut temp_image: RgbImage = ImageBuffer::from_pixel(text_width, text_height, Rgb([255, 255, 255]));
                     drawing::draw_text_mut(&mut temp_image, color, 0, 0, scale, &font, text);
 
-                    // Rotate 180 degrees and draw onto main image
                     let rotated = image::imageops::rotate180(&temp_image);
 
-                    // Apply justification (flipped for 180° rotation)
                     let adjusted_x = match justification {
                         Justification::Left => x,
                         Justification::Right => x.saturating_sub(text_width),
@@ -130,19 +121,15 @@ impl PngRenderer {
                 }
             }
             Orientation::Rotated270 => {
-                // Rotated 270 degrees clockwise (vertical, bottom to top)
                 let text_width = self.estimate_text_width(&font, scale, text);
-                let text_height = height + 10; // Use font height plus small padding
+                let text_height = height + 10;
 
                 if text_width > 0 && text_height > 0 {
                     let mut temp_image: RgbImage = ImageBuffer::from_pixel(text_width, text_height, Rgb([255, 255, 255]));
                     drawing::draw_text_mut(&mut temp_image, color, 0, 0, scale, &font, text);
 
-                    // Rotate 270 degrees and draw onto main image
                     let rotated = image::imageops::rotate270(&temp_image);
 
-                    // For Rotated270, origin should be at bottom-right of the rendered text
-                    // Text extends upward (negative Y) and based on justification
                     let adjusted_x = match justification {
                         Justification::Left => x.saturating_sub(rotated.width()),
                         Justification::Right => x,
@@ -171,7 +158,7 @@ impl PngRenderer {
             width += scaled_font.h_advance(glyph_id);
         }
 
-        width.ceil() as u32 + 10 // Add some padding
+        width.ceil() as u32 + 10
     }
 
     fn overlay_image(&self, target: &mut RgbImage, source: &RgbImage, x: u32, y: u32) {
@@ -180,7 +167,6 @@ impl PngRenderer {
             let target_y = y + src_y;
 
             if target_x < target.width() && target_y < target.height() {
-                // Only copy non-white pixels (transparent background)
                 if pixel[0] < 250 || pixel[1] < 250 || pixel[2] < 250 {
                     target.put_pixel(target_x, target_y, *pixel);
                 }
@@ -189,13 +175,10 @@ impl PngRenderer {
     }
 
     fn render_code128(&self, image: &mut RgbImage, x: u32, y: u32, data: &str, orientation: &Orientation, height: u32, module_width: u32) {
-        // Simple barcode rendering - just draw vertical lines
-        // In a real implementation, you would use a barcode library to encode the data
         let bar_width = module_width.max(1);
-        let num_bars = data.len() * 11; // Rough approximation
+        let num_bars = data.len() * 11;
         let barcode_width = num_bars as u32 * bar_width;
 
-        // Create barcode on temporary image
         let mut temp_image: RgbImage = ImageBuffer::from_pixel(barcode_width, height, Rgb([255, 255, 255]));
 
         for i in 0..num_bars {
@@ -211,7 +194,6 @@ impl PngRenderer {
             }
         }
 
-        // Rotate and position based on orientation
         match orientation {
             Orientation::Normal => {
                 self.overlay_image(image, &temp_image, x, y);
@@ -225,7 +207,6 @@ impl PngRenderer {
                 self.overlay_image(image, &rotated, x, y);
             }
             Orientation::Rotated270 => {
-                // 270° rotation (bottom to top)
                 let rotated = image::imageops::rotate270(&temp_image);
                 self.overlay_image(image, &rotated, x, y);
             }
@@ -233,12 +214,10 @@ impl PngRenderer {
     }
 
     fn render_code39(&self, image: &mut RgbImage, x: u32, y: u32, data: &str, orientation: Orientation, height: u32, module_width: u32) {
-        // Simple barcode rendering similar to Code128
         let bar_width = module_width.max(1);
-        let num_bars = data.len() * 13; // Code39 has wider encoding
+        let num_bars = data.len() * 13;
         let barcode_width = num_bars as u32 * bar_width;
 
-        // Create barcode on temporary image
         let mut temp_image: RgbImage = ImageBuffer::from_pixel(barcode_width, height, Rgb([255, 255, 255]));
 
         for i in 0..num_bars {
@@ -254,7 +233,6 @@ impl PngRenderer {
             }
         }
 
-        // Rotate and position based on orientation
         match orientation {
             Orientation::Normal => {
                 self.overlay_image(image, &temp_image, x, y);
@@ -268,7 +246,6 @@ impl PngRenderer {
                 self.overlay_image(image, &rotated, x, y);
             }
             Orientation::Rotated270 => {
-                // 270° rotation (bottom to top)
                 let rotated = image::imageops::rotate270(&temp_image);
                 self.overlay_image(image, &rotated, x, y);
             }
@@ -283,7 +260,6 @@ impl PngRenderer {
                 .min_dimensions(magnification, magnification)
                 .build();
 
-            // Copy QR code onto the main image
             for (qr_x, qr_y, pixel) in qr_image.enumerate_pixels() {
                 let target_x = x + qr_x;
                 let target_y = y + qr_y;
@@ -298,21 +274,10 @@ impl PngRenderer {
     fn render_box(&self, image: &mut RgbImage, x: u32, y: u32, width: u32, height: u32, thickness: u32, color: &LineColor, rounding: u32) {
         let rgb_color = self.line_color_to_rgb(color);
 
-        if rounding == 0 {
-            // Draw rectangle with thickness
-            for t in 0..thickness {
-                let rect = imageproc::rect::Rect::at(x as i32 + t as i32, y as i32 + t as i32)
-                    .of_size(width.saturating_sub(2 * t), height.saturating_sub(2 * t));
-                drawing::draw_hollow_rect_mut(image, rect, rgb_color);
-            }
-        } else {
-            // For rounded corners, draw a simple rectangle for now
-            // A full implementation would draw rounded corners
-            for t in 0..thickness {
-                let rect = imageproc::rect::Rect::at(x as i32 + t as i32, y as i32 + t as i32)
-                    .of_size(width.saturating_sub(2 * t), height.saturating_sub(2 * t));
-                drawing::draw_hollow_rect_mut(image, rect, rgb_color);
-            }
+        for t in 0..thickness {
+            let rect = imageproc::rect::Rect::at(x as i32 + t as i32, y as i32 + t as i32)
+                .of_size(width.saturating_sub(2 * t), height.saturating_sub(2 * t));
+            drawing::draw_hollow_rect_mut(image, rect, rgb_color);
         }
     }
 
@@ -350,7 +315,6 @@ impl PngRenderer {
     }
 
     fn render_graphic_field(&self, image: &mut RgbImage, x: u32, y: u32, bytes_per_row: u32, data: &[u8]) {
-        // Calculate dimensions
         let width = bytes_per_row * 8;
         let height = if bytes_per_row > 0 {
             (data.len() as u32) / bytes_per_row
@@ -362,10 +326,8 @@ impl PngRenderer {
             return;
         }
 
-        // Create temporary image to draw the bitmap
         let mut temp_image: RgbImage = ImageBuffer::from_pixel(width, height, Rgb([255, 255, 255]));
 
-        // Render bitmap data to temp image
         let mut byte_idx = 0;
         let mut current_y = 0;
 
@@ -388,12 +350,10 @@ impl PngRenderer {
             current_y += 1;
         }
 
-        // Draw debug bounding box if debug mode is enabled
         if self.debug {
             self.draw_debug_box(image, x, y, temp_image.width(), temp_image.height(), Rgb([0, 0, 255]));
         }
 
-        // Overlay image onto main image (no rotation)
         self.overlay_image(image, &temp_image, x, y);
     }
 
@@ -432,7 +392,6 @@ impl PngRenderer {
     }
 
     fn draw_debug_box(&self, image: &mut RgbImage, x: u32, y: u32, width: u32, height: u32, color: Rgb<u8>) {
-        // Draw a thin rectangle outline
         let rect = imageproc::rect::Rect::at(x as i32, y as i32).of_size(width, height);
         drawing::draw_hollow_rect_mut(image, rect, color);
     }

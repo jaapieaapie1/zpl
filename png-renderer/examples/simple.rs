@@ -1,9 +1,8 @@
 use png_renderer::PngRenderer;
+use zpl_parser::command::{FontName, LineColor, Orientation};
 use zpl_state_manager::DrawInstruction;
-use zpl_parser::command::{FontName, Orientation, LineColor};
 
 fn main() {
-    // Create some simple draw instructions manually
     let instructions = vec![
         DrawInstruction::DrawBox {
             x: 100,
@@ -32,13 +31,10 @@ fn main() {
         },
     ];
 
-    // Create renderer with standard 4x6 label size at 203 DPI
     let renderer = PngRenderer::new(812, 1218);
 
-    // Render to image
     let image = renderer.render(&instructions);
 
-    // Save to file
     match png_renderer::save_png(&image, "simple_example.png") {
         Ok(_) => println!("PNG saved to simple_example.png"),
         Err(e) => eprintln!("Error saving PNG: {:?}", e),

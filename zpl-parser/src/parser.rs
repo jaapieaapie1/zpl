@@ -94,6 +94,7 @@ impl<'a> Parser<'a> {
             (CommandPrefix::Caret, "FO") => self.parse_field_origin(params, span),
             (CommandPrefix::Caret, "FT") => self.parse_field_typeset(params, span),
             (CommandPrefix::Caret, "FB") => self.parse_field_block(params, span),
+            (CommandPrefix::Caret, "FR") => Ok(Command::FieldReverse),
             (CommandPrefix::Caret, "LH") => self.parse_label_home(params, span),
             (CommandPrefix::Caret, "LT") => self.parse_label_top(params, span),
             (CommandPrefix::Caret, "PW") => self.parse_print_width(params, span),

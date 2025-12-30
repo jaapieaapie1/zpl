@@ -23,6 +23,7 @@ pub enum DrawInstruction {
         orientation: Orientation,
         height: u32,
         module_width: u32,
+        wide_bar_ratio: f32,
         print_interpretation_line: bool,
         print_interpretation_line_above: bool,
         check_digit: bool,
@@ -57,6 +58,7 @@ pub enum DrawInstruction {
         thickness: u32,
         color: LineColor,
         rounding: u32,
+        reverse: bool,
     },
     DrawCircle {
         x: u32,
@@ -115,6 +117,37 @@ pub struct StateManager {
     field_block_hanging_indent: u32,
 
     pending_field_data: Option<String>,
+    pending_field_mode: FieldMode,
+    field_reverse: bool,
+}
+
+#[derive(Debug, Clone)]
+enum FieldMode {
+    Text,
+    Code128 {
+        orientation: Orientation,
+        height: u32,
+        print_interpretation_line: bool,
+        print_interpretation_line_above: bool,
+        check_digit: bool,
+        mode: Code128Mode,
+        module_width: u32,
+        wide_bar_ratio: f32,
+    },
+    Code39 {
+        orientation: Orientation,
+        check_digit: bool,
+        height: u32,
+        print_interpretation_line: bool,
+        print_interpretation_line_above: bool,
+    },
+    QrCode {
+        orientation: Orientation,
+        model: QrModel,
+        magnification: u32,
+        error_correction: QrErrorCorrection,
+        mask: Option<u32>,
+    },
 }
 
 impl StateManager {
@@ -150,6 +183,8 @@ impl StateManager {
             field_block_hanging_indent: 0,
 
             pending_field_data: None,
+            pending_field_mode: FieldMode::Text,
+            field_reverse: false,
         }
     }
 
@@ -268,73 +303,123 @@ impl StateManager {
             }
 
             Command::FieldSeperator => {
-                if let Some(data) = self.pending_field_data.take() {
-                    Some(DrawInstruction::DrawText {
-                        x: self.label_home_x + self.field_origin_x,
-                        y: self.label_home_y + self.field_origin_y,
+                let data = self.pending_field_data.take()?;
+                let x = self.label_home_x + self.field_origin_x;
+                let y = self.label_home_y + self.field_origin_y;
+
+                let instruction = match &self.pending_field_mode {
+                    FieldMode::Text => DrawInstruction::DrawText {
+                        x,
+                        y,
                         text: data,
                         font: self.current_font,
                         height: self.current_font_height,
                         width: self.current_font_width,
                         orientation: self.current_font_orientation,
                         justification: self.field_justification,
-                    })
-                } else {
-                    None
-                }
-            }
-
-            Command::Code128 { orientation, height, print_interpetation_line,
-                              print_above, check_digit, mode } => {
-                self.pending_field_data.take().map(|data| {
-                    DrawInstruction::DrawBarcode {
-                        x: self.label_home_x + self.field_origin_x,
-                        y: self.label_home_y + self.field_origin_y,
-                        data,
-                        orientation: orientation.unwrap_or(Orientation::Normal),
-                        height: height.unwrap_or(self.barcode_height),
-                        module_width: self.barcode_module_width,
-                        print_interpretation_line: print_interpetation_line,
-                        print_interpretation_line_above: print_above,
+                    },
+                    FieldMode::Code128 {
+                        orientation,
+                        height,
+                        print_interpretation_line,
+                        print_interpretation_line_above,
                         check_digit,
                         mode,
-                    }
-                })
-            }
-
-            Command::Code39 { orientation, check_digit, height,
-                             print_interpetation_line, print_above } => {
-                self.pending_field_data.take().map(|data| {
-                    DrawInstruction::DrawCode39 {
-                        x: self.label_home_x + self.field_origin_x,
-                        y: self.label_home_y + self.field_origin_y,
+                        module_width,
+                        wide_bar_ratio,
+                    } => DrawInstruction::DrawBarcode {
+                        x,
+                        y,
                         data,
+                        orientation: *orientation,
+                        height: *height,
+                        module_width: *module_width,
+                        wide_bar_ratio: *wide_bar_ratio,
+                        print_interpretation_line: *print_interpretation_line,
+                        print_interpretation_line_above: *print_interpretation_line_above,
+                        check_digit: *check_digit,
+                        mode: *mode,
+                    },
+                    FieldMode::Code39 {
                         orientation,
                         check_digit,
-                        height: height.unwrap_or(self.barcode_height),
-                        module_width: self.barcode_module_width,
-                        print_interpretation_line: print_interpetation_line,
-                        print_interpretation_line_above: print_above,
-                    }
-                })
-            }
-
-            Command::QrCode { orientation, model, magnification, error_correction, mask } => {
-                self.pending_field_data.take().map(|data| {
-                    DrawInstruction::DrawQrCode {
-                        x: self.label_home_x + self.field_origin_x,
-                        y: self.label_home_y + self.field_origin_y,
+                        height,
+                        print_interpretation_line,
+                        print_interpretation_line_above,
+                    } => DrawInstruction::DrawCode39 {
+                        x,
+                        y,
                         data,
+                        orientation: *orientation,
+                        check_digit: *check_digit,
+                        height: *height,
+                        module_width: self.barcode_module_width,
+                        print_interpretation_line: *print_interpretation_line,
+                        print_interpretation_line_above: *print_interpretation_line_above,
+                    },
+                    FieldMode::QrCode {
                         orientation,
                         model,
                         magnification,
                         error_correction,
                         mask,
-                    }
-                })
+                    } => DrawInstruction::DrawQrCode {
+                        x,
+                        y,
+                        data,
+                        orientation: *orientation,
+                        model: *model,
+                        magnification: *magnification,
+                        error_correction: *error_correction,
+                        mask: *mask,
+                    },
+                };
+
+                self.pending_field_mode = FieldMode::Text;
+                Some(instruction)
+            }
+
+            Command::Code128 { orientation, height, print_interpetation_line,
+                              print_above, check_digit, mode } => {
+                self.pending_field_mode = FieldMode::Code128 {
+                    orientation: orientation.unwrap_or(Orientation::Normal),
+                    height: height.unwrap_or(self.barcode_height),
+                    print_interpretation_line: print_interpetation_line,
+                    print_interpretation_line_above: print_above,
+                    check_digit,
+                    mode,
+                    module_width: self.barcode_module_width,
+                    wide_bar_ratio: self.barcode_wide_bar_ratio,
+                };
+                None
+            }
+
+            Command::Code39 { orientation, check_digit, height,
+                             print_interpetation_line, print_above } => {
+                self.pending_field_mode = FieldMode::Code39 {
+                    orientation,
+                    check_digit,
+                    height: height.unwrap_or(self.barcode_height),
+                    print_interpretation_line: print_interpetation_line,
+                    print_interpretation_line_above: print_above,
+                };
+                None
+            }
+
+            Command::QrCode { orientation, model, magnification, error_correction, mask } => {
+                self.pending_field_mode = FieldMode::QrCode {
+                    orientation,
+                    model,
+                    magnification,
+                    error_correction,
+                    mask,
+                };
+                None
             }
 
             Command::GraphicBox { width, height, thickness, line_color, rounding } => {
+                let reverse = self.field_reverse;
+                self.field_reverse = false;
                 Some(DrawInstruction::DrawBox {
                     x: self.label_home_x + self.field_origin_x,
                     y: self.label_home_y + self.field_origin_y,
@@ -343,6 +428,7 @@ impl StateManager {
                     thickness,
                     color: line_color,
                     rounding,
+                    reverse,
                 })
             }
 
@@ -386,6 +472,12 @@ impl StateManager {
                 }
                 None
             }
+
+            Command::FieldReverse => {
+                self.field_reverse = true;
+                None
+            }
+
             Command::PrintQuality { .. } => None,
             Command::Comment { .. } => None,
             Command::Unknown { .. } => None,
@@ -397,11 +489,13 @@ impl StateManager {
         self.field_origin_y = 0;
         self.field_justification = Justification::Left;
         self.pending_field_data = None;
+        self.pending_field_mode = FieldMode::Text;
         self.field_block_width = 0;
         self.field_block_max_lines = 1;
         self.field_block_line_spacing = 0;
         self.field_block_justification = BlockJustification::Left;
         self.field_block_hanging_indent = 0;
+        self.field_reverse = false;
     }
 }
 

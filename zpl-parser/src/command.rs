@@ -59,6 +59,8 @@ pub enum Command {
         justification: Option<Justification>,
     },
 
+    FieldReverse,
+
     BarcodeFieldDefaults {
         module_width: u32,
         wide_bar_ratio: f32,

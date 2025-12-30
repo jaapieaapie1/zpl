@@ -1,8 +1,9 @@
+use png_renderer::PngRenderer;
 use std::env;
 use std::io::{self, Read};
+use std::time::SystemTime;
 use zpl_parser::Parser;
 use zpl_state_manager::StateManager;
-use png_renderer::PngRenderer;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -13,6 +14,8 @@ fn main() {
     io::stdin()
         .read_to_string(&mut input)
         .expect("Failed to read from stdin");
+
+    let start = SystemTime::now();
 
     let parser = Parser::new(&input);
 
@@ -35,6 +38,10 @@ fn main() {
         PngRenderer::new(width, height)
     };
     let image = renderer.render(&draw_instructions);
+
+    let duration = SystemTime::now().duration_since(start).unwrap();
+
+    println!("{:?}", duration);
 
     match png_renderer::save_png(&image, output_file) {
         Ok(_) => println!("PNG saved to: {}", output_file),

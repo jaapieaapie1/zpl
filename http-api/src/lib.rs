@@ -71,12 +71,13 @@ pub fn render_label(zpl: &str, format: Format) -> Result<Rendered, RenderError> 
 
     let mut state = StateManager::new();
     let instructions = state.process(commands);
-    let (width, height) = state.get_label_dimensions();
+    let page = state.page_setup();
+    let (width, height) = (page.width, page.height);
     mark("state");
 
     let bytes = match format {
         Format::Pdf => {
-            let bytes = PdfRenderer::new(width, height).render(&instructions);
+            let bytes = PdfRenderer::for_page(&page).render(&instructions);
             mark("render");
             bytes
         }

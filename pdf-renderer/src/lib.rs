@@ -9,11 +9,12 @@
 //! Anything that renders glyphs must flip y back locally (see `text.rs`).
 
 use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref};
-use zpl_state_manager::DrawInstruction;
+use zpl_state_manager::{DrawInstruction, PageSetup};
 
 mod barcodes;
 mod fonts;
 mod graphic;
+mod matrix;
 mod shapes;
 mod text;
 
@@ -27,6 +28,8 @@ pub struct PdfRenderer {
     height: u32,
     dpi: f32,
     parallel: bool,
+    inverted: bool,
+    mirrored: bool,
 }
 
 /// Rendering state shared by all element modules.
@@ -39,15 +42,37 @@ pub(crate) struct Ctx {
     pub images: Vec<graphic::ImageMask>,
     /// Set when a reverse (^FR) element used the `/GsDiff` difference blend state.
     pub uses_difference: bool,
+    /// Gray level that prints black: 0 normally, 1 inside a reverse (^FR) element, where
+    /// white under the Difference blend mode inverts what is underneath.
+    pub ink: f32,
+}
+
+impl Ctx {
+    pub fn new() -> Self {
+        Self { content: Content::new(), fonts: Default::default(), images: Vec::new(), uses_difference: false, ink: 0.0 }
+    }
+
+    /// Fill gray for a ZPL line color, honouring reverse printing.
+    pub fn gray(&self, color: zpl_parser::command::LineColor) -> f32 {
+        match color {
+            zpl_parser::command::LineColor::Black => self.ink,
+            zpl_parser::command::LineColor::White => 1.0 - self.ink,
+        }
+    }
 }
 
 impl PdfRenderer {
     pub fn new(width: u32, height: u32) -> Self {
-        Self { width, height, dpi: DEFAULT_DPI, parallel: false }
+        Self::with_dpi(width, height, DEFAULT_DPI)
     }
 
     pub fn with_dpi(width: u32, height: u32, dpi: f32) -> Self {
-        Self { width, height, dpi, parallel: false }
+        Self { width, height, dpi, parallel: false, inverted: false, mirrored: false }
+    }
+
+    /// Renderer for a label's page settings: size plus ^PO inversion and ^PM mirroring.
+    pub fn for_page(page: &PageSetup) -> Self {
+        Self { inverted: page.inverted, mirrored: page.mirrored, ..Self::new(page.width, page.height) }
     }
 
     /// Subsets each font on its own short-lived thread while the page is compressed.
@@ -65,15 +90,24 @@ impl PdfRenderer {
         let page_w = self.width as f32 * scale;
         let page_h = self.height as f32 * scale;
 
-        let mut ctx = Ctx {
-            content: Content::new(),
-            fonts: fonts::FontRegistry::default(),
-            images: Vec::new(),
-            uses_difference: false,
-        };
+        let mut ctx = Ctx::new();
 
         // Map dots (top-left origin, y down) to points (bottom-left origin, y up).
         ctx.content.transform([scale, 0.0, 0.0, -scale, 0.0, page_h]);
+        let (w, h) = (self.width as f32, self.height as f32);
+        // ^PM mirrors left-right, ^POI turns the label upside down; both flips cancel x.
+        match (self.inverted, self.mirrored) {
+            (false, false) => {}
+            (false, true) => {
+                ctx.content.transform([-1.0, 0.0, 0.0, 1.0, w, 0.0]);
+            }
+            (true, false) => {
+                ctx.content.transform([-1.0, 0.0, 0.0, -1.0, w, h]);
+            }
+            (true, true) => {
+                ctx.content.transform([1.0, 0.0, 0.0, -1.0, 0.0, h]);
+            }
+        }
 
         // Opaque white label stock, so ^FR (Difference blend) inverts against white rather than
         // the transparent page backdrop, where it would just paint white.
@@ -190,12 +224,26 @@ fn render_instruction(ctx: &mut Ctx, instruction: &DrawInstruction) {
     match instruction {
         DrawInstruction::DrawText { .. } => text::render(ctx, instruction),
         DrawInstruction::DrawBarcode { .. }
-        | DrawInstruction::DrawCode39 { .. }
-        | DrawInstruction::DrawQrCode { .. } => barcodes::render(ctx, instruction),
+        | DrawInstruction::DrawLinear { .. }
+        | DrawInstruction::DrawQrCode { .. }
+        | DrawInstruction::DrawDataMatrix { .. }
+        | DrawInstruction::DrawPdf417 { .. }
+        | DrawInstruction::DrawAztec { .. } => barcodes::render(ctx, instruction),
         DrawInstruction::DrawBox { .. }
         | DrawInstruction::DrawCircle { .. }
+        | DrawInstruction::DrawEllipse { .. }
         | DrawInstruction::DrawDiagonalLine { .. } => shapes::render(ctx, instruction),
         DrawInstruction::DrawGraphicField { .. } => graphic::render(ctx, instruction),
+        DrawInstruction::Reverse(inner) => {
+            // Painting white with the Difference blend mode inverts the backdrop.
+            ctx.uses_difference = true;
+            ctx.content.save_state();
+            ctx.content.set_parameters(Name(b"GsDiff")).set_fill_gray(1.0);
+            let ink = std::mem::replace(&mut ctx.ink, 1.0);
+            render_instruction(ctx, inner);
+            ctx.ink = ink;
+            ctx.content.restore_state();
+        }
     }
 }
 

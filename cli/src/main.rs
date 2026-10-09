@@ -88,13 +88,14 @@ fn main() {
 
     let mut state_manager = StateManager::new();
     let draw_instructions = state_manager.process(commands);
-    let (width, height) = state_manager.get_label_dimensions();
+    let page = state_manager.page_setup();
+    let (width, height) = (page.width, page.height);
     timings.mark("state");
 
     // The PDF renderer produces finished file bytes; the PNG renderer produces an image
     // that still has to be encoded.
     let bytes = if is_pdf {
-        let bytes = PdfRenderer::new(width, height).render(&draw_instructions);
+        let bytes = PdfRenderer::for_page(&page).render(&draw_instructions);
         timings.mark("render");
         bytes
     } else {

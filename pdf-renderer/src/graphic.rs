@@ -42,13 +42,15 @@ impl ImageMask {
 }
 
 pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
-    let DrawInstruction::DrawGraphicField { x, y, bytes_per_row, data, .. } = instruction else {
+    let DrawInstruction::DrawGraphicField { x, y, bytes_per_row, data, magnification_x, magnification_y } = instruction
+    else {
         return;
     };
     let Some(mask) = ImageMask::from_rows(*bytes_per_row, data) else {
         return;
     };
-    let (w, h) = (mask.width as f32, mask.height as f32);
+    let w = (mask.width * magnification_x) as f32;
+    let h = (mask.height * magnification_y) as f32;
     let name = format!("Im{}", ctx.images.len());
     ctx.images.push(mask);
 
@@ -57,7 +59,7 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
     ctx.content
         .save_state()
         .transform([w, 0.0, 0.0, -h, *x as f32, *y as f32 + h])
-        .set_fill_gray(0.0)
+        .set_fill_gray(ctx.ink)
         .x_object(Name(name.as_bytes()))
         .restore_state();
 }

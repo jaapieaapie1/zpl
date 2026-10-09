@@ -8,8 +8,10 @@
 
 use crate::text;
 use crate::{Ctx, FontId};
+use crate::matrix;
 use png_renderer::code128;
-use zpl_parser::command::{Code128Mode, Orientation};
+use zpl_parser::command::{Code128Mode, LinearKind, Orientation};
+use zpl_symbols::linear::{self, LinearSymbol, MsiCheck, Symbology};
 use zpl_state_manager::DrawInstruction;
 
 pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
@@ -21,12 +23,19 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
             ctx, *x, *y, data, *orientation, *height, *module_width,
             *print_interpretation_line, *print_interpretation_line_above, *mode,
         ),
-        DrawInstruction::DrawCode39 { x, y, data, orientation, height, module_width, .. } => {
-            render_code39(ctx, *x, *y, data, *orientation, *height, *module_width)
+        DrawInstruction::DrawLinear {
+            x, y, kind, data, orientation, height, module_width, wide_bar_ratio,
+            print_interpretation_line, print_interpretation_line_above,
+        } => render_linear(
+            ctx, *x, *y, *kind, data, *orientation, *height, *module_width, *wide_bar_ratio,
+            *print_interpretation_line, *print_interpretation_line_above,
+        ),
+        DrawInstruction::DrawQrCode { x, y, data, magnification, mask, bottom, .. } => {
+            render_qr_code(ctx, *x, *y, data, *magnification, *mask, *bottom)
         }
-        DrawInstruction::DrawQrCode { x, y, data, magnification, mask, .. } => {
-            render_qr_code(ctx, *x, *y, data, *magnification, *mask)
-        }
+        DrawInstruction::DrawDataMatrix { .. }
+        | DrawInstruction::DrawPdf417 { .. }
+        | DrawInstruction::DrawAztec { .. } => matrix::render(ctx, instruction),
         _ => {}
     }
 }
@@ -34,7 +43,7 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
 /// Transform mapping a local `w` x `h` frame onto the page the way the PNG renderer rotates
 /// its temp image (`imageops::rotate*`) and overlays it at its (saturating) offset.
 /// `pad` is the Code 128 interpretation-line padding the PNG renderer subtracts from the origin.
-fn placement(orientation: Orientation, x: u32, y: u32, w: u32, h: u32, pad: u32) -> [f32; 6] {
+pub(crate) fn placement(orientation: Orientation, x: u32, y: u32, w: u32, h: u32, pad: u32) -> [f32; 6] {
     let (w_f, h_f) = (w as f32, h as f32);
     match orientation {
         Orientation::Normal => [1.0, 0.0, 0.0, 1.0, x.saturating_sub(pad) as f32, y as f32],
@@ -52,13 +61,13 @@ fn placement(orientation: Orientation, x: u32, y: u32, w: u32, h: u32, pad: u32)
 }
 
 /// Fill `(x, y, w, h)` rects in black inside `matrix`, wrapped in `q`/`Q`.
-fn fill_rects(ctx: &mut Ctx, matrix: [f32; 6], rects: &[(f32, f32, f32, f32)]) {
+pub(crate) fn fill_rects(ctx: &mut Ctx, matrix: [f32; 6], rects: &[(f32, f32, f32, f32)]) {
     if rects.is_empty() {
         return;
     }
     ctx.content.save_state();
     ctx.content.transform(matrix);
-    ctx.content.set_fill_gray(0.0);
+    ctx.content.set_fill_gray(ctx.ink);
     for &(x, y, w, h) in rects {
         ctx.content.rect(x, y, w, h);
     }
@@ -134,28 +143,103 @@ fn render_code128(
         let text_x = pad as f32 + (barcode_width as f32 - text_width as f32) / 2.0;
         ctx.content.save_state();
         ctx.content.transform(matrix);
-        ctx.content.set_fill_gray(0.0);
+        ctx.content.set_fill_gray(ctx.ink);
         text::show_text(ctx, FontId::DejaVuMono, &code.text, text_x, baseline, ip.size_x, ip.size_y);
         ctx.content.restore_state();
     }
 }
 
-fn render_code39(ctx: &mut Ctx, x: u32, y: u32, data: &str, orientation: Orientation, height: u32, module_width: u32) {
-    use barcoders::sym::code39::Code39;
+fn symbology(kind: LinearKind) -> Symbology {
+    match kind {
+        LinearKind::Code11 { check_digits } => Symbology::Code11 { check_digits },
+        LinearKind::Interleaved2of5 { check_digit } => Symbology::Interleaved2of5 { check_digit },
+        LinearKind::Code39 { check_digit } => Symbology::Code39 { check_digit },
+        LinearKind::Ean8 => Symbology::Ean8,
+        LinearKind::UpcE { .. } => Symbology::UpcE,
+        LinearKind::Code93 { print_check_digit } => Symbology::Code93 { check_digit: print_check_digit },
+        LinearKind::Ean13 => Symbology::Ean13,
+        LinearKind::Industrial2of5 => Symbology::Industrial2of5,
+        LinearKind::Standard2of5 => Symbology::Standard2of5,
+        LinearKind::Codabar { check_digit, .. } => Symbology::Codabar { check_digit },
+        LinearKind::Msi { .. } => Symbology::Msi { check: MsiCheck::None },
+        LinearKind::Plessey { print_check_digit } => Symbology::Plessey { check_digit: print_check_digit },
+        LinearKind::UpcEanExtension => Symbology::UpcEanExtension,
+        LinearKind::UpcA { .. } => Symbology::UpcA,
+    }
+}
 
-    let Ok(barcode) = Code39::new(data) else { return };
-    let encoded = barcode.encode();
-    let bar_width = module_width.max(1);
-    let barcode_width = encoded.len() as u32 * bar_width;
+fn encode_linear(kind: LinearKind, data: &str) -> Option<LinearSymbol> {
+    use zpl_parser::command::MsiCheck as Zpl;
+    let mut symbol = match kind {
+        LinearKind::Codabar { check_digit, start, stop } => linear::encode_codabar(data, start, stop, check_digit),
+        LinearKind::Msi { check, print_check_digit } => {
+            let check = match check {
+                Zpl::None => MsiCheck::None,
+                Zpl::Mod10 => MsiCheck::Mod10,
+                Zpl::Mod10Mod10 => MsiCheck::Mod10Mod10,
+                Zpl::Mod11Mod10 => MsiCheck::Mod11Mod10,
+            };
+            linear::encode_msi(data, check, print_check_digit)
+        }
+        kind => linear::encode(symbology(kind), data),
+    }
+    .ok()?;
+    // UPC-A/UPC-E print the check digit as the last (outside) text segment.
+    if matches!(kind, LinearKind::UpcA { print_check_digit: false } | LinearKind::UpcE { print_check_digit: false }) {
+        symbol.text.pop();
+    }
+    Some(symbol)
+}
 
-    let rects: Vec<_> = runs(&encoded)
-        .into_iter()
-        .filter(|_| height > 0)
-        .map(|(start, len)| ((start as u32 * bar_width) as f32, 0.0, (len as u32 * bar_width) as f32, height as f32))
-        .collect();
+/// All 1D symbologies except Code 128. Bars start at the field origin; the interpretation line
+/// (DejaVu Sans Mono at the Code 128 proportions) goes below, or above when requested. EAN/UPC
+/// guard bars extend halfway into the digits.
+#[allow(clippy::too_many_arguments)]
+fn render_linear(
+    ctx: &mut Ctx, x: u32, y: u32, kind: LinearKind, data: &str, orientation: Orientation, height: u32,
+    module_width: u32, ratio: f32, print_line: bool, line_above: bool,
+) {
+    let Some(symbol) = encode_linear(kind, data) else { return };
+    let module = module_width.max(1);
+    let width = symbol.width_dots(module, ratio);
 
-    let matrix = placement(orientation, x, y, barcode_width, height, 0);
+    let ip = interpretation(module);
+    let text_gap = (module * 2) as f32;
+    let show_text = print_line && !symbol.text.is_empty();
+    let text_area = if show_text { (text_gap + ip.digit_height + ip.descent).ceil() as u32 } else { 0 };
+    let guard_ext = if symbol.has_guards && show_text && !line_above {
+        (text_gap + ip.digit_height / 2.0).round() as u32
+    } else {
+        0
+    };
+    let bars_y = if line_above { text_area } else { 0 };
+
+    let mut rects = Vec::new();
+    let mut x_pos = 0;
+    for (element, dots) in symbol.element_dots(module, ratio) {
+        if element.bar && height > 0 {
+            let h = height + if element.guard { guard_ext } else { 0 };
+            rects.push((x_pos as f32, bars_y as f32, dots as f32, h as f32));
+        }
+        x_pos += dots;
+    }
+
+    let matrix = placement(orientation, x, y, width.max(1), (height + text_area).max(1), 0);
     fill_rects(ctx, matrix, &rects);
+
+    if show_text {
+        let baseline = if line_above { ip.digit_height } else { height as f32 + text_gap + ip.digit_height };
+        ctx.content.save_state();
+        ctx.content.transform(matrix);
+        ctx.content.set_fill_gray(ctx.ink);
+        for seg in &symbol.text {
+            let (start, end) = symbol.text_extent_dots(seg, module, ratio);
+            let text_w = ip.char_advance * seg.text.chars().count() as f32;
+            let text_x = (start + end - text_w) / 2.0;
+            text::show_text(ctx, FontId::DejaVuMono, &seg.text, text_x, baseline, ip.size_x, ip.size_y);
+        }
+        ctx.content.restore_state();
+    }
 }
 
 /// Parse the `<ec><input mode>,` prefix of QR ^FD data.
@@ -175,7 +259,7 @@ fn parse_qr_data(data: &str) -> (qr_core::EcLevel, &str) {
     }
 }
 
-fn render_qr_code(ctx: &mut Ctx, x: u32, y: u32, data: &str, magnification: u32, mask: Option<u32>) {
+fn render_qr_code(ctx: &mut Ctx, x: u32, y: u32, data: &str, magnification: u32, mask: Option<u32>, bottom: bool) {
     let (ec, payload) = parse_qr_data(data);
     let mut options = qr_encode::Options::new(ec);
     // ^BQ mask 0-7 forces a mask; anything else lets the encoder pick by ISO penalty score.
@@ -194,13 +278,14 @@ fn render_qr_code(ctx: &mut Ctx, x: u32, y: u32, data: &str, magnification: u32,
         }
     }
 
-    // Zebra printers draw QR codes 10 dots below the field origin.
-    let matrix = [1.0, 0.0, 0.0, 1.0, x as f32, (y + 10) as f32];
+    // Zebra printers draw QR codes 10 dots below the field origin; ^FT puts the bottom there.
+    let top = if bottom { y.saturating_sub(size * magnification.max(1)) } else { y + 10 };
+    let matrix = [1.0, 0.0, 0.0, 1.0, x as f32, top as f32];
     fill_rects(ctx, matrix, &rects);
 }
 
 /// Runs of consecutive `1`s as `(start, len)`.
-fn runs(bits: &[u8]) -> Vec<(usize, usize)> {
+pub(crate) fn runs(bits: &[u8]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < bits.len() {
@@ -220,15 +305,9 @@ fn runs(bits: &[u8]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pdf_writer::Content;
 
     fn new_ctx() -> Ctx {
-        Ctx {
-            content: Content::new(),
-            fonts: Default::default(),
-            images: Vec::new(),
-            uses_difference: false,
-        }
+        Ctx::new()
     }
 
     fn content_of(instruction: DrawInstruction) -> String {
@@ -312,16 +391,36 @@ mod tests {
         assert!(c.contains(&format!("0 -1 1 0 {} {} cm", 500 - h, 600)));
     }
 
-    #[test]
-    fn code39_merges_adjacent_modules() {
-        let c = content_of(DrawInstruction::DrawCode39 {
-            x: 10, y: 20, data: "A".into(), orientation: Orientation::Normal, check_digit: false,
-            height: 50, module_width: 1, print_interpretation_line: false,
+    fn linear(kind: LinearKind, data: &str, line: bool) -> DrawInstruction {
+        DrawInstruction::DrawLinear {
+            x: 10, y: 20, kind, data: data.into(), orientation: Orientation::Normal, height: 50,
+            module_width: 1, wide_bar_ratio: 3.0, print_interpretation_line: line,
             print_interpretation_line_above: false,
-        });
+        }
+    }
+
+    #[test]
+    fn code39_draws_bars_and_text() {
+        let c = content_of(linear(LinearKind::Code39 { check_digit: false }, "A", false));
         // "*A*": 3 characters, 5 bars each.
         assert_eq!(count_op(&c, "re"), 15);
         assert_eq!(count_op(&c, "f"), 1);
+        let c = content_of(linear(LinearKind::Code39 { check_digit: false }, "A", true));
+        assert_eq!(count_op(&c, "Tj"), 1);
+    }
+
+    #[test]
+    fn ean13_guards_extend_and_text_splits() {
+        let c = content_of(linear(LinearKind::Ean13, "400638133393", true));
+        // 3 guard patterns of 2/2/2 bars plus 12 digits of 2 bars each.
+        assert_eq!(count_op(&c, "re"), 30);
+        assert!(c.lines().any(|l| l.ends_with(" re") && !l.ends_with(" 50 re")), "guards are taller");
+        assert_eq!(count_op(&c, "Tj"), 3);
+    }
+
+    #[test]
+    fn invalid_data_draws_nothing() {
+        assert!(content_of(linear(LinearKind::Ean13, "abc", true)).is_empty());
     }
 
     #[test]
@@ -333,6 +432,7 @@ mod tests {
             x: 30, y: 40, data: "QA,hello".into(), orientation: Orientation::Normal,
             model: zpl_parser::command::QrModel::Model2, magnification: 4,
             error_correction: zpl_parser::command::QrErrorCorrection::Standard, mask: None,
+            bottom: false,
         });
         assert!(c.contains("1 0 0 1 30 50 cm"));
         // Top-left finder pattern: first row starts with a 7-module dark run.

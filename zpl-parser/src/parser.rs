@@ -9,6 +9,8 @@ use crate::{
     error::ParseError,
 };
 
+mod extra;
+
 pub struct Parser<'a> {
     tokenizer: Tokenizer<'a>,
     peeked: Option<Token<'a>>,
@@ -39,15 +41,6 @@ impl<'a> Parser<'a> {
         } else {
             self.tokenizer.next()
         }
-    }
-
-    #[inline]
-    fn peek_token(&mut self) -> Option<&Token<'a>> {
-        if self.peeked.is_none() {
-            self.peeked = self.tokenizer.next();
-        }
-
-        self.peeked.as_ref()
     }
 
     pub fn parse_next(&mut self) -> Result<Option<Command>, ParseError> {
@@ -118,14 +111,19 @@ impl<'a> Parser<'a> {
             (CommandPrefix::Caret, "MD") => self.parse_media_darkness(params, span),
             (CommandPrefix::Caret, "FX") => self.parse_comment(params, span),
 
-            _ => Ok(Command::Unknown {
+            _ => {
+                if let Some(command) = self.parse_extra(prefix == CommandPrefix::Tilde, &name_upper, params, span) {
+                    return command;
+                }
+                Ok(Command::Unknown {
                 prefix: match prefix {
                     CommandPrefix::Caret => CmdPrefix::Carot,
                     CommandPrefix::Tilde => CmdPrefix::Tilde,
                 },
                 name: name.to_string(),
                 params: params.iter().map(|s| s.to_string()).collect(),
-            }),
+                })
+            }
         }
     }
 
@@ -149,10 +147,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_field_typeset(&self, params: &[&str], span: Span) -> Result<Command, ParseError> {
-        // ^FTx,y
+        // ^FTx,y (Zebra continues after the previous field when omitted; we use 0)
 
-        let x = self.parse_u32_param(params, 0, "x", span)?;
-        let y = self.parse_u32_param(params, 1, "y", span)?;
+        let x = self.parse_optional_u32(params, 0, span)?.unwrap_or(0);
+        let y = self.parse_optional_u32(params, 1, span)?.unwrap_or(0);
 
         let justification = if params.len() >= 3 {
             self.parse_justification(params[2], span)?
@@ -376,7 +374,8 @@ impl<'a> Parser<'a> {
 
             // Check for Z64 compression format (:Z64:data:checksum)
             if raw.starts_with(":Z64:") || raw.starts_with(":B64:") {
-                self.decode_z64_data(&raw)?
+                let compact: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+                self.decode_z64_data(&compact)?
             } else {
                 match compression {
                     CompressionType::Ascii => self.decode_hex_data(&raw, bytes_per_row),

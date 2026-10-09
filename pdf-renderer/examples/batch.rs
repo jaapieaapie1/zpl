@@ -146,8 +146,7 @@ fn render(zpl: &str) -> Vec<u8> {
     let commands = Parser::new(zpl).parse().expect("sample label must parse");
     let mut state = StateManager::new();
     let instructions = state.process(commands);
-    let (width, height) = state.get_label_dimensions();
-    PdfRenderer::new(width, height).render(&instructions)
+    PdfRenderer::for_page(&state.page_setup()).render(&instructions)
 }
 
 fn rusage() -> libc::rusage {

@@ -1,0 +1,11 @@
+[package]
+name = "zpl-symbols"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+# Reference decoders for round-trip tests only.
+datamatrix_ref = { package = "datamatrix", version = "0.3.3" }
+rxing = { version = "0.9.3", default-features = false, features = ["aztec", "pdf417", "datamatrix", "decoders", "encoding_rs"] }

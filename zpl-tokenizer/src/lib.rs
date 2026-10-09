@@ -52,16 +52,6 @@ impl<'a> Tokenizer<'a> {
     }
 
     #[inline]
-    fn peek_n(&self, n: usize) -> Option<&'a str> {
-        let remaining = &self.input[self.position..];
-        if remaining.len() >= n {
-            Some(&remaining[..n])
-        } else {
-            None
-        }
-    }
-
-    #[inline]
     fn consume(&mut self) -> Option<char> {
         let c = self.peek()?;
         self.position += c.len_utf8();
@@ -166,12 +156,13 @@ impl<'a> Tokenizer<'a> {
     fn parse_field_data(&mut self) -> Option<&'a str> {
         let start = self.position;
 
-        while !self.is_eof() {
-            if self.peek_n(3) == Some("^FS") {
-                let data = &self.input[start..self.position];
-                return Some(data);
+        // Field data runs up to the next command (normally ^FS); a literal caret needs ^FH.
+        match self.input[start..].find('^') {
+            Some(end) => {
+                self.position = start + end;
+                return Some(&self.input[start..self.position]);
             }
-            self.consume();
+            None => self.position = self.input.len(),
         }
 
         if self.position > start {
@@ -194,6 +185,16 @@ impl<'a> Tokenizer<'a> {
         }
 
         &self.input[start..self.position]
+    }
+
+    /// A command whose first `leading` comma-separated parameters are followed by one raw
+    /// data parameter extending to the next `^` or `~`.
+    fn raw_command(&mut self, prefix: CommandPrefix, name: &'a str, start: usize, leading: usize) -> Token<'a> {
+        let rest = &self.input[self.position..];
+        let end = rest.find(['^', '~']).unwrap_or(rest.len());
+        self.position += end;
+        let params = rest[..end].splitn(leading + 1, ',').map(str::trim).collect();
+        Token::Command { prefix, name, params, span: Span { start, end: self.position } }
     }
 
     pub fn next_token(&mut self) -> Option<Token<'a>> {
@@ -239,7 +240,7 @@ impl<'a> Tokenizer<'a> {
             (CommandPrefix::Caret, "XZ") => Token::EndToken,
             (CommandPrefix::Caret, "FS") => Token::FieldSeparator,
 
-            (CommandPrefix::Caret, "FD") => {
+            (CommandPrefix::Caret, "FD" | "FV") => {
                 if let Some(data) = self.parse_field_data() {
                     Token::FieldData {
                         data,
@@ -279,6 +280,12 @@ impl<'a> Tokenizer<'a> {
                     },
                 }
             }
+
+            // Bitmap data may be wrapped over several lines: take everything up to the next
+            // command and split off only the leading parameters.
+            (CommandPrefix::Caret, "GF") => self.raw_command(prefix, name, start, 4),
+            (CommandPrefix::Tilde, "DG") => self.raw_command(prefix, name, start, 3),
+            (CommandPrefix::Tilde, "DY") => self.raw_command(prefix, name, start, 5),
 
             _ => {
                 let params = self.parse_parameters();

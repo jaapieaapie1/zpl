@@ -4,7 +4,7 @@
 //! exactly: borders grow inward from the outer bounds.
 
 use crate::Ctx;
-use pdf_writer::{Content, Name};
+use pdf_writer::Content;
 use zpl_parser::command::{DiagonalDirection, LineColor};
 use zpl_state_manager::DrawInstruction;
 
@@ -13,11 +13,14 @@ const KAPPA: f32 = 0.552_284_8;
 
 pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
     match *instruction {
-        DrawInstruction::DrawBox { x, y, width, height, thickness, color, rounding, reverse } => {
-            draw_box(ctx, x, y, width, height, thickness, color, rounding, reverse)
+        DrawInstruction::DrawBox { x, y, width, height, thickness, color, rounding } => {
+            draw_box(ctx, x, y, width, height, thickness, color, rounding)
         }
         DrawInstruction::DrawCircle { x, y, diameter, thickness, color } => {
-            draw_circle(ctx, x, y, diameter, thickness, color)
+            draw_ellipse(ctx, x, y, diameter, diameter, thickness, color)
+        }
+        DrawInstruction::DrawEllipse { x, y, width, height, thickness, color } => {
+            draw_ellipse(ctx, x, y, width, height, thickness, color)
         }
         DrawInstruction::DrawDiagonalLine { x, y, width, height, thickness, color, direction } => {
             draw_diagonal(ctx, x, y, width, height, thickness, color, direction)
@@ -26,23 +29,11 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
     }
 }
 
-fn gray(color: LineColor) -> f32 {
-    match color {
-        LineColor::Black => 0.0,
-        LineColor::White => 1.0,
-    }
-}
-
-/// Begin a painted element: save state and pick the fill. Reverse (^FR) paints white
-/// through the Difference blend mode, which inverts whatever is underneath.
-fn begin(ctx: &mut Ctx, color: LineColor, reverse: bool) {
+/// Begin a painted element: save state and pick the fill (`Ctx::gray` handles ^FR).
+fn begin(ctx: &mut Ctx, color: LineColor) {
+    let gray = ctx.gray(color);
     ctx.content.save_state();
-    if reverse {
-        ctx.uses_difference = true;
-        ctx.content.set_parameters(Name(b"GsDiff")).set_fill_gray(1.0);
-    } else {
-        ctx.content.set_fill_gray(gray(color));
-    }
+    ctx.content.set_fill_gray(gray);
 }
 
 /// Append a (possibly rounded) rectangle subpath.
@@ -66,14 +57,14 @@ fn rounded_rect(c: &mut Content, x: f32, y: f32, w: f32, h: f32, r: f32) {
     c.close_path();
 }
 
-/// Append a full-circle subpath (four Bezier arcs).
-fn ellipse(c: &mut Content, cx: f32, cy: f32, r: f32) {
-    let k = r * KAPPA;
-    c.move_to(cx + r, cy);
-    c.cubic_to(cx + r, cy + k, cx + k, cy + r, cx, cy + r);
-    c.cubic_to(cx - k, cy + r, cx - r, cy + k, cx - r, cy);
-    c.cubic_to(cx - r, cy - k, cx - k, cy - r, cx, cy - r);
-    c.cubic_to(cx + k, cy - r, cx + r, cy - k, cx + r, cy);
+/// Append a full-ellipse subpath (four Bezier arcs) with radii `rx`, `ry`.
+fn ellipse(c: &mut Content, cx: f32, cy: f32, rx: f32, ry: f32) {
+    let (kx, ky) = (rx * KAPPA, ry * KAPPA);
+    c.move_to(cx + rx, cy);
+    c.cubic_to(cx + rx, cy + ky, cx + kx, cy + ry, cx, cy + ry);
+    c.cubic_to(cx - kx, cy + ry, cx - rx, cy + ky, cx - rx, cy);
+    c.cubic_to(cx - rx, cy - ky, cx - kx, cy - ry, cx, cy - ry);
+    c.cubic_to(cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy);
     c.close_path();
 }
 
@@ -87,7 +78,6 @@ fn draw_box(
     thickness: u32,
     color: LineColor,
     rounding: u32,
-    reverse: bool,
 ) {
     if thickness == 0 {
         return;
@@ -101,7 +91,7 @@ fn draw_box(
     // ^GB rounding 0-8: radius = (rounding / 8) * (shorter side / 2).
     let radius = rounding.min(8) as f32 / 8.0 * short / 2.0;
 
-    begin(ctx, color, reverse);
+    begin(ctx, color);
     rounded_rect(&mut ctx.content, x, y, w, h, radius);
     if 2.0 * t < short {
         let inner_r = (radius - t).max(0.0);
@@ -111,19 +101,19 @@ fn draw_box(
     ctx.content.restore_state();
 }
 
-fn draw_circle(ctx: &mut Ctx, x: u32, y: u32, diameter: u32, thickness: u32, color: LineColor) {
-    if diameter == 0 || thickness == 0 {
+/// ^GC / ^GE: an ellipse ring `thickness` dots wide inside the `width` x `height` box.
+fn draw_ellipse(ctx: &mut Ctx, x: u32, y: u32, width: u32, height: u32, thickness: u32, color: LineColor) {
+    if width == 0 || height == 0 || thickness == 0 {
         return;
     }
-    let d = diameter as f32;
-    let r = d / 2.0;
-    let (cx, cy) = (x as f32 + r, y as f32 + r);
+    let (rx, ry) = (width as f32 / 2.0, height as f32 / 2.0);
+    let (cx, cy) = (x as f32 + rx, y as f32 + ry);
     let t = thickness as f32;
 
-    begin(ctx, color, false);
-    ellipse(&mut ctx.content, cx, cy, r);
-    if t < r {
-        ellipse(&mut ctx.content, cx, cy, r - t);
+    begin(ctx, color);
+    ellipse(&mut ctx.content, cx, cy, rx, ry);
+    if t < rx && t < ry {
+        ellipse(&mut ctx.content, cx, cy, rx - t, ry - t);
     }
     ctx.content.fill_even_odd();
     ctx.content.restore_state();
@@ -167,7 +157,7 @@ fn draw_diagonal(
         return;
     }
     let pts = diagonal_points(x, y, width, height, thickness, direction);
-    begin(ctx, color, false);
+    begin(ctx, color);
     let c = &mut ctx.content;
     c.move_to(pts[0].0, pts[0].1);
     for &(px, py) in &pts[1..] {
@@ -181,26 +171,21 @@ fn draw_diagonal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fonts::FontRegistry;
-
+    
     fn ctx() -> Ctx {
-        Ctx {
-            content: Content::new(),
-            fonts: FontRegistry::default(),
-            images: Vec::new(),
-            uses_difference: false,
-        }
+        Ctx::new()
     }
 
     fn ops(instruction: DrawInstruction) -> (String, bool) {
         let mut c = ctx();
-        render(&mut c, &instruction);
+        crate::render_instruction(&mut c, &instruction);
         let used = c.uses_difference;
         (String::from_utf8(c.content.finish().to_vec()).unwrap(), used)
     }
 
     fn gb(w: u32, h: u32, t: u32, rounding: u32, reverse: bool, color: LineColor) -> DrawInstruction {
-        DrawInstruction::DrawBox { x: 10, y: 20, width: w, height: h, thickness: t, color, rounding, reverse }
+        let gb = DrawInstruction::DrawBox { x: 10, y: 20, width: w, height: h, thickness: t, color, rounding };
+        if reverse { DrawInstruction::Reverse(Box::new(gb)) } else { gb }
     }
 
     #[test]

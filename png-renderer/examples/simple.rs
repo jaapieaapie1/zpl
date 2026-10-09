@@ -1,6 +1,6 @@
 use png_renderer::PngRenderer;
-use zpl_parser::command::{FontName, LineColor, Orientation};
-use zpl_state_manager::DrawInstruction;
+use zpl_parser::command::{FieldDirection, FontName, Justification, LineColor, Orientation};
+use zpl_state_manager::{DrawInstruction, TextAnchor};
 
 fn main() {
     let instructions = vec![
@@ -21,6 +21,11 @@ fn main() {
             height: 20,
             width: 10,
             orientation: Orientation::Normal,
+            justification: Justification::Left,
+            anchor: TextAnchor::Top,
+            block: None,
+            direction: FieldDirection::Horizontal,
+            char_gap: 0,
         },
         DrawInstruction::DrawCircle {
             x: 400,

@@ -780,3 +780,113 @@ fn test_mixed_empty_parameters() {
         }
     );
 }
+
+#[test]
+fn test_field_data_ends_at_next_command() {
+    let result = Parser::new("^FDabc^FO1,2^FS").parse().unwrap();
+    assert_eq!(result[0], Command::FielData { data: "abc".into() });
+    assert!(matches!(result[1], Command::FieldOrigin { x: 1, y: 2, .. }));
+}
+
+#[test]
+fn test_field_variable_is_field_data() {
+    let result = Parser::new("^FVhello world^FS").parse().unwrap();
+    assert_eq!(result[0], Command::FielData { data: "hello world".into() });
+}
+
+#[test]
+fn test_field_hex_indicator() {
+    let result = Parser::new("^FH\\^FD^FH^FD").parse().unwrap();
+    assert_eq!(result[0], Command::FieldHexIndicator { indicator: '\\' });
+    assert_eq!(result[2], Command::FieldHexIndicator { indicator: '_' });
+}
+
+#[test]
+fn test_graphic_field_data_spans_lines() {
+    let result = Parser::new("^GFA,4,4,2,\nFFFF\n0000\n^FS").parse().unwrap();
+    let Command::GraphicField { data, .. } = &result[0] else { panic!() };
+    assert_eq!(data, &[0xFF, 0xFF, 0x00, 0x00]);
+}
+
+#[test]
+fn test_download_graphic() {
+    let result = Parser::new("~DGR:LOGO.GRF,4,2,\nFFFF\n00FF\n^XA").parse().unwrap();
+    assert_eq!(
+        result[0],
+        Command::DownloadGraphic { name: "R:LOGO.GRF".into(), bytes_per_row: 2, data: vec![0xFF, 0xFF, 0x00, 0xFF] }
+    );
+}
+
+#[test]
+fn test_linear_barcodes() {
+    use zpl_parser::command::LinearKind;
+    let result = Parser::new("^BEN,100,Y,N^B2R,50,N,N,Y^BKN,N,40,Y,N,B,D^BUN,80,Y,N,N").parse().unwrap();
+    assert_eq!(
+        result[0],
+        Command::LinearBarcode {
+            kind: LinearKind::Ean13,
+            orientation: Some(Orientation::Normal),
+            height: Some(100),
+            print_interpretation_line: true,
+            print_above: false
+        }
+    );
+    assert!(matches!(
+        result[1],
+        Command::LinearBarcode { kind: LinearKind::Interleaved2of5 { check_digit: true }, height: Some(50), .. }
+    ));
+    assert!(matches!(
+        result[2],
+        Command::LinearBarcode { kind: LinearKind::Codabar { start: 'B', stop: 'D', check_digit: false }, height: Some(40), .. }
+    ));
+    assert!(matches!(result[3], Command::LinearBarcode { kind: LinearKind::UpcA { print_check_digit: false }, .. }));
+}
+
+#[test]
+fn test_matrix_barcodes() {
+    let result = Parser::new("^BXN,6,200,,,6,_^B7N,4,5,3^BON,4,N,0").parse().unwrap();
+    assert_eq!(
+        result[0],
+        Command::DataMatrix {
+            orientation: Some(Orientation::Normal),
+            module_height: Some(6),
+            columns: 0,
+            rows: 0,
+            escape: Some('_'),
+            rectangular: false
+        }
+    );
+    assert_eq!(
+        result[1],
+        Command::Pdf417 {
+            orientation: Some(Orientation::Normal),
+            row_height: Some(4),
+            security: Some(5),
+            columns: 3,
+            rows: 0,
+            truncated: false
+        }
+    );
+    assert_eq!(result[2], Command::Aztec { orientation: Some(Orientation::Normal), magnification: Some(4), ecc: 0 });
+}
+
+#[test]
+fn test_label_and_field_settings() {
+    let result = Parser::new("^LRY^POI^PMY^LS-20^FWR,1^FPV,3^TBN,200,100^FN3^GE100,50,2,B^GSN,20,20").parse().unwrap();
+    assert_eq!(result[0], Command::LabelReverse { enabled: true });
+    assert_eq!(result[1], Command::PrintOrientation { inverted: true });
+    assert_eq!(result[2], Command::PrintMirror { enabled: true });
+    assert_eq!(result[3], Command::LabelShift { shift: -20 });
+    assert_eq!(
+        result[4],
+        Command::FieldOrientation { orientation: Orientation::Rotated90, justification: Some(Justification::Right) }
+    );
+    assert_eq!(
+        result[5],
+        Command::FieldParameter { direction: zpl_parser::command::FieldDirection::Vertical, char_gap: 3 }
+    );
+    assert_eq!(result[6], Command::TextBlock { orientation: Some(Orientation::Normal), width: 200, height: 100 });
+    assert_eq!(result[7], Command::FieldNumber { number: 3 });
+    assert_eq!(result[8], Command::GraphicEllipse { width: 100, height: 50, thickness: 2, color: LineColor::Black });
+    assert!(matches!(result[9], Command::GraphicSymbol { height: Some(20), .. }));
+}

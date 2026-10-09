@@ -147,9 +147,7 @@ fn render(zpl: &str) -> Vec<u8> {
     let mut state = StateManager::new();
     let instructions = state.process(commands);
     let (width, height) = state.get_label_dimensions();
-    // The batch is already parallel across labels; per-render font threads would only
-    // oversubscribe the cores.
-    PdfRenderer::new(width, height).single_threaded().render(&instructions)
+    PdfRenderer::new(width, height).render(&instructions)
 }
 
 fn rusage() -> libc::rusage {

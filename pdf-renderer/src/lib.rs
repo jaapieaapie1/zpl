@@ -43,18 +43,20 @@ pub(crate) struct Ctx {
 
 impl PdfRenderer {
     pub fn new(width: u32, height: u32) -> Self {
-        Self { width, height, dpi: DEFAULT_DPI, parallel: true }
+        Self { width, height, dpi: DEFAULT_DPI, parallel: false }
     }
 
     pub fn with_dpi(width: u32, height: u32, dpi: f32) -> Self {
-        Self { width, height, dpi, parallel: true }
+        Self { width, height, dpi, parallel: false }
     }
 
-    /// Renders on the calling thread only. By default each font is subset on its own
-    /// short-lived thread, which lowers the latency of a single render; when many labels
-    /// are already rendered in parallel those extra threads only add overhead.
-    pub fn single_threaded(mut self) -> Self {
-        self.parallel = false;
+    /// Subsets each font on its own short-lived thread while the page is compressed.
+    ///
+    /// Off by default: thread start-up (and a fresh per-thread compressor) costs more than
+    /// it saves on Linux, measured ~25-80% slower per render, and far worse on small cloud
+    /// VMs. It only shaved ~20 µs off font-heavy labels on an idle macOS machine.
+    pub fn parallel_fonts(mut self) -> Self {
+        self.parallel = true;
         self
     }
 
@@ -100,7 +102,7 @@ impl PdfRenderer {
         pdf.catalog(catalog_id).pages(pages_id);
         pdf.pages(pages_id).kids([page_id]).count(1);
 
-        // Font subsetting runs on worker threads (unless single-threaded) while this thread
+        // With `parallel_fonts`, font subsetting runs on worker threads while this thread
         // deflates the rest.
         let raw = ctx.content.finish();
         let (programs, (content, images)) = ctx.fonts.build_programs(self.parallel, || {

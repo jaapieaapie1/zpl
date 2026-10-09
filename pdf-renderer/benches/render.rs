@@ -37,6 +37,12 @@ fn main() {
         });
         report(name, "render", &samples, bytes);
 
+        let parallel = PdfRenderer::new(width, height).parallel_fonts();
+        let samples = measure(iters, || {
+            black_box(parallel.render(black_box(&instructions)));
+        });
+        report(name, "render-par", &samples, bytes);
+
         let samples = measure(iters, || {
             let (instructions, (width, height)) = prepare(black_box(zpl));
             black_box(PdfRenderer::new(width, height).render(&instructions));

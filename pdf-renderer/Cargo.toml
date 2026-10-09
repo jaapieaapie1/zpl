@@ -1,0 +1,24 @@
+[package]
+name = "pdf-renderer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zpl-state-manager = { path = "../zpl-state-manager" }
+zpl-parser = { path = "../zpl-parser" }
+png-renderer = { path = "../png-renderer" }
+pdf-writer = "0.15"
+ttf-parser = "0.25"
+# Private repository: fetched over SSH (see .cargo/config.toml and the Dockerfile).
+qr-encode = { git = "ssh://git@github.com/jaapieaapie1/qrcode.git", rev = "766b33a5c6d8d70ab03e5a5f81bd2ffedf8da083", default-features = false }
+qr-core = { git = "ssh://git@github.com/jaapieaapie1/qrcode.git", rev = "766b33a5c6d8d70ab03e5a5f81bd2ffedf8da083", default-features = false }
+barcoders = "2.0"
+miniz_oxide = "0.8"
+subsetter = { version = "0.2", default-features = false }
+
+[[bench]]
+name = "render"
+harness = false
+
+[dev-dependencies]
+libc = "0.2"

@@ -1,0 +1,202 @@
+//! Vector PDF renderer for ZPL draw instructions.
+//!
+//! Every element is emitted as native PDF content: text as embedded-font text objects,
+//! boxes/lines/circles and barcode bars/QR modules as filled paths, and ^GF graphics as
+//! 1-bit image masks. No raster of the whole label is ever produced.
+//!
+//! Coordinate system: the page content stream starts with a CTM that maps printer dots
+//! (origin top-left, y down) to PDF points. All modules therefore draw in dot units.
+//! Anything that renders glyphs must flip y back locally (see `text.rs`).
+
+use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref};
+use zpl_state_manager::DrawInstruction;
+
+mod barcodes;
+mod fonts;
+mod graphic;
+mod shapes;
+mod text;
+
+pub use fonts::FontId;
+
+/// Default Zebra resolution (8 dots/mm).
+pub const DEFAULT_DPI: f32 = 203.0;
+
+pub struct PdfRenderer {
+    width: u32,
+    height: u32,
+    dpi: f32,
+    parallel: bool,
+}
+
+/// Rendering state shared by all element modules.
+pub(crate) struct Ctx {
+    /// Page content stream, in dot coordinates (y down).
+    pub content: Content,
+    /// Fonts referenced so far; written as resources when the document is finished.
+    pub fonts: fonts::FontRegistry,
+    /// ^GF bitmaps; each becomes an /ImageMask XObject named `Im{index}`.
+    pub images: Vec<graphic::ImageMask>,
+    /// Set when a reverse (^FR) element used the `/GsDiff` difference blend state.
+    pub uses_difference: bool,
+}
+
+impl PdfRenderer {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self { width, height, dpi: DEFAULT_DPI, parallel: true }
+    }
+
+    pub fn with_dpi(width: u32, height: u32, dpi: f32) -> Self {
+        Self { width, height, dpi, parallel: true }
+    }
+
+    /// Renders on the calling thread only. By default each font is subset on its own
+    /// short-lived thread, which lowers the latency of a single render; when many labels
+    /// are already rendered in parallel those extra threads only add overhead.
+    pub fn single_threaded(mut self) -> Self {
+        self.parallel = false;
+        self
+    }
+
+    pub fn render(&self, instructions: &[DrawInstruction]) -> Vec<u8> {
+        let scale = 72.0 / self.dpi;
+        let page_w = self.width as f32 * scale;
+        let page_h = self.height as f32 * scale;
+
+        let mut ctx = Ctx {
+            content: Content::new(),
+            fonts: fonts::FontRegistry::default(),
+            images: Vec::new(),
+            uses_difference: false,
+        };
+
+        // Map dots (top-left origin, y down) to points (bottom-left origin, y up).
+        ctx.content.transform([scale, 0.0, 0.0, -scale, 0.0, page_h]);
+
+        // Opaque white label stock, so ^FR (Difference blend) inverts against white rather than
+        // the transparent page backdrop, where it would just paint white.
+        ctx.content
+            .set_fill_gray(1.0)
+            .rect(0.0, 0.0, self.width as f32, self.height as f32)
+            .fill_nonzero()
+            .set_fill_gray(0.0);
+
+        for instruction in instructions {
+            render_instruction(&mut ctx, instruction);
+        }
+
+        self.write_document(ctx, page_w, page_h)
+    }
+
+    fn write_document(&self, ctx: Ctx, page_w: f32, page_h: f32) -> Vec<u8> {
+        let mut alloc = Ref::new(1);
+        let catalog_id = alloc.bump();
+        let pages_id = alloc.bump();
+        let page_id = alloc.bump();
+        let content_id = alloc.bump();
+        let gs_diff_id = alloc.bump();
+
+        let mut pdf = Pdf::new();
+        pdf.catalog(catalog_id).pages(pages_id);
+        pdf.pages(pages_id).kids([page_id]).count(1);
+
+        // Font subsetting runs on worker threads (unless single-threaded) while this thread
+        // deflates the rest.
+        let raw = ctx.content.finish();
+        let (programs, (content, images)) = ctx.fonts.build_programs(self.parallel, || {
+            let images: Vec<Vec<u8>> = ctx.images.iter().map(|img| compress(&img.data)).collect();
+            (compress(&raw), images)
+        });
+
+        let font_refs = ctx.fonts.write(&mut pdf, &mut alloc, programs);
+        let image_refs: Vec<Ref> =
+            ctx.images.iter().zip(&images).map(|(img, data)| img.write(&mut pdf, &mut alloc, data)).collect();
+
+        if ctx.uses_difference {
+            pdf.ext_graphics(gs_diff_id).blend_mode(pdf_writer::types::BlendMode::Difference);
+        }
+
+        let mut page = pdf.page(page_id);
+        page.media_box(Rect::new(0.0, 0.0, page_w, page_h));
+        page.parent(pages_id);
+        page.contents(content_id);
+        let mut resources = page.resources();
+        {
+            let mut fonts = resources.fonts();
+            for (name, id) in &font_refs {
+                fonts.pair(Name(name.as_bytes()), *id);
+            }
+        }
+        {
+            let mut xobjects = resources.x_objects();
+            for (i, id) in image_refs.iter().enumerate() {
+                xobjects.pair(Name(format!("Im{i}").as_bytes()), *id);
+            }
+        }
+        if ctx.uses_difference {
+            resources.ext_g_states().pair(Name(b"GsDiff"), gs_diff_id);
+        }
+        resources.finish();
+        page.finish();
+
+        pdf.stream(content_id, &content).filter(Filter::FlateDecode);
+
+        pdf.finish()
+    }
+}
+
+/// zlib-compresses `data` at level 1: a few percent larger than level 6 but roughly twice
+/// as fast. The compressor (~300 KB of hash tables) is reused across calls, since
+/// allocating and zeroing a fresh one dominated the cost for the small streams of a label.
+pub(crate) fn compress(data: &[u8]) -> Vec<u8> {
+    use miniz_oxide::deflate::core::{compress, CompressorOxide, TDEFLFlush, TDEFLStatus};
+    use miniz_oxide::DataFormat;
+
+    thread_local! {
+        static COMPRESSOR: std::cell::RefCell<Box<CompressorOxide>> =
+            std::cell::RefCell::new(Box::new(CompressorOxide::new(0)));
+    }
+
+    COMPRESSOR.with_borrow_mut(|compressor| {
+        compressor.reset();
+        compressor.set_format_and_level(DataFormat::Zlib, 1);
+
+        let mut input = data;
+        let mut output = vec![0; (data.len() / 2).max(64)];
+        let mut out_pos = 0;
+        loop {
+            let (status, bytes_in, bytes_out) = compress(compressor, input, &mut output[out_pos..], TDEFLFlush::Finish);
+            out_pos += bytes_out;
+            input = &input[bytes_in..];
+            match status {
+                TDEFLStatus::Done => {
+                    output.truncate(out_pos);
+                    return output;
+                }
+                TDEFLStatus::Okay => {
+                    if output.len() - out_pos < 64 {
+                        output.resize(output.len() * 2, 0);
+                    }
+                }
+                status => panic!("deflate failed: {status:?}"),
+            }
+        }
+    })
+}
+
+fn render_instruction(ctx: &mut Ctx, instruction: &DrawInstruction) {
+    match instruction {
+        DrawInstruction::DrawText { .. } => text::render(ctx, instruction),
+        DrawInstruction::DrawBarcode { .. }
+        | DrawInstruction::DrawCode39 { .. }
+        | DrawInstruction::DrawQrCode { .. } => barcodes::render(ctx, instruction),
+        DrawInstruction::DrawBox { .. }
+        | DrawInstruction::DrawCircle { .. }
+        | DrawInstruction::DrawDiagonalLine { .. } => shapes::render(ctx, instruction),
+        DrawInstruction::DrawGraphicField { .. } => graphic::render(ctx, instruction),
+    }
+}
+
+pub fn save_pdf(bytes: &[u8], path: &str) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
+}

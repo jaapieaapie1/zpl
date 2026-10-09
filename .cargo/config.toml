@@ -1,0 +1,4 @@
+[net]
+# qr-encode lives in a private repository; let the system git (and its SSH agent /
+# credentials) fetch it instead of cargo's built-in libgit2.
+git-fetch-with-cli = true

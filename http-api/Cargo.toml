@@ -1,0 +1,21 @@
+[package]
+name = "zpl-http-api"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "zpl-server"
+path = "src/main.rs"
+
+[dependencies]
+zpl-parser = { path = "../zpl-parser" }
+zpl-state-manager = { path = "../zpl-state-manager" }
+png-renderer = { path = "../png-renderer" }
+pdf-renderer = { path = "../pdf-renderer" }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+http-body-util = "0.1"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

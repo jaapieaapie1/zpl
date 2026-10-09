@@ -370,14 +370,18 @@ impl<'a> Parser<'a> {
         let bytes_per_row = self.parse_u32_param(params, 3, "d", span)?;
 
         let data = if params.len() >= 5 {
+            // The data itself may contain commas (ASCII compression), so rejoin the
+            // remaining params that the tokenizer split on ','.
+            let raw = params[4..].join(",");
+
             // Check for Z64 compression format (:Z64:data:checksum)
-            if params[4].starts_with(":Z64:") || params[4].starts_with(":B64:") {
-                self.decode_z64_data(params[4])?
+            if raw.starts_with(":Z64:") || raw.starts_with(":B64:") {
+                self.decode_z64_data(&raw)?
             } else {
                 match compression {
-                    CompressionType::Ascii => self.decode_hex_data(params[4])?,
+                    CompressionType::Ascii => self.decode_hex_data(&raw, bytes_per_row),
                     CompressionType::Binary | CompressionType::CompressedBinary => {
-                        params[4].as_bytes().to_vec()
+                        raw.as_bytes().to_vec()
                     }
                 }
             }
@@ -394,20 +398,56 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn decode_hex_data(&self, hex_str: &str) -> Result<Vec<u8>, ParseError> {
-        let mut bytes = Vec::new();
-        let mut chars = hex_str.chars().filter(|c| !c.is_whitespace());
+    /// Decodes ASCII hex graphic data, including ZPL's ASCII compression:
+    /// - `G`-`Y` repeat the next hex digit 1-19 times, `g`-`z` add 20-400 (combinable)
+    /// - `,` fills the rest of the row with `0`
+    /// - `!` fills the rest of the row with `F`
+    /// - `:` repeats the previous row
+    fn decode_hex_data(&self, hex_str: &str, bytes_per_row: u32) -> Vec<u8> {
+        let row_len = (bytes_per_row as usize) * 2;
+        // One flat nibble buffer. Complete rows occupy whole multiples of `row_len`, so the
+        // row being built starts at the last such multiple and the previous row precedes it.
+        let mut nibbles: Vec<u8> = Vec::with_capacity(hex_str.len() * 2);
+        let row_start = |len: usize| len / row_len * row_len;
+        let mut repeat: usize = 0;
 
-        while let Some(high) = chars.next() {
-            if let Some(low) = chars.next() {
-                let hex_pair = format!("{}{}", high, low);
-                if let Ok(byte) = u8::from_str_radix(&hex_pair, 16) {
-                    bytes.push(byte);
+        for &c in hex_str.as_bytes() {
+            match c {
+                b'G'..=b'Y' => repeat += (c - b'F') as usize,
+                b'g'..=b'z' => repeat += (c - b'f') as usize * 20,
+                b',' | b'!' if row_len > 0 => {
+                    let fill = if c == b',' { 0x0 } else { 0xF };
+                    let start = row_start(nibbles.len());
+                    nibbles.resize(start + row_len, fill);
+                    repeat = 0;
+                }
+                b':' if row_len > 0 => {
+                    let mut start = row_start(nibbles.len());
+                    if nibbles.len() > start {
+                        nibbles.resize(start + row_len, 0);
+                        start += row_len;
+                    }
+                    if start >= row_len {
+                        nibbles.extend_from_within(start - row_len..start);
+                    } else {
+                        nibbles.resize(row_len, 0);
+                    }
+                    repeat = 0;
+                }
+                _ => {
+                    let value = match c {
+                        b'0'..=b'9' => c - b'0',
+                        b'A'..=b'F' => c - b'A' + 10,
+                        b'a'..=b'f' => c - b'a' + 10,
+                        _ => continue,
+                    };
+                    nibbles.resize(nibbles.len() + repeat.max(1), value);
+                    repeat = 0;
                 }
             }
         }
 
-        Ok(bytes)
+        nibbles.chunks_exact(2).map(|pair| (pair[0] << 4) | pair[1]).collect()
     }
 
     fn decode_z64_data(&self, data: &str) -> Result<Vec<u8>, ParseError> {

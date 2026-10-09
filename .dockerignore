@@ -1,0 +1,12 @@
+**/target
+**/.DS_Store
+.git
+.github
+.claude
+CLAUDE.md
+Dockerfile
+.dockerignore
+generated-images
+docs
+*.pdf
+*.png

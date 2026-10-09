@@ -236,22 +236,30 @@ impl StateManager {
                 } else {
                     self.current_font_orientation = Orientation::Normal;
                 }
+                // Scalable fonts keep their aspect ratio when only one dimension is given
                 if let Some(h) = height {
                     self.current_font_height = h;
                 }
-                if let Some(w) = width {
+                if let Some(w) = width.or(height) {
                     self.current_font_width = w;
+                }
+                if width.is_some() && height.is_none() {
+                    self.current_font_height = self.current_font_width;
                 }
                 None
             }
 
             Command::ChangeFont { font, height, width } => {
                 self.current_font = font;
+                // Scalable fonts keep their aspect ratio when only one dimension is given
                 if let Some(h) = height {
                     self.current_font_height = h;
                 }
-                if let Some(w) = width {
+                if let Some(w) = width.or(height) {
                     self.current_font_width = w;
+                }
+                if width.is_some() && height.is_none() {
+                    self.current_font_height = self.current_font_width;
                 }
                 None
             }

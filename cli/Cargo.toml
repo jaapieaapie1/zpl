@@ -12,3 +12,4 @@ zpl-tokenizer = { path = "../zpl-tokenizer" }
 zpl-parser = { path = "../zpl-parser" }
 zpl-state-manager = { path = "../zpl-state-manager" }
 png-renderer = { path = "../png-renderer" }
+pdf-renderer = { path = "../pdf-renderer" }

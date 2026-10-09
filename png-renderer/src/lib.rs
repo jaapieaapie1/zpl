@@ -1,8 +1,10 @@
 use image::{ImageBuffer, Rgb, RgbImage};
 use imageproc::drawing;
 use ab_glyph::{FontRef, PxScale};
-use zpl_parser::command::{LineColor, Orientation, DiagonalDirection, Justification};
+use zpl_parser::command::{Code128Mode, LineColor, Orientation, DiagonalDirection, Justification};
 use zpl_state_manager::DrawInstruction;
+
+pub mod code128;
 
 pub struct PngRenderer {
     width: u32,
@@ -37,8 +39,8 @@ impl PngRenderer {
                 }
                 self.render_text(image, *x, *y, text, *height, *width, orientation, justification);
             }
-            DrawInstruction::DrawBarcode { x, y, data, orientation, height, module_width, wide_bar_ratio, .. } => {
-                self.render_code128(image, *x, *y, data, orientation, *height, *module_width, *wide_bar_ratio);
+            DrawInstruction::DrawBarcode { x, y, data, orientation, height, module_width, print_interpretation_line, print_interpretation_line_above, mode, .. } => {
+                self.render_code128(image, *x, *y, data, orientation, *height, *module_width, *print_interpretation_line, *print_interpretation_line_above, *mode);
             }
             DrawInstruction::DrawCode39 { x, y, data, orientation, height, module_width, .. } => {
                 self.render_code39(image, *x, *y, data, *orientation, *height, *module_width);
@@ -67,11 +69,24 @@ impl PngRenderer {
         }
     }
 
-    fn render_text(&self, image: &mut RgbImage, x: u32, y: u32, text: &str, height: u32, _width: u32, orientation: &Orientation, justification: &Justification) {
+    fn render_text(&self, image: &mut RgbImage, x: u32, y: u32, text: &str, height: u32, width: u32, orientation: &Orientation, justification: &Justification) {
+        use ab_glyph::Font;
+
         let font_data = include_bytes!("../fonts/ATTriumvirate-BoldCd.otf");
         let font = FontRef::try_from_slice(font_data).expect("Error loading font");
 
-        let scale = PxScale::from(height as f32);
+        // Zebra sizes scalable fonts in em units, ab_glyph's PxScale is ascent - descent
+        let units_per_em = font.units_per_em().unwrap_or(1000.0);
+        let px_per_em = font.height_unscaled() / units_per_em;
+        let width = if width == 0 { height } else { width };
+        let scale = PxScale {
+            x: width as f32 * px_per_em,
+            y: height as f32 * px_per_em,
+        };
+
+        // Zebra places the top of capital letters at the field origin, ab_glyph places the ascent there
+        let cap_height = units_per_em * 0.75;
+        let y_offset = ((font.ascent_unscaled() - cap_height) / units_per_em * height as f32).round() as i32;
         let color = Rgb([0, 0, 0]);
 
         match orientation {
@@ -82,7 +97,7 @@ impl PngRenderer {
                     Justification::Right => x.saturating_sub(text_width),
                     Justification::Auto => x.saturating_sub(text_width / 2),
                 };
-                drawing::draw_text_mut(image, color, adjusted_x as i32, y as i32, scale, &font, text);
+                drawing::draw_text_mut(image, color, adjusted_x as i32, y as i32 - y_offset, scale, &font, text);
             }
             Orientation::Rotated90 => {
                 let text_width = self.estimate_text_width(&font, scale, text);
@@ -90,7 +105,7 @@ impl PngRenderer {
 
                 if text_width > 0 && text_height > 0 {
                     let mut temp_image: RgbImage = ImageBuffer::from_pixel(text_width, text_height, Rgb([255, 255, 255]));
-                    drawing::draw_text_mut(&mut temp_image, color, 0, 0, scale, &font, text);
+                    drawing::draw_text_mut(&mut temp_image, color, 0, -y_offset, scale, &font, text);
 
                     let rotated = image::imageops::rotate90(&temp_image);
 
@@ -108,7 +123,7 @@ impl PngRenderer {
 
                 if text_width > 0 && text_height > 0 {
                     let mut temp_image: RgbImage = ImageBuffer::from_pixel(text_width, text_height, Rgb([255, 255, 255]));
-                    drawing::draw_text_mut(&mut temp_image, color, 0, 0, scale, &font, text);
+                    drawing::draw_text_mut(&mut temp_image, color, 0, -y_offset, scale, &font, text);
 
                     let rotated = image::imageops::rotate180(&temp_image);
 
@@ -126,7 +141,7 @@ impl PngRenderer {
 
                 if text_width > 0 && text_height > 0 {
                     let mut temp_image: RgbImage = ImageBuffer::from_pixel(text_width, text_height, Rgb([255, 255, 255]));
-                    drawing::draw_text_mut(&mut temp_image, color, 0, 0, scale, &font, text);
+                    drawing::draw_text_mut(&mut temp_image, color, 0, -y_offset, scale, &font, text);
 
                     let rotated = image::imageops::rotate270(&temp_image);
 
@@ -174,74 +189,84 @@ impl PngRenderer {
         }
     }
 
-    fn render_code128(&self, image: &mut RgbImage, x: u32, y: u32, data: &str, orientation: &Orientation, height: u32, module_width: u32, wide_bar_ratio: f32) {
-        let cleaned_data = data
-            .replace(">:", "")
-            .replace(">5", "")
-            .replace(">6", "")
-            .replace(">7", "")
-            .replace(">8", "");
+    fn render_code128(&self, image: &mut RgbImage, x: u32, y: u32, data: &str, orientation: &Orientation, height: u32, module_width: u32, print_interpretation_line: bool, print_interpretation_line_above: bool, mode: Code128Mode) {
+        use ab_glyph::{Font, ScaleFont};
 
+        let code = code128::encode(data, mode);
         let bar_width = module_width.max(1);
-        let mut pattern = Vec::new();
+        let widths = code.widths();
+        let barcode_width: u32 = widths.iter().map(|&w| w as u32 * bar_width).sum();
 
-        pattern.extend_from_slice(&[2, 1, 2, 2, 2, 2]);
+        let font_data = include_bytes!("../fonts/DejaVuSansMono.ttf");
+        let font = FontRef::try_from_slice(font_data).expect("Error loading font");
 
-        for ch in cleaned_data.chars() {
-            let patterns = match ch {
-                '0' => [2, 1, 2, 2, 2, 2],
-                '1' => [2, 2, 2, 1, 2, 2],
-                '2' => [2, 2, 2, 2, 2, 1],
-                '3' => [1, 2, 1, 2, 2, 3],
-                '4' => [1, 2, 1, 3, 2, 2],
-                '5' => [1, 3, 1, 2, 2, 2],
-                '6' => [1, 2, 2, 2, 1, 3],
-                '7' => [1, 2, 2, 3, 1, 2],
-                '8' => [1, 3, 2, 2, 1, 2],
-                '9' => [3, 1, 1, 2, 2, 2],
-                _ => [2, 1, 2, 2, 2, 2],
-            };
-            pattern.extend_from_slice(&patterns);
-        }
+        // Interpretation line: monospaced; pitch, digit height and gap scale with the module width (matches Labelary).
+        let char_advance = bar_width as f32 * 143.0 / 24.0;
+        let digit_height = (bar_width * 7) as f32;
+        let zero = font.glyph_id('0');
+        let zero_height_unscaled = font.outline(zero)
+            .map(|o| (o.bounds.max.y - o.bounds.min.y).abs())
+            .unwrap_or(font.ascent_unscaled());
+        let scale = PxScale {
+            x: char_advance * font.height_unscaled() / font.h_advance_unscaled(zero),
+            y: digit_height * font.height_unscaled() / zero_height_unscaled,
+        };
+        let scaled_font = font.as_scaled(scale);
+        let text_gap = (bar_width * 2) as f32;
 
-        pattern.extend_from_slice(&[2, 3, 3, 1, 1, 1, 2]);
+        let show_text = print_interpretation_line && !code.text.is_empty();
+        let text_width = if show_text { (char_advance * code.text.chars().count() as f32).ceil() as u32 } else { 0 };
+        let text_area = if show_text { (text_gap + digit_height - scaled_font.descent()).ceil() as u32 } else { 0 };
 
-        let barcode_width: u32 = pattern.iter().map(|&w| w * bar_width).sum();
-        let mut temp_image: RgbImage = ImageBuffer::from_pixel(barcode_width, height, Rgb([255, 255, 255]));
+        let pad = text_width.saturating_sub(barcode_width) / 2;
+        let total_width = barcode_width + 2 * pad;
+        let total_height = height + text_area;
+        let (bars_y, baseline) = if print_interpretation_line_above {
+            (text_area, digit_height)
+        } else {
+            (0, height as f32 + text_gap + digit_height)
+        };
 
-        let mut x_pos = 0;
-        for (i, &width) in pattern.iter().enumerate() {
-            let is_bar = i % 2 == 0;
-            let pixel_width = width * bar_width;
+        let mut temp_image: RgbImage = ImageBuffer::from_pixel(total_width.max(1), total_height.max(1), Rgb([255, 255, 255]));
 
-            if is_bar {
-                for w in 0..pixel_width {
-                    for h in 0..height {
-                        if x_pos + w < barcode_width {
-                            temp_image.put_pixel(x_pos + w, h, Rgb([0, 0, 0]));
-                        }
+        let mut x_pos = pad;
+        for (i, &width) in widths.iter().enumerate() {
+            let pixel_width = width as u32 * bar_width;
+            if i % 2 == 0 {
+                for px in x_pos..x_pos + pixel_width {
+                    for py in bars_y..bars_y + height {
+                        temp_image.put_pixel(px, py, Rgb([0, 0, 0]));
                     }
                 }
             }
             x_pos += pixel_width;
         }
 
+        if show_text {
+            let text_x = pad as f32 + (barcode_width as f32 - text_width as f32) / 2.0;
+            let text_y = baseline - scaled_font.ascent();
+            for (i, ch) in code.text.chars().enumerate() {
+                let ch_x = text_x + i as f32 * char_advance;
+                drawing::draw_text_mut(&mut temp_image, Rgb([0, 0, 0]), ch_x.round() as i32, text_y.round() as i32, scale, &font, &ch.to_string());
+            }
+        }
+
         match orientation {
             Orientation::Normal => {
-                self.overlay_image(image, &temp_image, x, y);
+                self.overlay_image(image, &temp_image, x.saturating_sub(pad), y);
             }
             Orientation::Rotated90 => {
                 let rotated = image::imageops::rotate90(&temp_image);
-                self.overlay_image(image, &rotated, x, y);
+                self.overlay_image(image, &rotated, x, y.saturating_sub(pad));
             }
             Orientation::Rotated180 => {
                 let rotated = image::imageops::rotate180(&temp_image);
-                self.overlay_image(image, &rotated, x, y);
+                self.overlay_image(image, &rotated, x.saturating_sub(pad), y);
             }
             Orientation::Rotated270 => {
                 let rotated = image::imageops::rotate270(&temp_image);
                 let adjusted_x = x.saturating_sub(rotated.width());
-                let adjusted_y = y.saturating_sub(rotated.height());
+                let adjusted_y = y.saturating_sub(rotated.height()).saturating_sub(pad);
                 self.overlay_image(image, &rotated, adjusted_x, adjusted_y);
             }
         }
@@ -296,12 +321,32 @@ impl PngRenderer {
     }
 
     fn render_qr_code(&self, image: &mut RgbImage, x: u32, y: u32, data: &str, magnification: u32) {
-        use qrcode::QrCode;
+        use qrcode::{EcLevel, QrCode};
 
-        if let Ok(code) = QrCode::new(data.as_bytes()) {
+        // ^FD for QR codes starts with "<error correction><input mode>," e.g. "QA,data"
+        let (ec_level, payload) = match data.get(..3) {
+            Some(prefix) if prefix.ends_with(',') => {
+                let ec_level = match &prefix[..1] {
+                    "H" => EcLevel::H,
+                    "Q" => EcLevel::Q,
+                    "L" => EcLevel::L,
+                    _ => EcLevel::M,
+                };
+                (ec_level, &data[3..])
+            }
+            _ => (EcLevel::M, data),
+        };
+
+        let module_size = magnification.max(1);
+
+        if let Ok(code) = QrCode::with_error_correction_level(payload.as_bytes(), ec_level) {
             let qr_image = code.render::<Rgb<u8>>()
-                .min_dimensions(magnification, magnification)
+                .quiet_zone(false)
+                .module_dimensions(module_size, module_size)
                 .build();
+
+            // Zebra printers draw QR codes 10 dots below the field origin
+            let y = y + 10;
 
             for (qr_x, qr_y, pixel) in qr_image.enumerate_pixels() {
                 let target_x = x + qr_x;
@@ -459,4 +504,21 @@ impl PngRenderer {
 
 pub fn save_png(image: &RgbImage, path: &str) -> Result<(), image::ImageError> {
     image.save(path)
+}
+
+/// Encodes `image` in memory in the format implied by `path`'s extension, like
+/// [`save_png`] does, without writing it to disk.
+pub fn encode_image(image: &RgbImage, path: &str) -> Result<Vec<u8>, image::ImageError> {
+    encode_as(image, image::ImageFormat::from_path(path)?)
+}
+
+/// Encodes `image` as PNG in memory.
+pub fn encode_png(image: &RgbImage) -> Result<Vec<u8>, image::ImageError> {
+    encode_as(image, image::ImageFormat::Png)
+}
+
+fn encode_as(image: &RgbImage, format: image::ImageFormat) -> Result<Vec<u8>, image::ImageError> {
+    let mut bytes = Vec::new();
+    image.write_to(&mut std::io::Cursor::new(&mut bytes), format)?;
+    Ok(bytes)
 }

@@ -124,8 +124,8 @@ const DM_FNC1: u16 = 256;
 /// FNC1 marks GS1 DataMatrix), `<e><e>` literal escape char, `<e>dNNN` byte with decimal value NNN, `<e>@`..`<e>_` control
 /// characters 0-31. Other sequences are kept literally.
 ///
-/// The encoder picks the shortest ASCII / C40 / Text / EDIFACT / Base 256 segmentation
-/// (X12 is not used; C40 and EDIFACT cover its character set).
+/// Encodation follows Labelary (ISO/IEC 16022 annex P look-ahead, see [`dm_encode`]), so the
+/// symbols match it codeword for codeword.
 pub fn datamatrix(
     data: &[u8],
     rows: u32,
@@ -137,43 +137,39 @@ pub fn datamatrix(
         Some(e) if e.is_ascii() => dm_unescape(data, e as u8),
         _ => data.iter().map(|&b| u16::from(b)).collect(),
     };
-    let DmEncoded {
-        mut cws,
-        unlatch,
-        edf_unlatch_at,
-        edf_short_tail,
-    } = dm_encode(&input);
-    let len = cws.len();
-    // A decoder treats <= 2 codewords left at an EDIFACT group start as ASCII, so a final
-    // 2-byte EDIFACT group must not end exactly at the symbol end.
-    let needed = if edf_short_tail { len + 1 } else { len };
+    let (size, mut cws) = dm_codewords(&input, rows, cols, rectangular)?;
+    dm_ecc(&mut cws, size);
+    Ok(dm_place(&cws, size))
+}
 
-    let fits = |s: &&DmSize| usize::from(s.data) >= needed;
-    let size = if rows > 0 || cols > 0 {
+/// The symbol size and its padded data codewords (see [`datamatrix`] for the size rules).
+fn dm_codewords(
+    input: &[u16],
+    rows: u32,
+    cols: u32,
+    rectangular: bool,
+) -> Result<(&'static DmSize, Vec<u8>), EncodeError> {
+    let enc = dm_encode(input);
+    // The size must hold the codewords plus the pending values (as Labelary sizes it), and
+    // the finished data.
+    let finished = |s: &DmSize| {
+        let cap = usize::from(s.data);
+        let base = enc.cws.len() + enc.pending.len();
+        (base <= cap).then(|| dm_finish(&enc, input, cap - enc.cws.len())).filter(|c| c.len() <= cap)
+    };
+    let pick = |sizes: &'static [DmSize]| sizes.iter().find_map(|s| finished(s).map(|c| (s, c)));
+    let (size, mut cws) = if rows > 0 || cols > 0 {
         DM_SIZES
             .iter()
             .filter(|s| (s.rows != s.cols) == rectangular)
             .filter(|s| (rows == 0 || s.rows == rows) && (cols == 0 || s.cols == cols))
-            .find(fits)
+            .find_map(|s| finished(s).map(|c| (s, c)))
     } else {
-        rectangular
-            .then(|| DM_SIZES[24..].iter().find(fits))
-            .flatten()
-            .or_else(|| DM_SIZES[..24].iter().find(fits))
+        rectangular.then(|| pick(&DM_SIZES[24..])).flatten().or_else(|| pick(&DM_SIZES[..24]))
     }
     .ok_or(EncodeError::TooLong)?;
 
-    // Unlatch from C40/Text/EDIFACT if the symbol is not exactly full, then pad. An EDIFACT
-    // unlatch with <= 2 codewords left is implicit (the rest is read as ASCII) and must be omitted.
     let cap = usize::from(size.data);
-    if let Some(p) = edf_unlatch_at.filter(|&p| cap - p <= 2) {
-        cws.remove(p);
-    }
-    match unlatch {
-        Some(u @ 254) if len < cap => cws.push(u),
-        Some(u) if cap - len >= 3 => cws.push(u),
-        _ => {}
-    }
     if cws.len() < cap {
         cws.push(129);
     }
@@ -182,8 +178,7 @@ pub fn datamatrix(
         let v = 129 + (149 * p) % 253 + 1;
         cws.push(if v > 254 { v - 254 } else { v } as u8);
     }
-    dm_ecc(&mut cws, size);
-    Ok(dm_place(&cws, size))
+    Ok((size, cws))
 }
 
 /// Resolve ^BX escape sequences into bytes and [`DM_FNC1`] markers.
@@ -232,31 +227,31 @@ fn dm_unescape(data: &[u8], esc: u8) -> Vec<u16> {
     out
 }
 
-const DM_ASCII: usize = 0;
-const DM_B256: usize = 1;
-const DM_C40: usize = 2; // 2, 3, 4 = C40 with 0, 1, 2 pending values in the current triple
-const DM_TEXT: usize = 5; // 5, 6, 7 = Text with 0, 1, 2 pending values
-const DM_EDF: usize = 8; // 8..=11 = EDIFACT with 0..=3 pending characters in the current group
-const DM_STATES: usize = 12;
-
-/// Result of [`dm_encode`].
-struct DmEncoded {
-    /// Data codewords without padding.
-    cws: Vec<u8>,
-    /// Unlatch codeword to append when the data ends in C40/Text/EDIFACT (at a group boundary)
-    /// and the symbol has room left.
-    unlatch: Option<u8>,
-    /// Position of the stand-alone unlatch byte of the last mid-stream EDIFACT exit.
-    edf_unlatch_at: Option<usize>,
-    /// The data ends with a 2-byte EDIFACT group (one character + unlatch).
-    edf_short_tail: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmMode {
+    Ascii,
+    C40,
+    Text,
+    X12,
+    Edifact,
+    Base256,
 }
-/// Extra cost (twelfths of a codeword) of leaving EDIFACT with k pending characters: the
-/// unlatch value plus the bytes still needed to flush the group.
-const DM_EDF_EXIT: [u32; 4] = [12, 15, 18, 9];
+
+/// Result of [`dm_encode`]: the codewords so far and the open C40/Text/X12/EDIFACT values,
+/// finished by [`dm_finish`] once the symbol size is known.
+struct DmEncoded {
+    cws: Vec<u8>,
+    mode: DmMode,
+    /// Values of the incomplete C40/Text/X12 triple or EDIFACT group.
+    pending: Vec<u16>,
+}
 
 /// C40 (`text == false`) or Text values for one character; returns the value count.
 fn dm_c40_values(c: u16, text: bool, out: &mut [u16; 4]) -> usize {
+    if c == DM_FNC1 {
+        out[..2].copy_from_slice(&[1, 27]); // Shift 2, FNC1
+        return 2;
+    }
     let mut n = 0;
     let mut c = c;
     if c >= 128 {
@@ -285,240 +280,287 @@ fn dm_c40_values(c: u16, text: bool, out: &mut [u16; 4]) -> usize {
     n + 1
 }
 
-/// Data codewords (without padding) using the cheapest ASCII / C40 / Text / EDIFACT / Base 256
-/// segmentation, found by dynamic programming over (position, state) with costs in twelfths of
-/// a codeword (ASCII 12, C40/Text value 8, EDIFACT character 9). X12 is not used (C40 and
-/// EDIFACT cover it).
-fn dm_encode(input: &[u16]) -> DmEncoded {
-    const INF: u32 = u32::MAX;
-    let n = input.len();
-    let mut cost = vec![INF; (n + 1) * DM_STATES];
-    let mut back = vec![(0u32, 0u8); (n + 1) * DM_STATES];
-    cost[DM_ASCII] = 0;
-    let is_digit = |c: u16| (0x30..=0x39).contains(&c);
-    let mut vals = [0u16; 4];
-    for i in 0..n {
-        let ch = input[i];
-        let mut cur = [INF; DM_STATES];
-        cur.copy_from_slice(&cost[i * DM_STATES..(i + 1) * DM_STATES]);
-        let mut relax = |j: usize, t: usize, from: usize, c: u32| {
-            let k = j * DM_STATES + t;
-            if c < cost[k] {
-                cost[k] = c;
-                back[k] = (i as u32, from as u8);
-            }
-        };
-        // Cheapest way to be in ASCII at position i (any state at a group boundary + unlatch).
-        let mut best = (INF, DM_ASCII);
-        for (s, sw) in [
-            (DM_ASCII, 0),
-            (DM_B256, 0),
-            (DM_C40, 12),
-            (DM_TEXT, 12),
-            (DM_EDF, DM_EDF_EXIT[0]),
-            (DM_EDF + 1, DM_EDF_EXIT[1]),
-            (DM_EDF + 2, DM_EDF_EXIT[2]),
-            (DM_EDF + 3, DM_EDF_EXIT[3]),
-        ] {
-            let c = cur[s];
-            if c != INF && c + sw < best.0 {
-                best = (c + sw, s);
-            }
-        }
-        let (base_cost, base_state) = best;
-        if base_cost == INF {
-            continue;
-        }
-        // ASCII
-        if i + 1 < n && is_digit(ch) && is_digit(input[i + 1]) {
-            relax(i + 2, DM_ASCII, base_state, base_cost + 12);
-        }
-        let unit = if ch < 128 || ch == DM_FNC1 { 12 } else { 24 };
-        relax(i + 1, DM_ASCII, base_state, base_cost + unit);
-        if ch == DM_FNC1 {
-            continue;
-        }
-        // Base 256 (latch + one length byte)
-        relax(i + 1, DM_B256, base_state, base_cost + 36);
-        let c = cur[DM_B256];
-        if c != INF {
-            relax(i + 1, DM_B256, DM_B256, c + 12);
-        }
-        // C40 / Text: continue a value stream or latch
-        for (base, text) in [(DM_C40, false), (DM_TEXT, true)] {
-            let nv = dm_c40_values(ch, text, &mut vals);
-            let add = 8 * nv as u32;
-            relax(i + 1, base + nv % 3, base_state, base_cost + 12 + add);
-            for pending in 0..3 {
-                let c = cur[base + pending];
-                if c != INF {
-                    relax(i + 1, base + (pending + nv) % 3, base + pending, c + add);
-                }
-            }
-        }
-        // EDIFACT (ASCII 32..=94)
-        if (32..=94).contains(&ch) {
-            relax(i + 1, DM_EDF + 1, base_state, base_cost + 12 + 9);
-            for k in 0..4 {
-                let c = cur[DM_EDF + k];
-                if c != INF {
-                    relax(i + 1, DM_EDF + (k + 1) % 4, DM_EDF + k, c + 9);
-                }
-            }
-        }
-    }
-    // Final state: a pending pair of C40 values is completed with a Shift 1 pad value; EDIFACT
-    // with a partial group unlatches. C40/Text/EDIFACT at a group boundary only unlatch when the
-    // symbol is not exactly full (done by the caller), so that cost is not counted here.
-    let end_cost = |s: usize| {
-        let c = cost[n * DM_STATES + s];
-        match s {
-            _ if c == INF => INF,
-            4 | 7 => c + 8,
-            3 | 6 => INF,
-            _ if s > DM_EDF => c + DM_EDF_EXIT[s - DM_EDF],
-            _ => c,
-        }
-    };
-    let end = (0..DM_STATES)
-        .min_by_key(|&s| end_cost(s))
-        .unwrap_or(DM_ASCII);
+fn dm_is_x12(c: u16) -> bool {
+    matches!(c, 13 | 42 | 62 | 32 | 0x30..=0x39 | 0x41..=0x5a)
+}
 
-    // Reconstruct the per-character steps (from, to, state).
-    let mut steps: Vec<(usize, usize, usize)> = Vec::with_capacity(n);
-    let (mut j, mut t) = (n, end);
-    while j > 0 {
-        let (pi, ps) = back[j * DM_STATES + t];
-        steps.push((pi as usize, j, t));
-        j = pi as usize;
-        t = ps as usize;
+/// ISO/IEC 16022 annex P look-ahead test, as Labelary (Okapi Barcode, after zint) runs it:
+/// the encodation to continue with at `pos` when currently in `mode`.
+fn dm_look_ahead(input: &[u16], pos: usize, mode: DmMode) -> DmMode {
+    use DmMode::*;
+    // Smallest difference acted on (float noise).
+    const ST: f32 = 1.0 / 24.0;
+    let (mut a, mut c, mut t, mut x, mut e, mut b) =
+        if mode == Ascii { (0.0, 1.0, 1.0, 1.0, 1.0, 1.25) } else { (1.0, 2.0, 2.0, 2.0, 2.0, 2.25) };
+    match mode {
+        C40 => c = 0.0,
+        Text => t = 0.0,
+        X12 => x = 0.0,
+        Edifact => e = 0.0,
+        Base256 => b = 0.0,
+        Ascii => {}
     }
-    steps.reverse();
-
-    let mut out: Vec<u8> = Vec::with_capacity(n + 8);
-    let mode_of = |s: usize| match s {
-        DM_ASCII | DM_B256 => s,
-        DM_C40..DM_TEXT => DM_C40,
-        DM_TEXT..DM_EDF => DM_TEXT,
-        _ => DM_EDF,
-    };
-    let mut edf = [0u8; 4];
-    let mut edf_len = 0;
-    let mut edf_unlatch_at = None;
-    // Flush an EDIFACT group (1-4 six-bit values -> 1-3 bytes).
-    let flush_edf = |out: &mut Vec<u8>, edf: &[u8; 4], len: usize| {
-        let v = edf
-            .iter()
-            .take(len)
-            .enumerate()
-            .fold(0u32, |a, (k, &e)| a | u32::from(e) << (18 - 6 * k));
-        let bytes = v.to_be_bytes();
-        out.extend_from_slice(&bytes[1..1 + len.min(3)]);
-    };
-    let mut mode = DM_ASCII;
-    let mut b256_start = 0; // index of the Base 256 segment's first data byte in `out`
-    let mut triple = [0u16; 3];
-    let mut pending = 0;
-    let close_b256 = |out: &mut Vec<u8>, start: usize| {
-        let len = out.len() - start;
-        if len <= 249 {
-            out.insert(start, len as u8);
+    let mut sp = pos;
+    loop {
+        let mut best = None;
+        if let Some(&ch) = input.get(sp) {
+            let ext = ch > 127 && ch != DM_FNC1;
+            let digit = (0x30..=0x39).contains(&ch);
+            a = if digit { a + 0.5 } else { f32::ceil(a) + if ext { 2.0 } else { 1.0 } };
+            let third = |basic: bool| if basic { 2.0 / 3.0 } else if ext { 8.0 / 3.0 } else { 4.0 / 3.0 };
+            c += third(ch == 32 || digit || (0x41..=0x5a).contains(&ch));
+            t += third(ch == 32 || digit || (0x61..=0x7a).contains(&ch));
+            x += if dm_is_x12(ch) { 2.0 / 3.0 } else if ext { 13.0 / 3.0 } else { 10.0 / 3.0 };
+            e += if (32..=94).contains(&ch) { 0.75 } else if ext { 17.0 / 4.0 } else { 13.0 / 4.0 };
+            if ch == DM_FNC1 {
+                e += 6.0;
+            }
+            b += if ch == DM_FNC1 { 4.0 } else { 1.0 };
         } else {
-            out.splice(start..start, [(len / 250 + 249) as u8, (len % 250) as u8]);
+            // End of data: step (k).
+            [a, c, t, x, e, b] = [a, c, t, x, e, b].map(f32::ceil);
+            let mut count = c;
+            best = Some(C40);
+            for (n, m) in [(x, X12), (t, Text), (e, Edifact), (b, Base256)] {
+                if n < count - ST {
+                    (count, best) = (n, Some(m));
+                }
+            }
+            if a <= count + ST {
+                best = Some(Ascii);
+            }
         }
-        for (p, cw) in out.iter_mut().enumerate().skip(start) {
-            let v = u32::from(*cw) + (149 * (p as u32 + 1)) % 255 + 1;
-            *cw = if v > 255 { v - 256 } else { v } as u8;
+        if sp > pos + 3 {
+            // Step (r): the first scheme at least a codeword ahead of the others.
+            let below = |v: f32, others: &[f32]| others.iter().all(|&o| v + 1.0 < o - ST);
+            if below(c, &[a, b, e, t]) {
+                if c < x - ST {
+                    best = Some(C40);
+                } else if c <= x + ST {
+                    best = Some(if dm_x12_terminator_first(input, sp) { X12 } else { C40 });
+                }
+            }
+            if below(x, &[a, b, e, t, c]) {
+                best = Some(X12);
+            }
+            if below(t, &[a, b, e, x, c]) {
+                best = Some(Text);
+            }
+            if below(e, &[a, b, t, x, c]) {
+                best = Some(Edifact);
+            }
+            if b + 1.0 <= a + ST || below(b, &[e, t, x, c]) {
+                best = Some(Base256);
+            }
+            if [b, e, t, x, c].iter().all(|&o| a + 1.0 <= o + ST) {
+                best = Some(Ascii);
+            }
+        }
+        if let Some(m) = best {
+            return m;
+        }
+        sp += 1;
+    }
+}
+
+/// Annex P (r)(6)(ii)(I): an X12 terminator (CR, `*`, `>`) comes before the first non-X12
+/// character from `pos` on.
+fn dm_x12_terminator_first(input: &[u16], pos: usize) -> bool {
+    let rest = &input[pos.min(input.len())..];
+    let non_x12 = rest.iter().position(|&c| !dm_is_x12(c));
+    let terminator = rest.iter().position(|&c| matches!(c, 13 | 42 | 62));
+    matches!((terminator, non_x12), (Some(t), Some(n)) if t < n)
+}
+
+/// Data codewords by Labelary's encodation choices: ASCII with digit pairs, switching modes
+/// where the annex P look-ahead says so (checked from ASCII before every non-pair character,
+/// from C40/Text/X12 at triple boundaries, from EDIFACT before a group's last character and
+/// from Base 256 before every byte).
+fn dm_encode(input: &[u16]) -> DmEncoded {
+    use DmMode::*;
+    let n = input.len();
+    let mut out: Vec<u8> = Vec::with_capacity(n + 8);
+    let mut pending: Vec<u16> = Vec::with_capacity(6);
+    let mut vals = [0u16; 4];
+    let mut b256_start = 0; // index of the Base 256 segment's first data byte in `out`
+    let (mut mode, mut next) = (Ascii, Ascii);
+    let is_digit = |c: u16| (0x30..=0x39).contains(&c);
+    let triples = |out: &mut Vec<u8>, pending: &mut Vec<u16>| {
+        while pending.len() >= 3 {
+            let packed = 1600 * pending[0] + 40 * pending[1] + pending[2] + 1;
+            out.extend_from_slice(&packed.to_be_bytes());
+            pending.drain(..3);
         }
     };
-    for (from, to, s) in steps {
-        let t = mode_of(s);
-        if t != mode {
-            match mode {
-                DM_C40 | DM_TEXT => out.push(254),
-                DM_B256 => close_b256(&mut out, b256_start),
-                DM_EDF => {
-                    if edf_len == 0 {
-                        edf_unlatch_at = Some(out.len());
-                    }
-                    edf[edf_len] = 31; // unlatch
-                    flush_edf(&mut out, &edf, edf_len + 1);
-                    edf_len = 0;
-                }
-                _ => {}
-            }
-            match t {
-                DM_C40 => out.push(230),
-                DM_TEXT => out.push(239),
-                DM_EDF => out.push(240),
-                DM_B256 => {
-                    out.push(231);
-                    b256_start = out.len();
-                }
-                _ => {}
-            }
-            mode = t;
+    let mut sp = 0;
+    while sp < n {
+        if mode == Base256 && next != Base256 {
+            dm_close_b256(&mut out, b256_start);
         }
-        let c = input[from];
-        match t {
-            DM_ASCII => {
-                if to - from == 2 {
-                    out.push(130 + ((c - 0x30) * 10 + (input[from + 1] - 0x30)) as u8);
-                } else if c == DM_FNC1 {
-                    out.push(232);
-                } else if c < 128 {
-                    out.push(c as u8 + 1);
+        mode = next;
+        let c = input[sp];
+        match mode {
+            Ascii => {
+                if sp + 1 < n && is_digit(c) && is_digit(input[sp + 1]) {
+                    out.push(130 + ((c - 0x30) * 10 + (input[sp + 1] - 0x30)) as u8);
+                    sp += 2;
+                    continue;
+                }
+                next = dm_look_ahead(input, sp, Ascii);
+                match next {
+                    C40 => out.push(230),
+                    Text => out.push(239),
+                    X12 => out.push(238),
+                    Edifact => out.push(240),
+                    Base256 => {
+                        out.push(231);
+                        b256_start = out.len();
+                    }
+                    Ascii => {
+                        if c == DM_FNC1 {
+                            out.push(232);
+                        } else if c < 128 {
+                            out.push(c as u8 + 1);
+                        } else {
+                            out.push(235);
+                            out.push((c - 127) as u8);
+                        }
+                        sp += 1;
+                    }
+                }
+            }
+            C40 | Text | X12 => {
+                if pending.is_empty() {
+                    next = dm_look_ahead(input, sp, mode);
+                    // Never start an X12 triple that cannot hold the next characters.
+                    if next == X12 && input[sp..n.min(sp + 3)].iter().any(|&c| !dm_is_x12(c)) {
+                        next = Ascii;
+                    }
+                }
+                if next != mode {
+                    out.push(254);
+                    next = Ascii;
+                    continue;
+                }
+                if mode == X12 {
+                    pending.push(match c {
+                        13 => 0,
+                        42 => 1,
+                        62 => 2,
+                        32 => 3,
+                        0x30..=0x39 => c - 0x30 + 4,
+                        _ => c - 0x41 + 14,
+                    });
                 } else {
-                    out.push(235);
-                    out.push((c - 127) as u8);
+                    let nv = dm_c40_values(c, mode == Text, &mut vals);
+                    pending.extend_from_slice(&vals[..nv]);
+                }
+                triples(&mut out, &mut pending);
+                sp += 1;
+            }
+            Edifact => {
+                if pending.len() == 3 {
+                    next = dm_look_ahead(input, sp, Edifact);
+                }
+                if next == Edifact {
+                    pending.push(c & 0x3f);
+                    sp += 1;
+                } else {
+                    pending.push(31); // unlatch
+                    next = Ascii;
+                }
+                if pending.len() == 4 {
+                    dm_flush_edifact(&mut out, &pending);
+                    pending.clear();
                 }
             }
-            DM_C40 | DM_TEXT => {
-                let nv = dm_c40_values(c, t == DM_TEXT, &mut vals);
-                for &v in &vals[..nv] {
-                    triple[pending] = v;
-                    pending += 1;
-                    if pending == 3 {
-                        let packed = 1600 * triple[0] + 40 * triple[1] + triple[2] + 1;
-                        out.extend_from_slice(&packed.to_be_bytes());
-                        pending = 0;
-                    }
+            Base256 => {
+                next = dm_look_ahead(input, sp, Base256);
+                if next == Base256 {
+                    out.push(c as u8);
+                    sp += 1;
+                } else {
+                    next = Ascii;
                 }
             }
-            DM_EDF => {
-                edf[edf_len] = (c & 0x3f) as u8;
-                edf_len += 1;
-                if edf_len == 4 {
-                    flush_edf(&mut out, &edf, 4);
-                    edf_len = 0;
-                }
-            }
-            _ => out.push(c as u8),
         }
     }
-    if mode == DM_EDF && edf_len > 0 {
-        edf[edf_len] = 31;
-        flush_edf(&mut out, &edf, edf_len + 1);
-        edf_unlatch_at = None;
+    if mode == Base256 {
+        dm_close_b256(&mut out, b256_start);
     }
-    if pending == 2 {
-        let packed = 1600 * triple[0] + 40 * triple[1] + 1;
-        out.extend_from_slice(&packed.to_be_bytes());
+    DmEncoded { cws: out, mode, pending }
+}
+
+/// EDIFACT group of 1-4 six-bit values -> 1-3 bytes.
+fn dm_flush_edifact(out: &mut Vec<u8>, values: &[u16]) {
+    let v = values.iter().enumerate().fold(0u32, |a, (k, &e)| a | u32::from(e) << (18 - 6 * k));
+    out.extend_from_slice(&v.to_be_bytes()[1..1 + values.len().min(3)]);
+}
+
+/// Insert a Base 256 segment's length before `start` and randomise the segment.
+fn dm_close_b256(out: &mut Vec<u8>, start: usize) {
+    let len = out.len() - start;
+    if len <= 249 {
+        out.insert(start, len as u8);
+    } else {
+        out.splice(start..start, [(len / 250 + 249) as u8, (len % 250) as u8]);
     }
-    if mode == DM_B256 {
-        close_b256(&mut out, b256_start);
+    for (p, cw) in out.iter_mut().enumerate().skip(start) {
+        let v = u32::from(*cw) + (149 * (p as u32 + 1)) % 255 + 1;
+        *cw = if v > 255 { v - 256 } else { v } as u8;
     }
-    let unlatch = match mode {
-        DM_C40 | DM_TEXT => Some(254),
-        DM_EDF if edf_len == 0 => Some(31 << 2),
-        _ => None,
+}
+
+/// Closes the encodation once `left` codewords remain in the symbol (annex P / zint): the
+/// pending C40/Text/X12/EDIFACT values, the last characters in ASCII where they need it, and
+/// an unlatch only when there is room for more than the finished data.
+fn dm_finish(enc: &DmEncoded, input: &[u16], left: usize) -> Vec<u8> {
+    let mut out = enc.cws.clone();
+    let p = enc.pending.len();
+    // The input characters behind `k` pending single-value X12/EDIFACT values (or the last
+    // C40/Text character), in ASCII.
+    let ascii_tail = |out: &mut Vec<u8>, k: usize| {
+        for &c in &input[input.len() - k..] {
+            match c {
+                DM_FNC1 => out.push(232),
+                0..=127 => out.push(c as u8 + 1),
+                _ => out.extend_from_slice(&[235, (c - 127) as u8]),
+            }
+        }
     };
-    DmEncoded {
-        cws: out,
-        unlatch,
-        edf_unlatch_at,
-        edf_short_tail: mode == DM_EDF && edf_len == 1,
+    match enc.mode {
+        DmMode::C40 | DmMode::Text => match p {
+            1 => {
+                if left > 1 {
+                    out.push(254);
+                }
+                ascii_tail(&mut out, 1);
+            }
+            2 => {
+                let packed = 1600 * enc.pending[0] + 40 * enc.pending[1] + 1;
+                out.extend_from_slice(&packed.to_be_bytes());
+                if left > 2 {
+                    out.push(254);
+                }
+            }
+            _ if left > 0 => out.push(254),
+            _ => {}
+        },
+        DmMode::X12 => {
+            if !(left == 1 && p == 1) {
+                out.push(254);
+            }
+            ascii_tail(&mut out, p);
+        }
+        DmMode::Edifact if left <= 2 => ascii_tail(&mut out, p),
+        DmMode::Edifact => {
+            let mut group = enc.pending.clone();
+            group.push(31);
+            dm_flush_edifact(&mut out, &group);
+        }
+        DmMode::Ascii | DmMode::Base256 => {}
     }
+    out
 }
 
 /// Append interleaved Reed-Solomon codewords (GF(256), poly 0x12d) to the padded data.
@@ -861,7 +903,7 @@ fn pdf_dimensions(needed: u32, columns: u32, rows: u32) -> Option<(u32, u32)> {
 
 /// PDF417 high-level encoding (text / byte / numeric compaction), after zxing's
 /// `PDF417HighLevelEncoder` in auto mode, with Zebra's choice between text and numeric runs.
-fn pdf_high_level(msg: &[u8], out: &mut Vec<u16>) {
+pub(crate) fn pdf_high_level(msg: &[u8], out: &mut Vec<u16>) {
     const TEXT: u8 = 0;
     const BYTE: u8 = 1;
     const NUMERIC: u8 = 2;
@@ -2319,8 +2361,7 @@ mod tests {
     }
 
     #[test]
-    fn datamatrix_size_vs_reference_optimizer() {
-        // Our segmentation should never need a larger symbol than the optimizing reference encoder.
+    fn datamatrix_roundtrips_through_reference_decoder() {
         let samples: [&[u8]; 7] = [
             b"Hello",
             b"0123456789ABCDEFGHIJ-shipment 4711/2024 batch:XY12",
@@ -2332,18 +2373,39 @@ mod tests {
         ];
         for data in samples {
             let ours = datamatrix(data, 0, 0, false, None).unwrap();
-            let reference = datamatrix_ref::DataMatrix::encode(
-                data,
-                datamatrix_ref::SymbolList::default().enforce_square(),
-            )
-            .unwrap();
-            let rw = reference.bitmap().width() as u32;
-            assert!(
-                ours.width <= rw,
-                "{data:?}: ours {} reference {rw}",
-                ours.width
-            );
             assert_eq!(strict_dm(&ours), data);
+        }
+    }
+
+    #[test]
+    fn datamatrix_codewords_match_labelary() {
+        // Data codewords read back from Labelary renders: C40/Text/X12/EDIFACT/Base 256
+        // switches and the way each mode is closed.
+        let cases: [(&[u8], bool, &[u8]); 7] = [
+            (b"RECTANGLE AUTO", true, &[230, 196, 161, 208, 140, 128, 251, 21, 19, 210, 161, 254, 129]),
+            (b"DATAMATRIX 200", false, &[230, 108, 146, 91, 159, 211, 47, 231, 191, 254, 130, 129]),
+            (b"FT DATAMATRIX", false, &[230, 123, 236, 108, 146, 91, 159, 211, 47, 254, 89, 129]),
+            (
+                b"hello world lowercase text",
+                false,
+                &[239, 134, 42, 160, 164, 229, 128, 158, 236, 160, 197, 117, 105, 92, 147, 23, 251, 236, 105, 254, 129],
+            ),
+            (
+                b"ABC*DEF>GHI*123>456",
+                false,
+                &[238, 89, 233, 8, 251, 119, 37, 134, 178, 32, 56, 13, 202, 254, 55, 129],
+            ),
+            (
+                b"A.B.C/D:E;F.G/H:I;J",
+                false,
+                &[240, 6, 224, 174, 14, 241, 58, 23, 177, 174, 30, 242, 58, 39, 178, 159],
+            ),
+            (b"caf\xe9 cr\xe8me br\xfbl\xe9e", false, &[231, 61, 36, 184, 82, 107, 56, 16, 181, 192, 219, 105]),
+        ];
+        for (data, rectangular, expect) in cases {
+            let input: Vec<u16> = data.iter().map(|&b| u16::from(b)).collect();
+            let (_, cws) = dm_codewords(&input, 0, 0, rectangular).unwrap();
+            assert_eq!(&cws[..expect.len()], expect, "{}", String::from_utf8_lossy(data));
         }
     }
 

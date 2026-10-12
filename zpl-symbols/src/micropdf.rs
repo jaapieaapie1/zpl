@@ -6,7 +6,7 @@
 //! Tables after ISO/IEC 24728:2006 Tables 1, 2 and 10-12 (as tabulated in zint's
 //! `pdf417_tabs.h`, BSD-3-Clause).
 
-use crate::matrix::{CODEWORDS, SUB_ALPHA, is_pdf_text, pdf_bytes, pdf_numeric, pdf_text};
+use crate::matrix::{CODEWORDS, pdf_high_level};
 use crate::{RowHeight, Stacked, StackedRow, SymbolError};
 
 /// Data columns per variant (ISO/IEC 24728 Table 1 order).
@@ -210,139 +210,16 @@ pub(crate) fn smallest_variant(cols: u8, n: usize) -> Option<usize> {
         .min_by_key(|&v| ROWS[v])
 }
 
-/// How a run of the input is compacted.
-#[derive(Clone, Copy, PartialEq)]
-enum Compaction {
-    Text,
-    Numeric,
-    Byte,
-}
-
-/// A maximal run of digits, other text-compactable characters, or other bytes.
-#[derive(Clone, Copy)]
-struct Run {
-    start: usize,
-    end: usize,
-    /// Options in preference order of the default choice.
-    options: &'static [Compaction],
-}
-
-fn runs(data: &[u8]) -> Vec<Run> {
-    let class = |c: u8| {
-        if c.is_ascii_digit() {
-            0
-        } else if is_pdf_text(c) {
-            1
-        } else {
-            2
-        }
-    };
-    let mut spans: Vec<(usize, usize, u8)> = Vec::new();
-    let mut i = 0;
-    while i < data.len() {
-        let k = class(data[i]);
-        let start = i;
-        while i < data.len() && class(data[i]) == k {
-            i += 1;
-        }
-        spans.push((start, i, k));
-    }
-    // Only alternatives that can pay off are tried: Numeric Compaction for 5+ digits (fewer
-    // never save a codeword), Byte Compaction for short runs next to non-text bytes.
-    let near_binary =
-        |j: usize| (j > 0 && spans[j - 1].2 == 2) || spans.get(j + 1).is_some_and(|s| s.2 == 2);
-    spans
-        .iter()
-        .enumerate()
-        .map(|(j, &(start, end, k))| {
-            use Compaction::*;
-            let n = end - start;
-            let nb = n < 8 && near_binary(j);
-            let options: &'static [Compaction] = match k {
-                0 if n >= 13 => &[Numeric, Text],
-                0 if n >= 5 && nb => &[Text, Numeric, Byte],
-                0 if n >= 5 => &[Text, Numeric],
-                0 | 1 if nb => &[Text, Byte],
-                0 | 1 => &[Text],
-                _ => &[Byte],
-            };
-            Run {
-                start,
-                end,
-                options,
-            }
-        })
-        .collect()
-}
-
-/// Encode `data` with one compaction choice per run. MicroPDF417 starts in Byte Compaction
-/// (ISO/IEC 24728 5.4.3), so every block gets an explicit latch.
-fn encode_runs(data: &[u8], runs: &[Run], choice: &[Compaction], out: &mut Vec<u16>) {
-    let mut mode = Compaction::Byte;
-    let mut first = true;
-    let mut sub = SUB_ALPHA;
-    let mut i = 0;
-    while i < runs.len() {
-        // Merge consecutive runs with the same compaction into one block.
-        let c = choice[i];
-        let mut j = i + 1;
-        while j < runs.len() && choice[j] == c {
-            j += 1;
-        }
-        let block = &data[runs[i].start..runs[j - 1].end];
-        match c {
-            Compaction::Text => {
-                if mode != Compaction::Text || first {
-                    out.push(900);
-                    sub = SUB_ALPHA;
-                }
-                sub = pdf_text(block, sub, out);
-                mode = Compaction::Text;
-            }
-            Compaction::Numeric => {
-                out.push(902);
-                pdf_numeric(block, out);
-                mode = Compaction::Numeric;
-            }
-            Compaction::Byte => {
-                if block.len() == 1 && mode == Compaction::Text {
-                    out.push(913);
-                    out.push(u16::from(block[0]));
-                } else {
-                    pdf_bytes(block, out);
-                    mode = Compaction::Byte;
-                }
-            }
-        }
-        first = false;
-        i = j;
-    }
-}
-
-/// MicroPDF417 data codewords for `data` (no padding): the PDF417 text / byte / numeric
-/// compactions, with the compaction of each character run chosen greedily (left to right) to
-/// minimise the total codeword count, so short digit strings use Numeric Compaction when
-/// that is shorter (as the ZPL capacity table assumes, e.g. 8 digits in mode 0).
+/// MicroPDF417 data codewords for `data` (no padding): the PDF417 high-level encoding
+/// Labelary uses for ^B7 as well (see `pdf_high_level`), with an explicit Text Compaction
+/// latch first since MicroPDF417 starts in Byte Compaction (ISO/IEC 24728 5.4.3).
 pub(crate) fn micro_codewords(data: &[u8]) -> Vec<u16> {
-    let runs = runs(data);
-    let mut choice: Vec<Compaction> = runs.iter().map(|r| r.options[0]).collect();
-    let mut best = Vec::new();
-    encode_runs(data, &runs, &choice, &mut best);
-    let mut trial = Vec::with_capacity(best.len() + 8);
-    for i in 0..runs.len() {
-        let mut keep = choice[i];
-        for &alt in &runs[i].options[1..] {
-            choice[i] = alt;
-            trial.clear();
-            encode_runs(data, &runs, &choice, &mut trial);
-            if trial.len() < best.len() {
-                std::mem::swap(&mut best, &mut trial);
-                keep = alt;
-            }
-        }
-        choice[i] = keep;
+    let mut out = Vec::with_capacity(data.len() + 2);
+    pdf_high_level(data, &mut out);
+    if !matches!(out.first(), Some(900 | 901 | 902 | 924)) {
+        out.insert(0, 900);
     }
-    best
+    out
 }
 
 fn to_stacked(rows: Vec<Vec<bool>>) -> Stacked {

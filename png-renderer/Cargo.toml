@@ -12,10 +12,9 @@ zpl-state-manager = { path = "../zpl-state-manager" }
 zpl-parser = { path = "../zpl-parser" }
 image = "0.25"
 imageproc = "0.25"
-# ^BQ (src/qr.rs, shared with pdf-renderer). Private repository: fetched over SSH (see
-# .cargo/config.toml and the Dockerfile).
-qr-encode = { git = "ssh://git@github.com/jaapieaapie1/qrcode.git", rev = "2968749a95e03f715b2686bc1a7f44a59d6bf390", default-features = false }
-qr-core = { git = "ssh://git@github.com/jaapieaapie1/qrcode.git", rev = "2968749a95e03f715b2686bc1a7f44a59d6bf390", default-features = false }
+# ^BQ (src/qr.rs, shared with pdf-renderer).
+qr-encode = { git = "https://github.com/jaapieaapie1/qrcode.git", rev = "2968749a95e03f715b2686bc1a7f44a59d6bf390", default-features = false }
+qr-core = { git = "https://github.com/jaapieaapie1/qrcode.git", rev = "2968749a95e03f715b2686bc1a7f44a59d6bf390", default-features = false }
 ab_glyph = "0.2"
 zpl-symbols = { path = "../zpl-symbols" }
 # ^PA advanced text layout (src/layout.rs).
@@ -25,4 +24,4 @@ unicode-bidi-mirroring = "0.4.0"
 
 [dev-dependencies]
 # Decodes the ^BQ symbols in the qr tests.
-qr-decode = { git = "ssh://git@github.com/jaapieaapie1/qrcode.git", rev = "2968749a95e03f715b2686bc1a7f44a59d6bf390", default-features = false }
+qr-decode = { git = "https://github.com/jaapieaapie1/qrcode.git", rev = "2968749a95e03f715b2686bc1a7f44a59d6bf390", default-features = false }

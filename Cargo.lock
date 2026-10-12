@@ -1284,12 +1284,12 @@ dependencies = [
 [[package]]
 name = "qr-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/jaapieaapie1/qrcode.git?rev=2968749a95e03f715b2686bc1a7f44a59d6bf390#2968749a95e03f715b2686bc1a7f44a59d6bf390"
+source = "git+https://github.com/jaapieaapie1/qrcode.git?rev=2968749a95e03f715b2686bc1a7f44a59d6bf390#2968749a95e03f715b2686bc1a7f44a59d6bf390"
 
 [[package]]
 name = "qr-decode"
 version = "0.1.0"
-source = "git+ssh://git@github.com/jaapieaapie1/qrcode.git?rev=2968749a95e03f715b2686bc1a7f44a59d6bf390#2968749a95e03f715b2686bc1a7f44a59d6bf390"
+source = "git+https://github.com/jaapieaapie1/qrcode.git?rev=2968749a95e03f715b2686bc1a7f44a59d6bf390#2968749a95e03f715b2686bc1a7f44a59d6bf390"
 dependencies = [
  "qr-core",
 ]
@@ -1297,7 +1297,7 @@ dependencies = [
 [[package]]
 name = "qr-encode"
 version = "0.1.0"
-source = "git+ssh://git@github.com/jaapieaapie1/qrcode.git?rev=2968749a95e03f715b2686bc1a7f44a59d6bf390#2968749a95e03f715b2686bc1a7f44a59d6bf390"
+source = "git+https://github.com/jaapieaapie1/qrcode.git?rev=2968749a95e03f715b2686bc1a7f44a59d6bf390#2968749a95e03f715b2686bc1a7f44a59d6bf390"
 dependencies = [
  "qr-core",
 ]

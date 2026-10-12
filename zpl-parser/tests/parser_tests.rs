@@ -309,7 +309,7 @@ fn test_graphic_diagonal_line_full() {
             height: 50,
             thickness: 2,
             color: LineColor::White,
-            direction: DiagonalDirection::LeftToRight
+            direction: DiagonalDirection::RightToLeft
         }
     );
 }
@@ -744,11 +744,11 @@ fn test_diagonal_direction_values() {
     let result = parser.parse().unwrap();
 
     if let Command::GraphicDiagonalLine { direction, .. } = result[0] {
-        assert_eq!(direction, DiagonalDirection::LeftToRight);
+        assert_eq!(direction, DiagonalDirection::RightToLeft);
     }
 
     if let Command::GraphicDiagonalLine { direction, .. } = result[1] {
-        assert_eq!(direction, DiagonalDirection::RightToLeft);
+        assert_eq!(direction, DiagonalDirection::LeftToRight);
     }
 }
 

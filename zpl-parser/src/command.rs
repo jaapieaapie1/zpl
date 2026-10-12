@@ -542,7 +542,9 @@ pub enum CompressionType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagonalDirection {
+    /// ^GD L, left-leaning: top-left to bottom-right (`\`).
     LeftToRight,
+    /// ^GD R or `/`, right-leaning: top-right to bottom-left (`/`).
     RightToLeft,
 }
 

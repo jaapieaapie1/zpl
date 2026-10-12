@@ -119,8 +119,9 @@ fn draw_ellipse(ctx: &mut Ctx, x: u32, y: u32, width: u32, height: u32, thicknes
     ctx.content.restore_state();
 }
 
-/// Corner points of a ^GD parallelogram: the line spans `width` x `height` dots and
-/// has a horizontal thickness of `thickness` dots.
+/// Corner points of a ^GD parallelogram: the line's left edge runs corner to corner of the
+/// `width` x `height` box and it is `thickness` dots wide horizontally, so it sticks out
+/// `thickness` dots on the right (as Labelary draws it).
 pub(crate) fn diagonal_points(
     x: u32,
     y: u32,
@@ -130,15 +131,14 @@ pub(crate) fn diagonal_points(
     direction: DiagonalDirection,
 ) -> [(f32, f32); 4] {
     let t = thickness as f32;
-    let w = (width.max(thickness)) as f32;
     let h = height.max(1) as f32;
     let (x0, y0) = (x as f32, y as f32);
-    let (x1, y1) = (x0 + w, y0 + h);
+    let (x1, y1) = (x0 + width as f32, y0 + h);
     match direction {
         // '\' : top-left to bottom-right
-        DiagonalDirection::LeftToRight => [(x0, y0), (x0 + t, y0), (x1, y1), (x1 - t, y1)],
+        DiagonalDirection::LeftToRight => [(x0, y0), (x0 + t, y0), (x1 + t, y1), (x1, y1)],
         // '/' : top-right to bottom-left
-        DiagonalDirection::RightToLeft => [(x1 - t, y0), (x1, y0), (x0 + t, y1), (x0, y1)],
+        DiagonalDirection::RightToLeft => [(x1, y0), (x1 + t, y0), (x0 + t, y1), (x0, y1)],
     }
 }
 
@@ -241,8 +241,8 @@ mod tests {
     #[test]
     fn diagonal_geometry() {
         let p = diagonal_points(0, 0, 100, 50, 4, DiagonalDirection::LeftToRight);
-        assert_eq!(p, [(0.0, 0.0), (4.0, 0.0), (100.0, 50.0), (96.0, 50.0)]);
+        assert_eq!(p, [(0.0, 0.0), (4.0, 0.0), (104.0, 50.0), (100.0, 50.0)]);
         let p = diagonal_points(0, 0, 100, 50, 4, DiagonalDirection::RightToLeft);
-        assert_eq!(p, [(96.0, 0.0), (100.0, 0.0), (4.0, 50.0), (0.0, 50.0)]);
+        assert_eq!(p, [(100.0, 0.0), (104.0, 0.0), (4.0, 50.0), (0.0, 50.0)]);
     }
 }

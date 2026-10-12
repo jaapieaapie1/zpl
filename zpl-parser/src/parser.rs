@@ -1157,8 +1157,9 @@ impl<'a> Parser<'a> {
         span: Span,
     ) -> Result<DiagonalDirection, ParseError> {
         match s.to_uppercase().as_str() {
-            "R" | "/" => Ok(DiagonalDirection::LeftToRight),
-            "L" | "\\" => Ok(DiagonalDirection::RightToLeft),
+            // Labelary draws '\' right-leaning too (the default), not left-leaning as documented.
+            "R" | "/" | "\\" => Ok(DiagonalDirection::RightToLeft),
+            "L" => Ok(DiagonalDirection::LeftToRight),
             _ => Err(ParseError::InvalidNumber {
                 value: s.to_string(),
                 span,

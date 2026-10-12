@@ -33,6 +33,10 @@ pub struct PngRenderer {
     /// Printer dots per format dot (^JM / ^MU, see [`PageSetup::scale`]): the page is drawn
     /// in format dots and then enlarged to printer dots.
     scale: (u32, u32),
+    /// ^POI: the finished page is turned 180 degrees.
+    inverted: bool,
+    /// ^PMY: the finished page is mirrored left to right.
+    mirrored: bool,
     /// Area drawn by the instruction being rendered: [x0, y0, x1, y1), clipped to the page.
     #[cfg(feature = "source-map")]
     drawn: std::cell::Cell<Option<[i64; 4]>>,
@@ -493,15 +497,23 @@ impl PngRenderer {
             debug,
             dpmm: DEFAULT_DPMM,
             scale: (1, 1),
+            inverted: false,
+            mirrored: false,
             #[cfg(feature = "source-map")]
             drawn: std::cell::Cell::new(None),
         }
     }
 
-    /// Renderer for a label's page settings: size, printer resolution and ^JM / ^MU format
-    /// scale. The image has one pixel per printer dot.
+    /// Renderer for a label's page settings: size, printer resolution, ^JM / ^MU format
+    /// scale and ^PO / ^PM. The image has one pixel per printer dot.
     pub fn for_page(page: &PageSetup, debug: bool) -> Self {
-        Self { dpmm: page.dpmm, scale: page.scale, ..Self::with_debug(page.width, page.height, debug) }
+        Self {
+            dpmm: page.dpmm,
+            scale: page.scale,
+            inverted: page.inverted,
+            mirrored: page.mirrored,
+            ..Self::with_debug(page.width, page.height, debug)
+        }
     }
 
     pub fn render(&self, instructions: &[DrawInstruction]) -> RgbImage {
@@ -511,7 +523,20 @@ impl PngRenderer {
             self.render_instruction(&mut image, instruction);
         }
 
+        self.orient(&mut image);
         self.to_printer_dots(image)
+    }
+
+    /// ^POI turns the finished page upside down, ^PMY mirrors it left to right; both together
+    /// flip it top to bottom. Nothing to do (and no copy) when neither is set.
+    fn orient(&self, image: &mut RgbImage) {
+        use image::imageops;
+        match (self.inverted, self.mirrored) {
+            (false, false) => {}
+            (true, false) => imageops::rotate180_in_place(image),
+            (false, true) => imageops::flip_horizontal_in_place(image),
+            (true, true) => imageops::flip_vertical_in_place(image),
+        }
     }
 
     /// Enlarges a page drawn in format dots to printer dots (nearest neighbour, as the
@@ -550,6 +575,18 @@ impl PngRenderer {
                 height: (y1 - y0) as u32,
             }));
         }
+
+        // ^PO / ^PM move what each instruction drew along with the page.
+        let (w, h) = (image.width(), image.height());
+        for b in bounds.iter_mut().flatten() {
+            if self.inverted != self.mirrored {
+                b.x = w - b.x - b.width;
+            }
+            if self.inverted {
+                b.y = h - b.y - b.height;
+            }
+        }
+        self.orient(&mut image);
 
         if self.scale.0 != self.scale.1 {
             for b in bounds.iter_mut().flatten() {
@@ -1280,24 +1317,34 @@ impl PngRenderer {
         }
     }
 
+    /// ^GD: a parallelogram whose left edge runs corner to corner of the `width` x `height`
+    /// box, `thickness` dots wide on every row (so it sticks out `thickness` dots on the
+    /// right), as Labelary draws it: each row starts at the first dot right of the edge
+    /// where it crosses the row's top.
     #[allow(clippy::too_many_arguments)]
     fn render_diagonal_line(&self, image: &mut RgbImage, x: u32, y: u32, width: u32, height: u32, thickness: u32, color: &LineColor, direction: &DiagonalDirection) {
-        self.note_drawn(x as i64, y as i64, width + thickness, height + thickness);
+        if thickness == 0 {
+            return;
+        }
+        self.note_drawn(x as i64, y as i64, width + thickness, height.max(1));
         let rgb_color = self.line_color_to_rgb(color);
-
-        let (x1, y1, x2, y2) = match direction {
-            DiagonalDirection::LeftToRight => (x as f32, y as f32, (x + width) as f32, (y + height) as f32),
-            DiagonalDirection::RightToLeft => ((x + width) as f32, y as f32, x as f32, (y + height) as f32),
-        };
-
-        for t in 0..thickness {
-            let offset = t as f32;
-            drawing::draw_line_segment_mut(
-                image,
-                (x1 + offset, y1 + offset),
-                (x2 + offset, y2 + offset),
-                rgb_color,
-            );
+        let h = height.max(1) as f32;
+        let slope = width as f32 / h;
+        for row in 0..height.max(1) {
+            let py = y + row;
+            if py >= image.height() {
+                break;
+            }
+            let dy = row as f32;
+            let left = x as f32
+                + match direction {
+                    DiagonalDirection::LeftToRight => dy * slope,
+                    DiagonalDirection::RightToLeft => width as f32 - dy * slope,
+                };
+            let from = left.ceil().max(0.0) as u32;
+            for px in from..(from + thickness).min(image.width()) {
+                image.put_pixel(px, py, rgb_color);
+            }
         }
     }
 
@@ -1367,6 +1414,20 @@ impl PngRenderer {
     }
 }
 
+/// A page rendered on media of a given size, the way Labelary lays it out: the page keeps
+/// its ^PW width, centred on wider media (the offset rounded up) and clipped by narrower
+/// media at the right; it is cropped or padded with white at the bottom. ^POI and ^PMY
+/// apply to the page, before it is placed.
+pub fn place_on_media(page: RgbImage, width: u32, height: u32) -> RgbImage {
+    if page.dimensions() == (width, height) {
+        return page;
+    }
+    let offset = width.saturating_sub(page.width()).div_ceil(2);
+    let mut media: RgbImage = ImageBuffer::from_pixel(width, height, WHITE);
+    image::imageops::replace(&mut media, &page, offset as i64, 0);
+    media
+}
+
 pub fn save_png(image: &RgbImage, path: &str) -> Result<(), image::ImageError> {
     image.save(path)
 }
@@ -1424,6 +1485,50 @@ mod tests {
         };
         let image = PngRenderer::new(40, 20).render(&[filled]);
         assert!(black(&image, 20, 10));
+    }
+
+    #[test]
+    fn diagonal_thickness_is_horizontal_and_leans_like_labelary() {
+        let gd = |direction| DrawInstruction::DrawDiagonalLine {
+            x: 10, y: 10, width: 100, height: 50, thickness: 6, color: LineColor::Black, direction,
+        };
+        // L leans left (\): starts top-left, ends bottom-right, sticking out by the thickness.
+        let image = PngRenderer::new(200, 100).render(&[gd(DiagonalDirection::LeftToRight)]);
+        let row = |y| (0..200).filter(|&x| black(&image, x, y)).collect::<Vec<_>>();
+        assert_eq!(row(10), (10..16).collect::<Vec<_>>());
+        assert_eq!(row(59), (108..114).collect::<Vec<_>>());
+        assert!(row(60).is_empty());
+        // R leans right (/).
+        let image = PngRenderer::new(200, 100).render(&[gd(DiagonalDirection::RightToLeft)]);
+        let row = |y| (0..200).filter(|&x| black(&image, x, y)).collect::<Vec<_>>();
+        assert_eq!(row(10), (110..116).collect::<Vec<_>>());
+        assert_eq!(row(59), (12..18).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn inverted_and_mirrored_pages() {
+        let gb = DrawInstruction::DrawBox { x: 0, y: 0, width: 4, height: 2, thickness: 2, color: LineColor::Black, rounding: 0 };
+        let page = |inverted, mirrored| {
+            let setup = PageSetup { width: 10, height: 6, inverted, mirrored, ..PageSetup::default() };
+            PngRenderer::for_page(&setup, false).render(std::slice::from_ref(&gb))
+        };
+        let corner = |image: &RgbImage| (black(image, 0, 0), black(image, 9, 0), black(image, 0, 5), black(image, 9, 5));
+        assert_eq!(corner(&page(false, false)), (true, false, false, false));
+        assert_eq!(corner(&page(true, false)), (false, false, false, true));
+        assert_eq!(corner(&page(false, true)), (false, true, false, false));
+        assert_eq!(corner(&page(true, true)), (false, false, true, false));
+    }
+
+    #[test]
+    fn narrow_page_is_centred_on_media() {
+        let page: RgbImage = ImageBuffer::from_pixel(401, 3, BLACK);
+        let media = place_on_media(page, 812, 6);
+        // (812 - 401) / 2 rounded up.
+        assert!(!black(&media, 205, 0) && black(&media, 206, 0) && black(&media, 606, 2) && !black(&media, 607, 0));
+        assert!(!black(&media, 300, 3));
+        // A page wider than the media is clipped on the right.
+        let media = place_on_media(ImageBuffer::from_pixel(1000, 3, BLACK), 812, 3);
+        assert!(black(&media, 0, 0) && black(&media, 811, 0));
     }
 
     #[test]

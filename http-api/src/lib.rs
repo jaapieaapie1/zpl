@@ -1,7 +1,9 @@
 //! HTTP API for rendering ZPL labels to PDF or PNG.
 //!
 //! - `POST /render?format=pdf|png` with the raw ZPL as the request body. `format` defaults
-//!   to `pdf`. Responds with the rendered file (`application/pdf` or `image/png`).
+//!   to `pdf`. Responds with the rendered file (`application/pdf` or `image/png`). Every
+//!   label (^XA...^XZ, times its ^PQ copies) is a page: a PDF holds them all, a PNG shows
+//!   page `?page=N` (1-based, default 1). The `X-Page-Count` header gives the page count.
 //! - Add `timings` (`?timings` or `?format=png&timings=1`) to get a `Server-Timing` header
 //!   with the duration of each stage, which browser devtools display as well.
 //! - `GET /health` returns `ok`.
@@ -66,6 +68,8 @@ impl Format {
 /// A rendered label plus the duration of each rendering stage.
 pub struct Rendered {
     pub bytes: Vec<u8>,
+    /// Labels in the input; a PDF holds all of them, a PNG one.
+    pub page_count: usize,
     pub timings: Vec<(&'static str, Duration)>,
 }
 
@@ -73,10 +77,13 @@ pub struct Rendered {
 pub enum RenderError {
     Parse(String),
     Encode(String),
+    /// The requested PNG page (1-based) does not exist.
+    NoSuchPage { page: usize, page_count: usize },
 }
 
 /// Parses, lays out and renders `zpl`, timing each stage. Synchronous and CPU-bound.
-pub fn render_label(zpl: &str, format: Format) -> Result<Rendered, RenderError> {
+/// A PDF holds every page; a PNG shows `page` (1-based).
+pub fn render_label(zpl: &str, format: Format, page: usize) -> Result<Rendered, RenderError> {
     let mut timings = Vec::new();
     let mut last = Instant::now();
     let mut mark = |stage: &'static str| {
@@ -88,20 +95,22 @@ pub fn render_label(zpl: &str, format: Format) -> Result<Rendered, RenderError> 
     let commands = Parser::new(zpl).parse().map_err(|e| RenderError::Parse(format!("{e:?}")))?;
     mark("parse");
 
-    let mut state = StateManager::new();
-    let instructions = state.process(commands);
-    let page = state.page_setup();
-    let (width, height) = (page.width, page.height);
+    let pages = StateManager::new().process_pages(commands);
+    let page_count = pages.len();
     mark("state");
 
     let bytes = match format {
         Format::Pdf => {
-            let bytes = PdfRenderer::for_page(&page).render(&instructions);
+            let pages: Vec<_> = pages.iter().map(|p| (p.setup, p.instructions.as_slice())).collect();
+            let bytes = PdfRenderer::for_page(&pages[0].0).render_pages(&pages);
             mark("render");
             bytes
         }
         Format::Png => {
-            let image = PngRenderer::new(width, height).render(&instructions);
+            let Some(page) = page.checked_sub(1).and_then(|i| pages.get(i)) else {
+                return Err(RenderError::NoSuchPage { page, page_count });
+            };
+            let image = PngRenderer::new(page.setup.width, page.setup.height).render(&page.instructions);
             mark("render");
             let bytes = png_renderer::encode_png(&image).map_err(|e| RenderError::Encode(e.to_string()))?;
             mark("encode");
@@ -109,7 +118,7 @@ pub fn render_label(zpl: &str, format: Format) -> Result<Rendered, RenderError> 
         }
     };
 
-    Ok(Rendered { bytes, timings })
+    Ok(Rendered { bytes, page_count, timings })
 }
 
 /// Renders a small label touching every font and the QR/barcode/compression code, so the
@@ -119,7 +128,7 @@ pub fn warm_up() {
                          ^FO50,120^BCN,60,Y,N,N^FD12345^FS\
                          ^FO50,250^BQN,2,4^FDQA,warm up^FS^XZ";
     for format in [Format::Pdf, Format::Png] {
-        let _ = render_label(LABEL, format);
+        let _ = render_label(LABEL, format, 1);
     }
 }
 
@@ -141,6 +150,11 @@ async fn render(Query(params): Query<HashMap<String, String>>, body: Body) -> Re
         Some("png") => Format::Png,
         Some(other) => return error(StatusCode::BAD_REQUEST, format!("unsupported format {other:?}; use pdf or png")),
     };
+    let page = match params.get("page").map(|p| p.parse::<usize>()) {
+        None => 1,
+        Some(Ok(page)) if page >= 1 => page,
+        Some(_) => return error(StatusCode::BAD_REQUEST, "page must be a page number, starting at 1"),
+    };
     let timings_enabled = params.get("timings").is_some_and(|v| !matches!(v.as_str(), "0" | "false"));
 
     let body = match to_bytes(body, MAX_BODY_BYTES).await {
@@ -158,7 +172,7 @@ async fn render(Query(params): Query<HashMap<String, String>>, body: Body) -> Re
     let queued = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
         let queue = queued.elapsed();
-        render_label(&zpl, format).map(|rendered| (queue, rendered))
+        render_label(&zpl, format, page).map(|rendered| (queue, rendered))
     })
     .await;
 
@@ -166,6 +180,9 @@ async fn render(Query(params): Query<HashMap<String, String>>, body: Body) -> Re
         Ok(Ok(ok)) => ok,
         Ok(Err(RenderError::Parse(e))) => return error(StatusCode::BAD_REQUEST, format!("parse error: {e}")),
         Ok(Err(RenderError::Encode(e))) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("encode error: {e}")),
+        Ok(Err(RenderError::NoSuchPage { page, page_count })) => {
+            return error(StatusCode::BAD_REQUEST, format!("page {page} out of range; the label has {page_count} page(s)"))
+        }
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("render task failed: {e}")),
     };
 
@@ -174,6 +191,7 @@ async fn render(Query(params): Query<HashMap<String, String>>, body: Body) -> Re
         rendered.bytes,
     )
         .into_response();
+    response.headers_mut().insert("x-page-count", HeaderValue::from(rendered.page_count));
 
     if timings_enabled {
         let mut stages = vec![("read", read), ("queue", queue)];
@@ -264,6 +282,45 @@ mod tests {
         assert_eq!(post("/render?format=gif", LABEL).await.status(), StatusCode::BAD_REQUEST);
         let huge = vec![b'A'; MAX_BODY_BYTES + 1];
         assert_eq!(post("/render", huge).await.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    fn page_count(response: &Response) -> &str {
+        response.headers()["x-page-count"].to_str().unwrap()
+    }
+
+    #[tokio::test]
+    async fn pdf_has_a_page_per_label() {
+        let response = post("/render", LABEL).await;
+        assert_eq!(page_count(&response), "1");
+
+        let response = post("/render", format!("{LABEL}{LABEL}^XA^FO1,1^FDthird^FS^XZ")).await;
+        assert_eq!(page_count(&response), "3");
+        let pdf = body_bytes(response).await;
+        assert_eq!(String::from_utf8_lossy(&pdf).matches("/Type /Page\n").count(), 3);
+
+        let response = post("/render", "^XA^PQ3^FO1,1^SN001,1,Y^FS^XZ").await;
+        assert_eq!(page_count(&response), "3");
+        assert!(String::from_utf8_lossy(&body_bytes(response).await).contains("/Count 3"));
+    }
+
+    #[tokio::test]
+    async fn png_page_parameter() {
+        let two = "^XA^PW100^LL50^FO1,1^GB10,10,10^FS^XZ^XA^PW200^FO1,1^GB10,10,10^FS^XZ";
+        let width = |png: &[u8]| u32::from_be_bytes(png[16..20].try_into().unwrap());
+
+        let response = post("/render?format=png", two).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(page_count(&response), "2");
+        assert_eq!(width(&body_bytes(response).await), 100);
+
+        let response = post("/render?format=png&page=2", two).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(width(&body_bytes(response).await), 200);
+
+        for bad in ["3", "0", "x"] {
+            let response = post(&format!("/render?format=png&page={bad}"), two).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "page={bad}");
+        }
     }
 
     #[tokio::test]

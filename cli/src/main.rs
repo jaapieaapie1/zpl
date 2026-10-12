@@ -2,6 +2,7 @@ use pdf_renderer::PdfRenderer;
 use png_renderer::PngRenderer;
 use std::env;
 use std::io::{self, Read};
+use std::path::Path;
 use std::time::{Duration, Instant};
 use zpl_parser::Parser;
 use zpl_state_manager::StateManager;
@@ -86,30 +87,37 @@ fn main() {
         .unwrap_or_else(|e| fail("Parse error", e));
     timings.mark("parse");
 
-    let mut state_manager = StateManager::new();
-    let draw_instructions = state_manager.process(commands);
-    let page = state_manager.page_setup();
-    let (width, height) = (page.width, page.height);
+    let pages = StateManager::new().process_pages(commands);
+    let instruction_count: usize = pages.iter().map(|p| p.instructions.len()).sum();
     timings.mark("state");
 
-    // The PDF renderer produces finished file bytes; the PNG renderer produces an image
-    // that still has to be encoded.
-    let bytes = if is_pdf {
-        let bytes = PdfRenderer::for_page(&page).render(&draw_instructions);
+    // One file per label: a PDF holds every page; images are written as `output.png`,
+    // `output-2.png`, `output-3.png`, ...
+    let outputs: Vec<(String, Vec<u8>)> = if is_pdf {
+        let pages: Vec<_> = pages.iter().map(|p| (p.setup, p.instructions.as_slice())).collect();
+        let bytes = PdfRenderer::for_page(&pages[0].0).render_pages(&pages);
         timings.mark("render");
-        bytes
+        vec![(output_file.to_string(), bytes)]
     } else {
-        let renderer = if debug {
-            PngRenderer::with_debug(width, height, true)
-        } else {
-            PngRenderer::new(width, height)
-        };
-        let image = renderer.render(&draw_instructions);
-        timings.mark("render");
-        let bytes = png_renderer::encode_image(&image, output_file)
-            .unwrap_or_else(|e| fail("Failed to encode image", e));
-        timings.mark("encode");
-        bytes
+        pages
+            .iter()
+            .enumerate()
+            .map(|(i, page)| {
+                let (width, height) = (page.setup.width, page.setup.height);
+                let renderer = if debug {
+                    PngRenderer::with_debug(width, height, true)
+                } else {
+                    PngRenderer::new(width, height)
+                };
+                let image = renderer.render(&page.instructions);
+                timings.mark("render");
+                let path = page_path(output_file, i + 1);
+                let bytes = png_renderer::encode_image(&image, &path)
+                    .unwrap_or_else(|e| fail("Failed to encode image", e));
+                timings.mark("encode");
+                (path, bytes)
+            })
+            .collect()
     };
 
     // Same figure as before: parse through render, excluding encoding and disk IO.
@@ -118,11 +126,46 @@ fn main() {
         println!("{:?}", duration);
     }
 
-    std::fs::write(output_file, &bytes).unwrap_or_else(|e| fail("Failed to save output", e));
+    for (path, bytes) in &outputs {
+        std::fs::write(path, bytes).unwrap_or_else(|e| fail("Failed to save output", e));
+    }
     timings.mark("write file");
 
     if timings_enabled {
-        timings.print(bytes.len(), draw_instructions.len());
+        timings.print(outputs.iter().map(|(_, b)| b.len()).sum(), instruction_count);
     }
-    println!("{} saved to: {}", if is_pdf { "PDF" } else { "PNG" }, output_file);
+    if is_pdf {
+        let count = pages.len();
+        println!("PDF ({count} page{}) saved to: {output_file}", if count == 1 { "" } else { "s" });
+    } else {
+        for (path, _) in &outputs {
+            println!("PNG saved to: {path}");
+        }
+    }
+}
+
+/// Output path for page `n` (1-based): `path` itself for the first, `<stem>-<n>.<ext>` after.
+fn page_path(path: &str, n: usize) -> String {
+    if n == 1 {
+        return path.to_string();
+    }
+    let path = Path::new(path);
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let name = match path.extension() {
+        Some(ext) => format!("{stem}-{n}.{}", ext.to_string_lossy()),
+        None => format!("{stem}-{n}"),
+    };
+    path.with_file_name(name).to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_path;
+
+    #[test]
+    fn page_paths() {
+        assert_eq!(page_path("out/label.png", 1), "out/label.png");
+        assert_eq!(page_path("out/label.png", 2), "out/label-2.png");
+        assert_eq!(page_path("label", 3), "label-3");
+    }
 }

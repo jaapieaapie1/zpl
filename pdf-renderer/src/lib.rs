@@ -8,7 +8,8 @@
 //! (origin top-left, y down) to PDF points. All modules therefore draw in dot units.
 //! Anything that renders glyphs must flip y back locally (see `text.rs`).
 
-use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref};
+use pdf_writer::writers::Resources;
+use pdf_writer::{Buf, Content, Filter, Finish, Name, Pdf, Rect, Ref};
 use zpl_state_manager::{DrawInstruction, PageSetup};
 
 mod barcodes;
@@ -87,62 +88,47 @@ impl PdfRenderer {
     }
 
     pub fn render(&self, instructions: &[DrawInstruction]) -> Vec<u8> {
-        let scale = 72.0 / self.dpi;
-        let page_w = self.width as f32 * scale;
-        let page_h = self.height as f32 * scale;
-
-        let mut ctx = Ctx::new();
-
-        // Map dots (top-left origin, y down) to points (bottom-left origin, y up).
-        ctx.content.transform([scale, 0.0, 0.0, -scale, 0.0, page_h]);
-        let (w, h) = (self.width as f32, self.height as f32);
-        // ^PM mirrors left-right, ^POI turns the label upside down; both flips cancel x.
-        match (self.inverted, self.mirrored) {
-            (false, false) => {}
-            (false, true) => {
-                ctx.content.transform([-1.0, 0.0, 0.0, 1.0, w, 0.0]);
-            }
-            (true, false) => {
-                ctx.content.transform([-1.0, 0.0, 0.0, -1.0, w, h]);
-            }
-            (true, true) => {
-                ctx.content.transform([1.0, 0.0, 0.0, -1.0, 0.0, h]);
-            }
-        }
-
-        // Opaque white label stock, so ^FR (Difference blend) inverts against white rather than
-        // the transparent page backdrop, where it would just paint white.
-        ctx.content
-            .set_fill_gray(1.0)
-            .rect(0.0, 0.0, self.width as f32, self.height as f32)
-            .fill_nonzero()
-            .set_fill_gray(0.0);
-
-        for instruction in instructions {
-            render_instruction(&mut ctx, instruction);
-        }
-
-        self.write_document(ctx, page_w, page_h)
+        let page = PageSetup { width: self.width, height: self.height, inverted: self.inverted, mirrored: self.mirrored };
+        self.render_pages(&[(page, instructions)])
     }
 
-    fn write_document(&self, ctx: Ctx, page_w: f32, page_h: f32) -> Vec<u8> {
+    /// Renders one PDF page per label, each with its own size and ^PO / ^PM settings; the
+    /// renderer's own page settings are not used. Fonts and images are shared by all pages,
+    /// so each font is embedded once, subset to the glyphs of every page.
+    pub fn render_pages(&self, pages: &[(PageSetup, &[DrawInstruction])]) -> Vec<u8> {
+        let scale = 72.0 / self.dpi;
+        let mut ctx = Ctx::new();
+        let mut contents = Vec::with_capacity(pages.len());
+        for (setup, instructions) in pages {
+            begin_page(&mut ctx, setup, scale);
+            for instruction in *instructions {
+                render_instruction(&mut ctx, instruction);
+            }
+            let content = std::mem::replace(&mut ctx.content, Content::new()).finish();
+            contents.push((content, setup.width as f32 * scale, setup.height as f32 * scale));
+        }
+        self.write_document(ctx, contents)
+    }
+
+    /// `pages` holds each page's raw content stream and size in points.
+    fn write_document(&self, ctx: Ctx, pages: Vec<(Buf, f32, f32)>) -> Vec<u8> {
         let mut alloc = Ref::new(1);
         let catalog_id = alloc.bump();
         let pages_id = alloc.bump();
-        let page_id = alloc.bump();
-        let content_id = alloc.bump();
+        let resources_id = alloc.bump();
         let gs_diff_id = alloc.bump();
+        let page_ids: Vec<(Ref, Ref)> = pages.iter().map(|_| (alloc.bump(), alloc.bump())).collect();
 
         let mut pdf = Pdf::new();
         pdf.catalog(catalog_id).pages(pages_id);
-        pdf.pages(pages_id).kids([page_id]).count(1);
+        pdf.pages(pages_id).kids(page_ids.iter().map(|&(page, _)| page)).count(page_ids.len() as i32);
 
         // With `parallel_fonts`, font subsetting runs on worker threads while this thread
         // deflates the rest.
-        let raw = ctx.content.finish();
-        let (programs, (content, images)) = ctx.fonts.build_programs(self.parallel, || {
+        let (programs, (contents, images)) = ctx.fonts.build_programs(self.parallel, || {
             let images: Vec<Vec<u8>> = ctx.images.iter().map(|img| compress(&img.data)).collect();
-            (compress(&raw), images)
+            let contents: Vec<Vec<u8>> = pages.iter().map(|(raw, ..)| compress(raw)).collect();
+            (contents, images)
         });
 
         let font_refs = ctx.fonts.write(&mut pdf, &mut alloc, programs);
@@ -153,11 +139,8 @@ impl PdfRenderer {
             pdf.ext_graphics(gs_diff_id).blend_mode(pdf_writer::types::BlendMode::Difference);
         }
 
-        let mut page = pdf.page(page_id);
-        page.media_box(Rect::new(0.0, 0.0, page_w, page_h));
-        page.parent(pages_id);
-        page.contents(content_id);
-        let mut resources = page.resources();
+        // One resource dictionary, shared by every page.
+        let mut resources = pdf.indirect(resources_id).start::<Resources>();
         {
             let mut fonts = resources.fonts();
             for (name, id) in &font_refs {
@@ -174,12 +157,44 @@ impl PdfRenderer {
             resources.ext_g_states().pair(Name(b"GsDiff"), gs_diff_id);
         }
         resources.finish();
-        page.finish();
 
-        pdf.stream(content_id, &content).filter(Filter::FlateDecode);
+        for ((_, page_w, page_h), (&(page_id, content_id), content)) in pages.iter().zip(page_ids.iter().zip(&contents)) {
+            let mut page = pdf.page(page_id);
+            page.media_box(Rect::new(0.0, 0.0, *page_w, *page_h));
+            page.parent(pages_id);
+            page.contents(content_id);
+            page.pair(Name(b"Resources"), resources_id);
+            page.finish();
+            pdf.stream(content_id, content).filter(Filter::FlateDecode);
+        }
 
         pdf.finish()
     }
+}
+
+/// Starts a page's content: the dots-to-points transform, ^PO / ^PM and the label stock.
+fn begin_page(ctx: &mut Ctx, setup: &PageSetup, scale: f32) {
+    let (w, h) = (setup.width as f32, setup.height as f32);
+
+    // Map dots (top-left origin, y down) to points (bottom-left origin, y up).
+    ctx.content.transform([scale, 0.0, 0.0, -scale, 0.0, h * scale]);
+    // ^PM mirrors left-right, ^POI turns the label upside down; both flips cancel x.
+    match (setup.inverted, setup.mirrored) {
+        (false, false) => {}
+        (false, true) => {
+            ctx.content.transform([-1.0, 0.0, 0.0, 1.0, w, 0.0]);
+        }
+        (true, false) => {
+            ctx.content.transform([-1.0, 0.0, 0.0, -1.0, w, h]);
+        }
+        (true, true) => {
+            ctx.content.transform([1.0, 0.0, 0.0, -1.0, 0.0, h]);
+        }
+    }
+
+    // Opaque white label stock, so ^FR (Difference blend) inverts against white rather than
+    // the transparent page backdrop, where it would just paint white.
+    ctx.content.set_fill_gray(1.0).rect(0.0, 0.0, w, h).fill_nonzero().set_fill_gray(0.0);
 }
 
 /// zlib-compresses `data` at level 1: a few percent larger than level 6 but roughly twice
@@ -251,4 +266,49 @@ fn render_instruction(ctx: &mut Ctx, instruction: &DrawInstruction) {
 
 pub fn save_pdf(bytes: &[u8], path: &str) -> std::io::Result<()> {
     std::fs::write(path, bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zpl_parser::Parser;
+    use zpl_state_manager::StateManager;
+
+    fn render_zpl(zpl: &str) -> String {
+        let pages = StateManager::new().process_pages(Parser::new(zpl).parse().unwrap());
+        let pages: Vec<_> = pages.iter().map(|p| (p.setup, p.instructions.as_slice())).collect();
+        let pdf = PdfRenderer::new(1, 1).render_pages(&pages);
+        // Only the dictionaries are inspected; streams are binary.
+        String::from_utf8_lossy(&pdf).into_owned()
+    }
+
+    fn count(pdf: &str, needle: &str) -> usize {
+        pdf.matches(needle).count()
+    }
+
+    #[test]
+    fn one_pdf_page_per_label() {
+        let pdf = render_zpl("^XA^PW406^LL203^FO10,10^A0N,30^FDone^FS^XZ^XA^PW203^FO10,10^A0N,30^FDtwo^FS^XZ");
+        assert_eq!(count(&pdf, "/Type /Page\n"), 2);
+        assert!(pdf.contains("/Count 2"));
+        // Each page has its own size (^LL carries over); one font embedding serves both.
+        assert!(pdf.contains("/MediaBox [0 0 144 72]"));
+        assert!(pdf.contains("/MediaBox [0 0 72 72]"));
+        assert_eq!(count(&pdf, "/FontFile"), 1);
+    }
+
+    #[test]
+    fn copies_share_images() {
+        let pdf = render_zpl("^XA^PQ3^FO10,10^GFA,2,2,1,FF00^FS^XZ");
+        assert_eq!(count(&pdf, "/Type /Page\n"), 3);
+        assert_eq!(count(&pdf, "/ImageMask"), 1);
+    }
+
+    #[test]
+    fn render_is_a_single_page() {
+        let pdf = PdfRenderer::new(203, 203).render(&[]);
+        let pdf = String::from_utf8_lossy(&pdf);
+        assert_eq!(count(&pdf, "/Type /Page\n"), 1);
+        assert!(pdf.contains("/MediaBox [0 0 72 72]"));
+    }
 }

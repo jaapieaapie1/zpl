@@ -51,8 +51,15 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
     };
     let w = (mask.width * magnification_x) as f32;
     let h = (mask.height * magnification_y) as f32;
-    let name = format!("Im{}", ctx.images.len());
-    ctx.images.push(mask);
+    // ^PQ copies repeat the same bitmaps; embed each one once.
+    let index = match ctx.images.iter().position(|m| m.width == mask.width && m.data == mask.data) {
+        Some(index) => index,
+        None => {
+            ctx.images.push(mask);
+            ctx.images.len() - 1
+        }
+    };
+    let name = format!("Im{index}");
 
     // Image space is the unit square with row 0 at the top (y = 1). The page CTM is
     // y-down, so flip: unit (0,1) -> (x, y) and (0,0) -> (x, y + h).

@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZPL Playground</title>
+<style>
+  :root {
+    --bg: #f4f4f2;
+    --panel: #ffffff;
+    --text: #1d1d1b;
+    --muted: #6b6b66;
+    --border: #dcdcd6;
+    --accent: #2457d6;
+    --error: #c2261d;
+    --error-bg: #fdecea;
+    --stage: #e6e6e1;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615;
+      --panel: #1f1f1d;
+      --text: #ecece8;
+      --muted: #9a9a93;
+      --border: #34342f;
+      --accent: #7aa2ff;
+      --error: #ff7b72;
+      --error-bg: #3a1d1b;
+      --stage: #121211;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; }
+  header .spacer { flex: 1; }
+  label.toggle { display: flex; align-items: center; gap: 6px; color: var(--muted); cursor: pointer; }
+  select, button {
+    font: inherit;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 10px;
+    cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  @media (prefers-color-scheme: dark) { button.primary { color: #0d1530; } }
+  main {
+    flex: 1;
+    display: grid;
+    grid-template-columns: minmax(320px, 1fr) minmax(320px, 1.2fr);
+    min-height: 0;
+  }
+  @media (max-width: 760px) {
+    main { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+  }
+  #editor-pane { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--border); }
+  textarea {
+    flex: 1;
+    width: 100%;
+    resize: none;
+    border: 0;
+    outline: none;
+    padding: 12px 16px;
+    background: var(--panel);
+    color: var(--text);
+    font: 13px/1.5 var(--mono);
+    tab-size: 4;
+    white-space: pre;
+  }
+  #problem {
+    display: none;
+    padding: 8px 16px;
+    background: var(--error-bg);
+    color: var(--error);
+    font: 12px/1.4 var(--mono);
+    border-top: 1px solid var(--border);
+    cursor: pointer;
+  }
+  #problem.visible { display: block; }
+  #preview-pane {
+    position: relative;
+    overflow: auto;
+    background: var(--stage);
+    display: flex;
+    min-height: 0;
+  }
+  #preview-pane canvas {
+    margin: auto;
+    padding: 0;
+    background: #fff;
+    box-shadow: 0 1px 3px rgb(0 0 0 / .2), 0 6px 24px rgb(0 0 0 / .12);
+    flex: none;
+  }
+  #preview-pane.fit { padding: 24px; }
+  #preview-pane.fit canvas { max-width: 100%; max-height: 100%; object-fit: contain; }
+  #preview-pane.pixelated canvas { image-rendering: pixelated; }
+  #preview-pane.stale canvas { opacity: .55; transition: opacity .2s; }
+  footer {
+    display: flex;
+    gap: 16px;
+    padding: 4px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--muted);
+    font: 12px/1.6 var(--mono);
+    flex-wrap: wrap;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>ZPL Playground</h1>
+  <label class="toggle"><input type="checkbox" id="debug"> Outline fields</label>
+  <select id="zoom" aria-label="Zoom">
+    <option value="fit" selected>Fit</option>
+    <option value="0.5">50%</option>
+    <option value="1">100%</option>
+    <option value="2">200%</option>
+  </select>
+  <span class="spacer"></span>
+  <button id="png">Download PNG</button>
+  <button id="pdf" class="primary">Download PDF</button>
+</header>
+<main>
+  <section id="editor-pane">
+    <textarea id="zpl" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="ZPL source"></textarea>
+    <div id="problem" role="alert" title="Click to select the problem"></div>
+  </section>
+  <section id="preview-pane" class="fit">
+    <canvas id="label" width="1" height="1" aria-label="Rendered label"></canvas>
+  </section>
+</main>
+<footer>
+  <span id="status">Loading renderer…</span>
+  <span id="size"></span>
+  <span id="cursor"></span>
+</footer>
+<script type="module" src="app.js"></script>
+</body>
+</html>

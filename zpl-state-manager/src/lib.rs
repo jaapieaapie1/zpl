@@ -536,6 +536,12 @@ impl StateManager {
         instructions
     }
 
+    /// Sets the real-time clock used by ^FC fields to `secs` since the Unix epoch, in
+    /// the printer's local time. A ^ST in the label still overrides it.
+    pub fn set_clock_unix(&mut self, secs: i64) {
+        self.clock = Some(clock::DateTime::from_unix(secs));
+    }
+
     pub fn get_label_dimensions(&self) -> (u32, u32) {
         let width = self.print_width.unwrap_or(812);
         let height = self.label_length.unwrap_or(1218);

@@ -1,0 +1,15 @@
+[package]
+name = "zpl-wasm"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+zpl-parser = { path = "../zpl-parser" }
+zpl-tokenizer = { path = "../zpl-tokenizer" }
+zpl-state-manager = { path = "../zpl-state-manager" }
+png-renderer = { path = "../png-renderer" }
+pdf-renderer = { path = "../pdf-renderer" }
+wasm-bindgen = "0.2"

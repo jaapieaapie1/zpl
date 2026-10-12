@@ -2139,6 +2139,18 @@ name = "zpl-tokenizer"
 version = "0.1.0"
 
 [[package]]
+name = "zpl-wasm"
+version = "0.1.0"
+dependencies = [
+ "pdf-renderer",
+ "png-renderer",
+ "wasm-bindgen",
+ "zpl-parser",
+ "zpl-state-manager",
+ "zpl-tokenizer",
+]
+
+[[package]]
 name = "zune-core"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

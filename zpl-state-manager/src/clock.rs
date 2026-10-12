@@ -1,5 +1,6 @@
 //! Real-time clock fields (^FC, ^ST, ^SO).
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A calendar date and time (proleptic Gregorian, no time zone).
@@ -37,12 +38,20 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 impl DateTime {
+    /// The system clock. `wasm32-unknown-unknown` has none (`SystemTime::now` panics
+    /// there), so it reads as the epoch; callers in the browser set the clock instead.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub fn now() -> Self {
         let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         Self::from_unix(secs)
     }
 
-    fn from_unix(secs: i64) -> Self {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    pub fn now() -> Self {
+        Self::from_unix(0)
+    }
+
+    pub(crate) fn from_unix(secs: i64) -> Self {
         let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
         let (year, month, day) = civil_from_days(days);
         Self { year, month, day, hour: (rem / 3600) as u32, minute: (rem / 60 % 60) as u32, second: (rem % 60) as u32 }

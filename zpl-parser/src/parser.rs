@@ -14,17 +14,52 @@ mod extra;
 pub struct Parser<'a> {
     tokenizer: Tokenizer<'a>,
     peeked: Option<Token<'a>>,
-    /// Dots per ^MU unit: 1 for dots, 8 for millimetres, 203.2 for inches (8 dots/mm).
+    /// Format dots per ^MU unit: 1 for dots; for millimetres and inches the printer's dots
+    /// per mm (or inch), divided by the ^JM / ^MU format scale so they stay physical sizes.
     unit_scale: std::cell::Cell<f32>,
+    /// Printer resolution in dots per millimetre.
+    dpmm: u32,
+    /// ^MU units (`D`, `M` or `I`), ^MU base/desired dpi conversion and ^JM half density,
+    /// which together decide `unit_scale`.
+    units: std::cell::Cell<char>,
+    conversion: std::cell::Cell<(u32, u32)>,
+    half_density: std::cell::Cell<bool>,
 }
+
+/// Printer resolution assumed by [`Parser::new`]: 8 dots/mm (203 dpi).
+pub const DEFAULT_DPMM: u32 = 8;
 
 impl<'a> Parser<'a> {
     pub fn new(zpl: &'a str) -> Self {
+        Self::with_dpmm(zpl, DEFAULT_DPMM)
+    }
+
+    /// Parser for a `dpmm` dots/mm printer (6, 8, 12 or 24): ^MU millimetres and inches
+    /// are converted to that printer's dots.
+    pub fn with_dpmm(zpl: &'a str, dpmm: u32) -> Self {
         Self {
             tokenizer: Tokenizer::new(zpl),
             peeked: None,
             unit_scale: std::cell::Cell::new(1.0),
+            dpmm: dpmm.max(1),
+            units: std::cell::Cell::new('D'),
+            conversion: std::cell::Cell::new((1, 1)),
+            half_density: std::cell::Cell::new(false),
         }
+    }
+
+    /// Recomputes `unit_scale` after ^MU or ^JM. Physical units use the printer's dots/mm
+    /// divided by the format scale (desired/base dpi, doubled by ^JMB), so `^MUm^FO10,10`
+    /// lands 10 mm in whatever the format is scaled to.
+    fn update_unit_scale(&self) {
+        let (base, desired) = self.conversion.get();
+        let format_scale = desired as f32 / base as f32 * if self.half_density.get() { 2.0 } else { 1.0 };
+        let per_mm = self.dpmm as f32 / format_scale;
+        self.unit_scale.set(match self.units.get() {
+            'I' => per_mm * 25.4,
+            'M' => per_mm,
+            _ => 1.0,
+        });
     }
 
     pub fn parse(mut self) -> Result<Vec<Command>, ParseError> {

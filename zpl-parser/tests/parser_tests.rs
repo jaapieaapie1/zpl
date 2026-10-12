@@ -913,3 +913,44 @@ fn test_serialization() {
     assert!(matches!(result[4], Command::Unknown { .. }));
     assert!(matches!(result[5], Command::Unknown { .. }));
 }
+
+#[test]
+fn test_units_follow_printer_resolution() {
+    let origin = |zpl: &str, dpmm| match Parser::with_dpmm(zpl, dpmm).parse().unwrap()[1] {
+        Command::FieldOrigin { x, y, .. } => (x, y),
+        ref other => panic!("{other:?}"),
+    };
+    // Inches are 25.4 mm: 152.4, 203.2, 304.8 and 609.6 dots.
+    for (dpmm, mm, inch, half_inch) in [(6, (60, 15), 152, 76), (8, (80, 20), 203, 102), (12, (120, 30), 305, 152), (24, (240, 60), 610, 305)] {
+        assert_eq!(origin("^MUM^FO10,2.5", dpmm), mm, "{dpmm}");
+        assert_eq!(origin("^MUI^FO1,0.5", dpmm), (inch, half_inch), "{dpmm}");
+        assert_eq!(origin("^MUD^FO10,20", dpmm), (10, 20), "{dpmm}");
+    }
+    // Parser::new is 8 dots/mm.
+    assert_eq!(origin("^MUM^FO10,1", 8), match Parser::new("^MUM^FO10,1").parse().unwrap()[1] {
+        Command::FieldOrigin { x, y, .. } => (x, y),
+        _ => unreachable!(),
+    });
+}
+
+#[test]
+fn test_format_conversion_and_half_density() {
+    let result = Parser::new("^MUd,200,600^MUd,150^MUd,200,400^JMB^JMA^JM").parse().unwrap();
+    assert_eq!(result[0], Command::FormatConversion { base: 200, desired: 600 });
+    // Without both values (or with unsupported ones) only the units change.
+    assert_eq!(result[1], Command::Comment { text: String::new() });
+    assert_eq!(result[2], Command::Comment { text: String::new() });
+    assert_eq!(result[3], Command::DotsPerMm { half: true });
+    assert_eq!(result[4], Command::DotsPerMm { half: false });
+    assert_eq!(result[5], Command::DotsPerMm { half: false });
+
+    // Millimetres stay millimetres when the format is scaled: ^JMB halves the dots per mm
+    // of the format, ^MUd,200,600 thirds them. Dots are left to the page scale.
+    let origin = |zpl: &str| match Parser::with_dpmm(zpl, 12).parse().unwrap().last() {
+        Some(Command::FieldOrigin { x, .. }) => *x,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(origin("^JMB^MUM^FO10,0"), 60);
+    assert_eq!(origin("^MUM,200,600^FO12,0"), 48);
+    assert_eq!(origin("^MUD,200,600^FO12,0"), 12);
+}

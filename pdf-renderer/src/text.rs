@@ -21,9 +21,6 @@ const CAP_HEIGHT_EM: f32 = 0.75;
 /// justified/rotated fields land on the same dots.
 const BOX_PAD: f32 = 10.0;
 
-/// Resolution the bitmap font matrices are taken for (8 dots/mm, 203 dpi).
-const DOTS_PER_MM: u32 = 8;
-
 /// Horizontal squeeze for DejaVu Sans Bold fallback glyphs next to the condensed Triumvirate.
 const FALLBACK_CONDENSE: f32 = 0.8;
 
@@ -403,7 +400,7 @@ fn field_for(
         return scalable(key, cap, size_y, size_x);
     }
 
-    if let Some(cell) = bitmap_cell(font, DOTS_PER_MM) {
+    if let Some(cell) = bitmap_cell(font, ctx.dpmm) {
         let (mh, mw) = magnification(height, width, cell.height, cell.width);
         let m = builtin_metrics(BITMAP_FONT);
         // Cap height of the stroked outline = character height above the baseline; the
@@ -485,7 +482,7 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
         *anchor,
     );
     // Uppercase-only bitmap fonts print lowercase letters as capitals.
-    let text: Cow<str> = match bitmap_cell(*font, DOTS_PER_MM) {
+    let text: Cow<str> = match bitmap_cell(*font, ctx.dpmm) {
         Some(cell) if cell.uppercase && custom_font.is_none() && text.chars().any(char::is_lowercase) => {
             Cow::Owned(text.to_uppercase())
         }

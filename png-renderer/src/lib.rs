@@ -7,7 +7,7 @@ use zpl_parser::command::{
     BlockJustification, Code128Mode, DiagonalDirection, FontName, Justification, LineColor, LinearKind,
     Orientation, TextLayout,
 };
-use zpl_state_manager::{DrawInstruction, TextAnchor, TextBlock};
+use zpl_state_manager::{DrawInstruction, PageSetup, TextAnchor, TextBlock, DEFAULT_DPMM};
 use zpl_symbols::linear::{self, LinearSymbol, Symbology};
 use zpl_symbols::matrix::{self, Matrix};
 
@@ -28,6 +28,11 @@ pub struct PngRenderer {
     width: u32,
     height: u32,
     debug: bool,
+    /// Printer resolution, for the bitmap font matrices and MaxiCode.
+    dpmm: u32,
+    /// Printer dots per format dot (^JM / ^MU, see [`PageSetup::scale`]): the page is drawn
+    /// in format dots and then enlarged to printer dots.
+    scale: (u32, u32),
     /// Area drawn by the instruction being rendered: [x0, y0, x1, y1), clipped to the page.
     #[cfg(feature = "source-map")]
     drawn: std::cell::Cell<Option<[i64; 4]>>,
@@ -63,17 +68,37 @@ struct TextFont {
     uppercase: bool,
 }
 
-/// Bitmap font matrices at 8 dots/mm (H, W, intercharacter gap, baseline, uppercase only);
-/// see docs/commands/other/FONTS.md and pdf-renderer's text.rs.
-fn bitmap_cell(font: FontName) -> Option<(u32, u32, u32, u32, bool)> {
+/// Bitmap font matrices on a `dpmm` printhead (H, W, intercharacter gap, baseline,
+/// uppercase only); see docs/commands/other/FONTS.md and pdf-renderer's text.rs. Only E and
+/// H differ between resolutions; their gap and baseline scale from the 8 dots/mm values.
+fn bitmap_cell(font: FontName, dpmm: u32) -> Option<(u32, u32, u32, u32, bool)> {
+    let scaled = |(h, w): (u32, u32), (h8, w8, gap8, base8): (u32, u32, u32, u32), uppercase| {
+        let gap = ((gap8 * w) as f32 / w8 as f32).round() as u32;
+        let base = ((base8 * h) as f32 / h8 as f32).round() as u32;
+        (h, w, gap, base, uppercase)
+    };
     Some(match font {
         FontName::FontA => (9, 5, 1, 7, false),
         FontName::FontB => (11, 7, 2, 11, true),
         FontName::FontC | FontName::FontD => (18, 10, 2, 14, false),
-        FontName::FontE => (28, 15, 5, 23, false),
+        FontName::FontE => {
+            let size = match dpmm {
+                0..=6 => (21, 10),
+                7..=8 => (28, 15),
+                _ => (42, 20),
+            };
+            scaled(size, (28, 15, 5, 23), false)
+        }
         FontName::FontF => (26, 13, 3, 21, false),
         FontName::FontG => (60, 40, 8, 48, false),
-        FontName::FontH => (21, 13, 6, 21, true),
+        FontName::FontH => {
+            let size = match dpmm {
+                0..=6 => (17, 11),
+                7..=8 => (21, 13),
+                _ => (34, 22),
+            };
+            scaled(size, (21, 13, 6, 21), true)
+        }
         _ => return None,
     })
 }
@@ -125,12 +150,12 @@ fn custom_font(data: &Arc<Vec<u8>>) -> Option<FontArc> {
 }
 
 impl TextFont {
-    fn new(name: FontName, custom: Option<&Arc<Vec<u8>>>, height: u32, width: u32) -> Self {
+    fn new(name: FontName, custom: Option<&Arc<Vec<u8>>>, height: u32, width: u32, dpmm: u32) -> Self {
         use ab_glyph::Font;
 
         let mono: &'static [u8] = DEJAVU_SANS_MONO;
 
-        if let (None, Some((h, w, gap, base, uppercase))) = (custom, bitmap_cell(name)) {
+        if let (None, Some((h, w, gap, base, uppercase))) = (custom, bitmap_cell(name, dpmm)) {
             let font = FontArc::try_from_slice(mono).expect("Error loading font");
             let (mh, mw) = magnification(height, width, h, w);
             let upem = font.units_per_em().unwrap_or(2048.0);
@@ -377,9 +402,17 @@ impl PngRenderer {
             width,
             height,
             debug,
+            dpmm: DEFAULT_DPMM,
+            scale: (1, 1),
             #[cfg(feature = "source-map")]
             drawn: std::cell::Cell::new(None),
         }
+    }
+
+    /// Renderer for a label's page settings: size, printer resolution and ^JM / ^MU format
+    /// scale. The image has one pixel per printer dot.
+    pub fn for_page(page: &PageSetup, debug: bool) -> Self {
+        Self { dpmm: page.dpmm, scale: page.scale, ..Self::with_debug(page.width, page.height, debug) }
     }
 
     pub fn render(&self, instructions: &[DrawInstruction]) -> RgbImage {
@@ -389,7 +422,26 @@ impl PngRenderer {
             self.render_instruction(&mut image, instruction);
         }
 
-        image
+        self.to_printer_dots(image)
+    }
+
+    /// Enlarges a page drawn in format dots to printer dots (nearest neighbour, as the
+    /// printer burns each format dot as a block of dots); a no-op at scale 1.
+    fn to_printer_dots(&self, image: RgbImage) -> RgbImage {
+        let (num, den) = self.scale;
+        if num == den {
+            return image;
+        }
+        let (w, h) = (self.printer_dots(image.width()), self.printer_dots(image.height()));
+        let src = |v: u32| (v as u64 * den as u64 / num as u64) as u32;
+        let cols: Vec<u32> = (0..w).map(|x| src(x).min(image.width() - 1)).collect();
+        ImageBuffer::from_fn(w, h, |x, y| *image.get_pixel(cols[x as usize], src(y).min(image.height() - 1)))
+    }
+
+    /// Format dots to printer dots, rounded.
+    fn printer_dots(&self, v: u32) -> u32 {
+        let (num, den) = self.scale;
+        ((v as u64 * num as u64 + den as u64 / 2) / den as u64) as u32
     }
 
     /// Like [`PngRenderer::render`], plus the area each instruction drew on (`None` when it
@@ -410,7 +462,14 @@ impl PngRenderer {
             }));
         }
 
-        (image, bounds)
+        if self.scale.0 != self.scale.1 {
+            for b in bounds.iter_mut().flatten() {
+                let (x1, y1) = (self.printer_dots(b.x + b.width), self.printer_dots(b.y + b.height));
+                (b.x, b.y) = (self.printer_dots(b.x), self.printer_dots(b.y));
+                (b.width, b.height) = (x1 - b.x, y1 - b.y);
+            }
+        }
+        (self.to_printer_dots(image), bounds)
     }
 
     /// Records that the current instruction drew in the `width` x `height` area at (`x`, `y`).
@@ -444,7 +503,7 @@ impl PngRenderer {
                 if self.debug {
                     self.draw_origin_cross(image, *x, *y, Rgb([255, 0, 0]));
                 }
-                let font = TextFont::new(*font, custom_font.as_ref(), *height, *width);
+                let font = TextFont::new(*font, custom_font.as_ref(), *height, *width, self.dpmm);
                 let text = if font.uppercase { text.to_uppercase() } else { text.clone() };
                 self.render_text(
                     image, *x, *y, &text, &font, *orientation, *justification, *anchor, block.as_ref(), layout,
@@ -526,7 +585,7 @@ impl PngRenderer {
     /// ^FR / ^LR: draw `inner` on a blank page, then invert every target pixel it blackened.
     fn render_reverse(&self, image: &mut RgbImage, inner: &DrawInstruction) {
         // No debug markers on the scratch page: they would be inverted too.
-        let plain = PngRenderer::new(image.width(), image.height());
+        let plain = PngRenderer { dpmm: self.dpmm, ..PngRenderer::new(image.width(), image.height()) };
         let mut scratch: RgbImage = ImageBuffer::from_pixel(image.width(), image.height(), WHITE);
         plain.render_instruction(&mut scratch, inner);
         #[cfg(feature = "source-map")]
@@ -1213,8 +1272,27 @@ mod tests {
     }
 
     #[test]
+    fn page_scale_enlarges_to_printer_dots() {
+        let setup = PageSetup { width: 10, height: 6, scale: (2, 1), ..PageSetup::default() };
+        let gb = DrawInstruction::DrawBox { x: 2, y: 1, width: 3, height: 2, thickness: 2, color: LineColor::Black, rounding: 0 };
+        let image = PngRenderer::for_page(&setup, false).render(&[gb]);
+        assert_eq!(image.dimensions(), (20, 12));
+        let black = |x, y| image.get_pixel(x, y)[0] == 0;
+        assert!(black(4, 2) && black(9, 5) && !black(3, 2) && !black(10, 5) && !black(4, 6));
+    }
+
+    #[test]
+    fn bitmap_fonts_e_and_h_follow_resolution() {
+        assert_eq!(bitmap_cell(FontName::FontE, 6).unwrap().0, 21);
+        assert_eq!(bitmap_cell(FontName::FontE, 8).unwrap().0, 28);
+        assert_eq!(bitmap_cell(FontName::FontE, 24).unwrap().0, 42);
+        assert_eq!(bitmap_cell(FontName::FontH, 12).unwrap().1, 22);
+        assert_eq!(bitmap_cell(FontName::FontA, 24), bitmap_cell(FontName::FontA, 8));
+    }
+
+    #[test]
     fn wrap_respects_width_and_forced_breaks() {
-        let font = TextFont::new(FontName::Font0, None, 30, 30);
+        let font = TextFont::new(FontName::Font0, None, 30, 30, 8);
         let lines = wrap_lines(&font, "aaa bbb ccc\\&ddd", font.measure("aaa bbb") as u32 + 1, 0);
         assert_eq!(lines, vec!["aaa bbb", "ccc", "ddd"]);
     }

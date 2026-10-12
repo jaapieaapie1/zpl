@@ -260,9 +260,10 @@ fn draw_postal(ctx: &mut Ctx, symbol: &postal::PostalSymbol, at: Place, module: 
     }
 }
 
-/// MaxiCode at its fixed physical size (8 dots/mm): pointy-top hexagons plus the bullseye rings.
+/// MaxiCode at its fixed physical size on the printhead: pointy-top hexagons plus the
+/// bullseye rings.
 fn draw_maxicode(ctx: &mut Ctx, symbol: &maxicode::MaxiCode, at: Place) {
-    let g = symbol.geometry(8.0);
+    let g = symbol.geometry(ctx.dpmm as f32);
     let matrix = at.matrix(g.width.ceil() as u32, g.height.ceil() as u32);
     ctx.content.save_state();
     ctx.content.transform(matrix);

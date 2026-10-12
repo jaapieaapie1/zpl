@@ -210,6 +210,19 @@ pub enum Command {
         enabled: bool,
     },
 
+    /// ^JM: `half` (B) prints at half the printhead's dots per millimetre, every format
+    /// dot covering 2 x 2 printer dots.
+    DotsPerMm {
+        half: bool,
+    },
+
+    /// ^MUa,b,c with b and c: the format was written for `base` dpi and is scaled to
+    /// `desired` dpi. Equal values turn the conversion off.
+    FormatConversion {
+        base: u32,
+        desired: u32,
+    },
+
     /// ^LS: shift all fields left by `shift` dots (negative shifts right).
     LabelShift {
         shift: i32,

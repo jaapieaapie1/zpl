@@ -238,15 +238,58 @@ pub struct TextBlock {
     pub clip_height: Option<u32>,
 }
 
+/// Printer resolution used unless [`StateManager::set_dpmm`] says otherwise: 8 dots/mm.
+pub use zpl_parser::DEFAULT_DPMM;
+
+/// The printhead resolutions Zebra makes, in dots per millimetre.
+pub const DPMM_VALUES: [u32; 4] = [6, 8, 12, 24];
+
+/// Nominal dots per inch of a `dpmm` printhead as Zebra (and Labelary) round them: 152,
+/// 203, 300 and 600 rather than the exact 152.4, 203.2, 304.8 and 609.6.
+pub fn nominal_dpi(dpmm: u32) -> u32 {
+    match dpmm {
+        6 => 152,
+        8 => 203,
+        12 => 300,
+        24 => 600,
+        _ => (dpmm as f32 * 25.4).round() as u32,
+    }
+}
+
 /// Whole-label settings that apply to the page rather than to a field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageSetup {
+    /// Label size in format dots, the unit of every instruction on the page.
     pub width: u32,
     pub height: u32,
     /// ^POI: label printed rotated 180 degrees.
     pub inverted: bool,
     /// ^PMY: label printed mirrored horizontally.
     pub mirrored: bool,
+    /// Printer resolution in dots per millimetre.
+    pub dpmm: u32,
+    /// Printer dots per format dot as a fraction (numerator, denominator): 2/1 after ^JMB,
+    /// desired/base dpi after ^MUd,b,c, 1/1 normally.
+    pub scale: (u32, u32),
+}
+
+impl Default for PageSetup {
+    /// A 4 x 6 inch label at 8 dots/mm.
+    fn default() -> Self {
+        Self { width: 812, height: 1218, inverted: false, mirrored: false, dpmm: DEFAULT_DPMM, scale: (1, 1) }
+    }
+}
+
+impl PageSetup {
+    /// Printer dots per format dot.
+    pub fn dot_scale(&self) -> f32 {
+        self.scale.0 as f32 / self.scale.1 as f32
+    }
+
+    /// Format dots per inch: the printer's nominal dpi divided by [`PageSetup::dot_scale`].
+    pub fn format_dpi(&self) -> f32 {
+        nominal_dpi(self.dpmm) as f32 / self.dot_scale()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -371,6 +414,10 @@ pub struct StateManager {
 
     print_width: Option<u32>,
     label_length: Option<u32>,
+    /// Printer resolution, ^JMB half density and the ^MU base/desired dpi conversion.
+    dpmm: u32,
+    half_density: bool,
+    conversion: (u32, u32),
     inverted: bool,
     mirrored: bool,
     label_reverse: bool,
@@ -536,6 +583,9 @@ impl StateManager {
 
             print_width: None,
             label_length: None,
+            dpmm: DEFAULT_DPMM,
+            half_density: false,
+            conversion: (1, 1),
             inverted: false,
             mirrored: false,
             label_reverse: false,
@@ -621,15 +671,39 @@ impl StateManager {
         self.clock = Some(clock::DateTime::from_unix(secs));
     }
 
+    /// Sets the printer resolution in dots per millimetre (6, 8, 12 or 24; default 8). It
+    /// sizes the default 4 x 6 inch label; parse with [`zpl_parser::Parser::with_dpmm`] at
+    /// the same resolution so ^MU millimetres and inches match.
+    pub fn set_dpmm(&mut self, dpmm: u32) {
+        self.dpmm = dpmm.max(1);
+    }
+
+    /// Label size in format dots: ^PW / ^LL, else a 4 x 6 inch label at the printer's
+    /// resolution (812 x 1218 at 8 dots/mm) shrunk by the ^JM / ^MU format scale.
     pub fn get_label_dimensions(&self) -> (u32, u32) {
-        let width = self.print_width.unwrap_or(812);
-        let height = self.label_length.unwrap_or(1218);
+        let (num, den) = self.format_scale();
+        let dpi = nominal_dpi(self.dpmm);
+        let inches = |n: u32| (n * dpi * den + num / 2) / num;
+        let width = self.print_width.unwrap_or_else(|| inches(4));
+        let height = self.label_length.unwrap_or_else(|| inches(6));
         (width, height)
+    }
+
+    fn format_scale(&self) -> (u32, u32) {
+        let (base, desired) = self.conversion;
+        (desired * if self.half_density { 2 } else { 1 }, base)
     }
 
     pub fn page_setup(&self) -> PageSetup {
         let (width, height) = self.get_label_dimensions();
-        PageSetup { width, height, inverted: self.inverted, mirrored: self.mirrored }
+        PageSetup {
+            width,
+            height,
+            inverted: self.inverted,
+            mirrored: self.mirrored,
+            dpmm: self.dpmm,
+            scale: self.format_scale(),
+        }
     }
 
     /// Field origin in label coordinates: ^LH home, minus the ^LS shift, plus the ^LT offset.
@@ -736,6 +810,8 @@ impl StateManager {
             Command::LabelLength { length, .. } => self.label_length = Some(length),
             Command::PrintOrientation { inverted } => self.inverted = inverted,
             Command::PrintMirror { enabled } => self.mirrored = enabled,
+            Command::DotsPerMm { half } => self.half_density = half,
+            Command::FormatConversion { base, desired } => self.conversion = (base, desired),
             Command::LabelReverse { enabled } => self.label_reverse = enabled,
             Command::MediaDarkness { value } => self.media_darkness = value,
             Command::CharacterEncoding { encoding } => self.character_encoding = encoding,
@@ -1394,6 +1470,54 @@ mod tests {
         let ins = run("^XA^MUM^FO10,2.5^GB25,25,1^FS^MUD^FO10,10^GB5,5,1^FS^XZ");
         assert!(matches!(ins[0], DrawInstruction::DrawBox { x: 80, y: 20, width: 200, .. }));
         assert!(matches!(ins[1], DrawInstruction::DrawBox { x: 10, y: 10, width: 5, .. }));
+    }
+
+    fn pages_at(zpl: &str, dpmm: u32) -> Vec<Page> {
+        let mut state = StateManager::new();
+        state.set_dpmm(dpmm);
+        state.process_pages(Parser::with_dpmm(zpl, dpmm).parse().unwrap())
+    }
+
+    #[test]
+    fn default_label_is_4_by_6_inches_at_the_printer_resolution() {
+        let size = |zpl: &str, dpmm| {
+            let setup = pages_at(zpl, dpmm)[0].setup;
+            (setup.width, setup.height)
+        };
+        assert_eq!(size("^XA^FO1,1^FDa^FS^XZ", 6), (608, 912));
+        assert_eq!(size("^XA^FO1,1^FDa^FS^XZ", 8), (812, 1218));
+        assert_eq!(size("^XA^FO1,1^FDa^FS^XZ", 12), (1200, 1800));
+        assert_eq!(size("^XA^FO1,1^FDa^FS^XZ", 24), (2400, 3600));
+        assert_eq!(pages("^XA^XZ")[0].setup.dpmm, 8);
+        // ^PW / ^LL are dots whatever the resolution.
+        assert_eq!(size("^XA^PW300^LL200^XZ", 12), (300, 200));
+        // ^MU millimetres follow it too.
+        assert_eq!(size("^XA^MUM^PW50^LL25^XZ", 12), (600, 300));
+    }
+
+    #[test]
+    fn half_density_doubles_the_format() {
+        let page = &pages_at("^XA^JMB^FO10,10^GB20,20,2^FS^XZ", 8)[0];
+        // Instructions stay in format dots; the page scale maps them to printer dots, and
+        // the default label shrinks so that it is still 4 x 6 inches.
+        assert!(matches!(page.instructions[0], DrawInstruction::DrawBox { x: 10, y: 10, width: 20, .. }));
+        assert_eq!(page.setup.scale, (2, 1));
+        assert_eq!(page.setup.dot_scale(), 2.0);
+        assert_eq!((page.setup.width, page.setup.height), (406, 609));
+        assert_eq!(page.setup.format_dpi(), 101.5);
+        // ^JM persists into later formats until ^JMA.
+        let pages = pages_at("^XA^JMB^FO1,1^FDa^FS^XZ^XA^FO1,1^FDb^FS^XZ^XA^JMA^FO1,1^FDc^FS^XZ", 12);
+        let scales: Vec<_> = pages.iter().map(|p| p.setup.scale).collect();
+        assert_eq!(scales, [(2, 1), (2, 1), (1, 1)]);
+    }
+
+    #[test]
+    fn format_conversion_scales_the_page() {
+        let setup = pages_at("^XA^MUd,200,600^FO1,1^FDa^FS^XZ", 24)[0].setup;
+        assert_eq!((setup.scale, setup.dot_scale()), ((600, 200), 3.0));
+        assert_eq!((setup.width, setup.height), (800, 1200));
+        // Matching values turn it off again.
+        assert_eq!(pages_at("^XA^MUd,200,600^MUd,300,300^XZ", 24)[0].setup.scale, (300, 300));
     }
 
     #[test]

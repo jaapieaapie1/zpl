@@ -10,7 +10,7 @@
 
 use pdf_writer::writers::Resources;
 use pdf_writer::{Buf, Content, Filter, Finish, Name, Pdf, Rect, Ref};
-use zpl_state_manager::{DrawInstruction, PageSetup};
+use zpl_state_manager::{DrawInstruction, PageSetup, DEFAULT_DPMM};
 
 mod barcodes;
 mod fonts;
@@ -22,13 +22,10 @@ mod text;
 
 pub use fonts::FontId;
 
-/// Default Zebra resolution (8 dots/mm).
-pub const DEFAULT_DPI: f32 = 203.0;
-
 pub struct PdfRenderer {
     width: u32,
     height: u32,
-    dpi: f32,
+    dpmm: u32,
     parallel: bool,
     inverted: bool,
     mirrored: bool,
@@ -47,11 +44,20 @@ pub(crate) struct Ctx {
     /// Gray level that prints black: 0 normally, 1 inside a reverse (^FR) element, where
     /// white under the Difference blend mode inverts what is underneath.
     pub ink: f32,
+    /// Printer resolution of the current page, for the bitmap font matrices and MaxiCode.
+    pub dpmm: u32,
 }
 
 impl Ctx {
     pub fn new() -> Self {
-        Self { content: Content::new(), fonts: Default::default(), images: Vec::new(), uses_difference: false, ink: 0.0 }
+        Self {
+            content: Content::new(),
+            fonts: Default::default(),
+            images: Vec::new(),
+            uses_difference: false,
+            ink: 0.0,
+            dpmm: DEFAULT_DPMM,
+        }
     }
 
     /// Fill gray for a ZPL line color, honouring reverse printing.
@@ -65,16 +71,19 @@ impl Ctx {
 
 impl PdfRenderer {
     pub fn new(width: u32, height: u32) -> Self {
-        Self::with_dpi(width, height, DEFAULT_DPI)
+        Self::with_dpmm(width, height, DEFAULT_DPMM)
     }
 
-    pub fn with_dpi(width: u32, height: u32, dpi: f32) -> Self {
-        Self { width, height, dpi, parallel: false, inverted: false, mirrored: false }
+    /// Renderer for a `width` x `height` dot label on a `dpmm` dots/mm printer (6, 8, 12 or
+    /// 24): each dot is 72 / 152, 203, 300 or 600 points.
+    pub fn with_dpmm(width: u32, height: u32, dpmm: u32) -> Self {
+        Self { width, height, dpmm, parallel: false, inverted: false, mirrored: false }
     }
 
-    /// Renderer for a label's page settings: size plus ^PO inversion and ^PM mirroring.
+    /// Renderer for a label's page settings: size and resolution plus ^PO inversion and ^PM
+    /// mirroring.
     pub fn for_page(page: &PageSetup) -> Self {
-        Self { inverted: page.inverted, mirrored: page.mirrored, ..Self::new(page.width, page.height) }
+        Self { inverted: page.inverted, mirrored: page.mirrored, ..Self::with_dpmm(page.width, page.height, page.dpmm) }
     }
 
     /// Subsets each font on its own short-lived thread while the page is compressed.
@@ -88,18 +97,27 @@ impl PdfRenderer {
     }
 
     pub fn render(&self, instructions: &[DrawInstruction]) -> Vec<u8> {
-        let page = PageSetup { width: self.width, height: self.height, inverted: self.inverted, mirrored: self.mirrored };
+        let page = PageSetup {
+            width: self.width,
+            height: self.height,
+            inverted: self.inverted,
+            mirrored: self.mirrored,
+            dpmm: self.dpmm,
+            scale: (1, 1),
+        };
         self.render_pages(&[(page, instructions)])
     }
 
-    /// Renders one PDF page per label, each with its own size and ^PO / ^PM settings; the
-    /// renderer's own page settings are not used. Fonts and images are shared by all pages,
-    /// so each font is embedded once, subset to the glyphs of every page.
+    /// Renders one PDF page per label, each with its own size, resolution and ^PO / ^PM
+    /// settings; the renderer's own page settings are not used. Fonts and images are shared
+    /// by all pages, so each font is embedded once, subset to the glyphs of every page.
     pub fn render_pages(&self, pages: &[(PageSetup, &[DrawInstruction])]) -> Vec<u8> {
-        let scale = 72.0 / self.dpi;
         let mut ctx = Ctx::new();
         let mut contents = Vec::with_capacity(pages.len());
         for (setup, instructions) in pages {
+            // Points per format dot: 72 / dpi, times the ^JM / ^MU format scale.
+            let scale = 72.0 / setup.format_dpi();
+            ctx.dpmm = setup.dpmm;
             begin_page(&mut ctx, setup, scale);
             for instruction in *instructions {
                 render_instruction(&mut ctx, instruction);
@@ -302,6 +320,31 @@ mod tests {
         let pdf = render_zpl("^XA^PQ3^FO10,10^GFA,2,2,1,FF00^FS^XZ");
         assert_eq!(count(&pdf, "/Type /Page\n"), 3);
         assert_eq!(count(&pdf, "/ImageMask"), 1);
+    }
+
+    fn render_at(zpl: &str, dpmm: u32) -> String {
+        let mut state = StateManager::new();
+        state.set_dpmm(dpmm);
+        let pages = state.process_pages(Parser::with_dpmm(zpl, dpmm).parse().unwrap());
+        let pages: Vec<_> = pages.iter().map(|p| (p.setup, p.instructions.as_slice())).collect();
+        String::from_utf8_lossy(&PdfRenderer::for_page(&pages[0].0).render_pages(&pages)).into_owned()
+    }
+
+    #[test]
+    fn page_size_follows_resolution() {
+        // The default label is 4 x 6 inches (288 x 432 pt) at every resolution.
+        for dpmm in [6, 8, 12, 24] {
+            assert!(render_at("^XA^FO10,10^GB50,50,5^FS^XZ", dpmm).contains("/MediaBox [0 0 288 432]"), "{dpmm}");
+        }
+        // 4 x 6 inches in dots.
+        assert!(render_at("^XA^PW812^LL1218^XZ", 8).contains("/MediaBox [0 0 288 432]"));
+        assert!(render_at("^XA^PW1200^LL1800^XZ", 12).contains("/MediaBox [0 0 288 432]"));
+        // The same dots are smaller on a finer printhead.
+        assert!(render_at("^XA^PW600^LL300^XZ", 12).contains("/MediaBox [0 0 144 72]"));
+        assert!(PdfRenderer::with_dpmm(600, 300, 12).render(&[]).windows(22).any(|w| w == b"/MediaBox [0 0 144 72]"));
+        // ^JMB: half as many, twice as large dots.
+        assert!(render_at("^XA^JMB^PW406^LL609^XZ", 8).contains("/MediaBox [0 0 288 432]"));
+        assert!(render_at("^XA^JMB^FO1,1^GB5,5,5^FS^XZ", 12).contains("/MediaBox [0 0 288 432]"));
     }
 
     #[test]

@@ -167,12 +167,25 @@ impl Parser<'_> {
                 print_above: self.yes_no_or(params, 3, false, span).ok()?,
             }),
             (false, "MU") => {
-                self.unit_scale.set(match first_char(params, 0).map(|c| c.to_ascii_uppercase()) {
-                    Some('I') => 203.2,
-                    Some('M') => 8.0,
-                    _ => 1.0,
-                });
-                Ok(Command::Comment { text: String::new() })
+                let units = first_char(params, 0).map(|c| c.to_ascii_uppercase());
+                self.units.set(units.filter(|u| matches!(u, 'I' | 'M')).unwrap_or('D'));
+                // Base and desired dpi must both be given, else they are ignored.
+                let dpi = |i| param(params, i).parse::<u32>().ok().filter(|v| matches!(v, 150 | 200 | 300 | 600));
+                let command = match (dpi(1), dpi(2)) {
+                    (Some(base), Some(desired)) => {
+                        self.conversion.set((base, desired));
+                        Command::FormatConversion { base, desired }
+                    }
+                    _ => Command::Comment { text: String::new() },
+                };
+                self.update_unit_scale();
+                Ok(command)
+            }
+            (false, "JM") => {
+                let half = param(params, 0).eq_ignore_ascii_case("B");
+                self.half_density.set(half);
+                self.update_unit_scale();
+                Ok(Command::DotsPerMm { half })
             }
             (false, "FC") => Ok(Command::FieldClock {
                 primary: first_char(params, 0).unwrap_or('%'),

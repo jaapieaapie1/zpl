@@ -17,7 +17,7 @@ impl PngRenderer {
         let at = Place { x: *x, y: *y, orientation: *orientation, bottom: *bottom };
         let frame = match *spec {
             SymbolSpec::MaxiCode { mode, symbol_number, total_symbols } => {
-                maxicode::encode(data, mode, symbol_number, total_symbols).ok().map(|s| maxicode_frame(&s))
+                maxicode::encode(data, mode, symbol_number, total_symbols).ok().map(|s| maxicode_frame(&s, self.dpmm))
             }
             SymbolSpec::DataBar { kind, module_width, separator_height, height, segments_per_row } => {
                 data_bar(kind, data, segments_per_row).map(|(symbol, composite)| {
@@ -282,10 +282,10 @@ fn postal_frame(symbol: &postal::PostalSymbol, module: u32, height: u32, text: O
     img
 }
 
-/// MaxiCode at its fixed physical size (8 dots/mm): pointy-top hexagons plus the bullseye
-/// rings, sampled at dot centres.
-fn maxicode_frame(symbol: &maxicode::MaxiCode) -> RgbImage {
-    let g = symbol.geometry(8.0);
+/// MaxiCode at its fixed physical size on a `dpmm` printhead: pointy-top hexagons plus the
+/// bullseye rings, sampled at dot centres.
+fn maxicode_frame(symbol: &maxicode::MaxiCode, dpmm: u32) -> RgbImage {
+    let g = symbol.geometry(dpmm as f32);
     let mut img = blank(g.width.ceil() as u32, g.height.ceil() as u32);
     let (w, h) = (img.width() as i32, img.height() as i32);
     let r = g.hex_radius;

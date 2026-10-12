@@ -1215,7 +1215,9 @@ dependencies = [
  "ab_glyph",
  "image",
  "imageproc",
- "qrcode",
+ "qr-core",
+ "qr-decode",
+ "qr-encode",
  "rustybuzz",
  "unicode-bidi",
  "unicode-bidi-mirroring",
@@ -1280,12 +1282,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "qrcode"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+name = "qr-core"
+version = "0.1.0"
+source = "git+ssh://git@github.com/jaapieaapie1/qrcode.git?rev=2968749a95e03f715b2686bc1a7f44a59d6bf390#2968749a95e03f715b2686bc1a7f44a59d6bf390"
+
+[[package]]
+name = "qr-decode"
+version = "0.1.0"
+source = "git+ssh://git@github.com/jaapieaapie1/qrcode.git?rev=2968749a95e03f715b2686bc1a7f44a59d6bf390#2968749a95e03f715b2686bc1a7f44a59d6bf390"
 dependencies = [
- "image",
+ "qr-core",
+]
+
+[[package]]
+name = "qr-encode"
+version = "0.1.0"
+source = "git+ssh://git@github.com/jaapieaapie1/qrcode.git?rev=2968749a95e03f715b2686bc1a7f44a59d6bf390#2968749a95e03f715b2686bc1a7f44a59d6bf390"
+dependencies = [
+ "qr-core",
 ]
 
 [[package]]

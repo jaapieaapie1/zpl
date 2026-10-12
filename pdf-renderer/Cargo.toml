@@ -10,7 +10,6 @@ zpl-symbols = { path = "../zpl-symbols" }
 png-renderer = { path = "../png-renderer" }
 pdf-writer = "0.15"
 ttf-parser = "0.25"
-# Private repository: fetched over SSH (see .cargo/config.toml and the Dockerfile).
 miniz_oxide = "0.8"
 subsetter = { version = "0.2", default-features = false }
 # ^PA advanced text layout: OpenType shaping and Unicode bidi.

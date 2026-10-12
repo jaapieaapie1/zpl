@@ -4,11 +4,11 @@
 //! Matches Labelary: automatic input encodes the data as one segment of the narrowest mode
 //! that holds all of it (numeric, alphanumeric or byte), the error correction level is then
 //! raised as far as the data still fits in the smallest version for the requested level,
-//! and the mask is always the lowest ISO penalty one (Labelary ignores the ^BQ mask).
+//! and the mask is always the lowest ISO penalty one (Labelary ignores the ^BQ mask). The
+//! encoding itself is qr-encode's (`single_segment`, `boost_ec`, automatic mask).
 
-use qrcode::bits::Bits;
-use qrcode::canvas::Canvas;
-use qrcode::{EcLevel, Version};
+use qr_core::{BitMatrix, EcLevel};
+use qr_encode::Options;
 use zpl_parser::command::Orientation;
 
 /// Top-left corner of a `size` x `size` module QR symbol of `module` dot modules. The
@@ -24,8 +24,6 @@ pub fn top_left(x: u32, y: u32, size: u32, module: u32, orientation: Orientation
         (false, _) => (x, y),
     }
 }
-
-const LEVELS: [EcLevel; 4] = [EcLevel::L, EcLevel::M, EcLevel::Q, EcLevel::H];
 
 /// Character mode of the data segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,80 +83,42 @@ fn alphanumeric(c: &u8) -> bool {
     c.is_ascii_digit() || c.is_ascii_uppercase() || b" $%*+-./:".contains(c)
 }
 
-/// The narrowest mode holding all of `data`.
-fn single_mode(data: &[u8]) -> Mode {
-    if data.iter().all(u8::is_ascii_digit) {
-        Mode::Numeric
-    } else if data.iter().all(alphanumeric) {
-        Mode::Alphanumeric
-    } else {
-        Mode::Byte
-    }
-}
-
-/// A finished QR symbol: `size` x `size` modules, row by row.
+/// A finished QR symbol: `size` x `size` modules.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QrSymbol {
     pub size: u32,
-    modules: Vec<bool>,
+    modules: BitMatrix,
 }
 
 impl QrSymbol {
     /// Whether the module in column `x`, row `y` is dark.
     pub fn get(&self, x: u32, y: u32) -> bool {
-        self.modules[(y * self.size + x) as usize]
+        self.modules.get(x, y)
     }
-}
-
-/// `data` as one `mode` segment in `version`, terminated for `ec`; `None` if it does not
-/// fit. The mode must hold every character of `data`.
-fn bits(data: &[u8], mode: Mode, version: i16, ec: EcLevel) -> Option<Bits> {
-    let mut bits = Bits::new(Version::Normal(version));
-    match mode {
-        Mode::Numeric => bits.push_numeric_data(data),
-        Mode::Alphanumeric => bits.push_alphanumeric_data(data),
-        Mode::Byte | Mode::Kanji => bits.push_byte_data(data),
-    }
-    .ok()?;
-    bits.push_terminator(ec).ok()?;
-    Some(bits)
 }
 
 /// The QR symbol for ^FD `data`, `None` if the data does not fit.
 pub fn encode(data: &str) -> Option<QrSymbol> {
     let field = parse(data);
-    let mode = field.mode.unwrap_or_else(|| single_mode(field.payload));
     // Manual numeric / alphanumeric input keeps only the characters the mode can hold
     // (Labelary encodes `N0123A45` as 012345); Kanji is not supported and goes as bytes.
+    // Automatic input is one segment of the narrowest mode (`single_segment`).
     let filtered: Vec<u8>;
-    let (mode, payload) = match mode {
-        Mode::Numeric => {
+    let (mode, payload) = match field.mode {
+        None => (None, field.payload),
+        Some(Mode::Numeric) => {
             filtered = field.payload.iter().copied().filter(u8::is_ascii_digit).collect();
-            (mode, filtered.as_slice())
+            (Some(qr_core::Mode::Numeric), filtered.as_slice())
         }
-        Mode::Alphanumeric => {
+        Some(Mode::Alphanumeric) => {
             filtered = field.payload.iter().copied().filter(alphanumeric).collect();
-            (mode, filtered.as_slice())
+            (Some(qr_core::Mode::Alphanumeric), filtered.as_slice())
         }
-        Mode::Byte | Mode::Kanji => (Mode::Byte, field.payload),
+        Some(Mode::Byte | Mode::Kanji) => (Some(qr_core::Mode::Byte), field.payload),
     };
-    let field = QrData { payload, ..field };
-    let (version, _) = (1..=40).find_map(|v| bits(field.payload, mode, v, field.ec).map(|b| (v, b)))?;
-    // Raise the level while the data still fits in the same version.
-    let (ec, bits) = LEVELS
-        .iter()
-        .rev()
-        .take_while(|&&ec| ec != field.ec)
-        .chain([&field.ec])
-        .find_map(|&ec| bits(field.payload, mode, version, ec).map(|b| (ec, b)))?;
-
-    let (data, ec_data) = qrcode::ec::construct_codewords(&bits.into_bytes(), Version::Normal(version), ec).ok()?;
-    let mut canvas = Canvas::new(Version::Normal(version), ec);
-    canvas.draw_all_functional_patterns();
-    canvas.draw_data(&data, &ec_data);
-    let canvas = canvas.apply_best_mask();
-    let modules = canvas.into_colors().into_iter().map(|c| c == qrcode::Color::Dark).collect();
-    Some(QrSymbol { size: (version * 4 + 17) as u32, modules })
+    let options = Options { mode, single_segment: true, boost_ec: true, ..Options::new(field.ec) };
+    let modules = qr_encode::encode(payload, options).ok()?;
+    Some(QrSymbol { size: modules.size(), modules })
 }
 
 #[cfg(test)]
@@ -209,5 +169,27 @@ mod tests {
         assert_eq!(code, encode("HM,N012345678912").unwrap());
         assert_eq!((code.size, format(&code)), (21, (0b10, 3)));
         assert!(encode("MM,Aabc").is_some());
+    }
+
+    /// Every ^FD of the qr_* compat cases decodes to its payload. Where the symbol differs
+    /// from Labelary's it is only by mask: Labelary scores the ISO 1:1:3:1:1 rule on a fixed
+    /// 7-module window, qr-encode on whole runs.
+    #[test]
+    fn compat_symbols_decode() {
+        let cases: [(&str, &[u8]); 9] = [
+            ("HA,ECC LEVEL H", b"ECC LEVEL H"),
+            ("MA,Bbinary data", b"Bbinary data"),
+            ("MM,N0123456789A12AABCDEF", b"012345678912"),
+            ("QA,FT MAG2", b"FT MAG2"),
+            ("QA,FT B", b"FT B"),
+            ("QA,TYPESET", b"TYPESET"),
+            ("QA,DEFAULT MAG", b"DEFAULT MAG"),
+            ("QA,lower case text", b"lower case text"),
+            ("QA,A LONGER QR CODE AT VERSION THREE", b"A LONGER QR CODE AT VERSION THREE"),
+        ];
+        for (data, payload) in cases {
+            let decoded = qr_decode::decode(&encode(data).unwrap().modules).unwrap();
+            assert_eq!(decoded.bytes, payload, "{data}");
+        }
     }
 }

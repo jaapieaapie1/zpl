@@ -26,6 +26,7 @@ fn main() {
             block: None,
             direction: FieldDirection::Horizontal,
             char_gap: 0,
+            custom_font: None,
         },
         DrawInstruction::DrawCircle {
             x: 400,

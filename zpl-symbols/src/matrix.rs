@@ -918,7 +918,7 @@ fn consecutive_digits(msg: &[u8], start: usize) -> usize {
         .count()
 }
 
-fn is_pdf_text(c: u8) -> bool {
+pub(crate) fn is_pdf_text(c: u8) -> bool {
     c == b'\t' || c == b'\n' || c == b'\r' || (32..=126).contains(&c)
 }
 
@@ -955,7 +955,7 @@ fn consecutive_binary(msg: &[u8], start: usize) -> usize {
     idx - start
 }
 
-fn pdf_bytes(bytes: &[u8], out: &mut Vec<u16>) {
+pub(crate) fn pdf_bytes(bytes: &[u8], out: &mut Vec<u16>) {
     out.push(if bytes.len().is_multiple_of(6) {
         924
     } else {
@@ -974,7 +974,7 @@ fn pdf_bytes(bytes: &[u8], out: &mut Vec<u16>) {
     out.extend(chunks.remainder().iter().map(|&b| u16::from(b)));
 }
 
-fn pdf_numeric(digits: &[u8], out: &mut Vec<u16>) {
+pub(crate) fn pdf_numeric(digits: &[u8], out: &mut Vec<u16>) {
     for group in digits.chunks(44) {
         // Big number "1" + digits, as base-10 digits, converted to base 900 by long division.
         let mut num: Vec<u32> = Vec::with_capacity(45);
@@ -999,7 +999,7 @@ fn pdf_numeric(digits: &[u8], out: &mut Vec<u16>) {
     }
 }
 
-const SUB_ALPHA: u8 = 0;
+pub(crate) const SUB_ALPHA: u8 = 0;
 const SUB_LOWER: u8 = 1;
 const SUB_MIXED: u8 = 2;
 const SUB_PUNCT: u8 = 3;
@@ -1024,7 +1024,7 @@ fn pdf_punct(c: u8) -> Option<u16> {
     PDF_PUNCT_RAW.iter().position(|&m| m == c).map(|p| p as u16)
 }
 
-fn pdf_text(msg: &[u8], mut sub: u8, out: &mut Vec<u16>) -> u8 {
+pub(crate) fn pdf_text(msg: &[u8], mut sub: u8, out: &mut Vec<u16>) -> u8 {
     let upper = |c: u8| c == b' ' || c.is_ascii_uppercase();
     let lower = |c: u8| c == b' ' || c.is_ascii_lowercase();
     let mut tmp: Vec<u16> = Vec::with_capacity(msg.len() * 2);
@@ -1864,7 +1864,7 @@ fn aztec_high_level(data: &[u8]) -> Vec<bool> {
 /// PDF417 bar/space patterns per cluster (0, 3, 6), 17 modules each with the leading bar bit
 /// implied. Taken from the MIT-licensed `pdf417` crate (Copyright (c) 2023 Sofiane).
 #[rustfmt::skip]
-static CODEWORDS: [[u16; 929]; 3] = [
+pub(crate) static CODEWORDS: [[u16; 929]; 3] = [
     [
         0xd5c0, 0xeaf0, 0xf57c, 0xd4e0, 0xea78, 0xf53e, 0xa8c0, 0xd470, 0xa860, 0x5040, 0xa830, 0x5020,
         0xadc0, 0xd6f0, 0xeb7c, 0xace0, 0xd678, 0xeb3e, 0x58c0, 0xac70, 0x5860, 0x5dc0, 0xaef0, 0xd77c,

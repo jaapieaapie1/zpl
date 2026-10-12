@@ -263,6 +263,131 @@ pub enum Command {
         truncated: bool,
     },
 
+    /// ^BD
+    MaxiCode {
+        mode: u8,
+        symbol_number: u8,
+        total_symbols: u8,
+    },
+
+    /// ^BR. `kind` is the ZPL symbology type 1-12.
+    DataBar {
+        orientation: Option<Orientation>,
+        kind: u8,
+        magnification: Option<u32>,
+        separator_height: u32,
+        height: Option<u32>,
+        segments_per_row: u32,
+    },
+
+    /// ^BF
+    MicroPdf417 {
+        orientation: Option<Orientation>,
+        height: Option<u32>,
+        mode: u8,
+    },
+
+    /// ^BT
+    Tlc39 {
+        orientation: Option<Orientation>,
+        code39_module_width: u32,
+        code39_ratio: f32,
+        code39_height: u32,
+        micro_row_height: u32,
+        micro_module_width: u32,
+    },
+
+    /// ^BB. `row_height` is in multiples of the module width.
+    Codablock {
+        orientation: Option<Orientation>,
+        row_height: u32,
+        security: bool,
+        columns: u32,
+        rows: u32,
+        mode: char,
+    },
+
+    /// ^B4. `row_height` is in multiples of the module width.
+    Code49 {
+        orientation: Option<Orientation>,
+        row_height: Option<u32>,
+        interpretation: Code49Interpretation,
+        start_mode: Option<u8>,
+    },
+
+    /// ^BZ (POSTNET, PLANET, USPS IMb) and ^B5 (PLANET).
+    Postal {
+        kind: PostalKind,
+        orientation: Option<Orientation>,
+        height: Option<u32>,
+        print_interpretation_line: bool,
+        print_above: bool,
+    },
+
+    /// ^FC: clock indicator characters for the field data of this field.
+    FieldClock {
+        primary: char,
+        secondary: Option<char>,
+        tertiary: Option<char>,
+    },
+
+    /// ^ST: set the real-time clock used by ^FC fields.
+    SetClock {
+        month: u32,
+        day: u32,
+        year: u32,
+        hour: u32,
+        minute: u32,
+        second: u32,
+    },
+
+    /// ^SO: offset of the secondary (2) or tertiary (3) clock.
+    ClockOffset {
+        clock: u8,
+        months: i32,
+        days: i32,
+        years: i32,
+        hours: i32,
+        minutes: i32,
+        seconds: i32,
+    },
+
+    /// ^FE: field data may embed `^FN` values as `#n#` or `#n,f|b,x,y#`.
+    FieldEmbed {
+        indicator: char,
+    },
+
+    /// ^IL: draw a stored label image (saved with ^IS) as the background of this format.
+    ImageLoad {
+        name: String,
+    },
+
+    /// ^IS: store this format's image under `name` at ^XZ.
+    ImageSave {
+        name: String,
+        print: bool,
+    },
+
+    /// ~DU / ~DT / ~DY (TrueType/OpenType): store a font under `name`.
+    DownloadFont {
+        name: String,
+        data: Vec<u8>,
+    },
+
+    /// ^CW: font letter `letter` now refers to the stored font `name`.
+    FontAlias {
+        letter: char,
+        name: String,
+    },
+
+    /// ^A@: select a stored font by name.
+    FontByName {
+        orientation: Option<Orientation>,
+        height: Option<u32>,
+        width: Option<u32>,
+        name: String,
+    },
+
     /// ^BO / ^B0
     Aztec {
         orientation: Option<Orientation>,
@@ -275,6 +400,20 @@ pub enum Command {
         name: String,
         params: Vec<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Code49Interpretation {
+    None,
+    Above,
+    Below,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostalKind {
+    Postnet,
+    Planet,
+    UspsImb,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,6 +479,15 @@ pub enum Encoding {
     SingleByteAsian,
     MultibyteAsian,
     Utf8,
+    Utf16BigEndian,
+    Utf16LittleEndian,
+    /// Zebra Code Page 1252 (^CI27) and Windows code pages 1250-1255 (^CI31-36).
+    Cp1252,
+    Cp1250,
+    Cp1251,
+    Cp1253,
+    Cp1254,
+    Cp1255,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

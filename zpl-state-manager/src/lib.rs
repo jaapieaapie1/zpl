@@ -1,8 +1,12 @@
+mod charset;
+mod clock;
+
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use zpl_parser::command::{
-    BlockJustification, Code128Mode, Command, DiagonalDirection, Encoding, FieldDirection, FontName,
-    Justification, LineColor, LinearKind, Orientation, QrErrorCorrection, QrModel,
+    BlockJustification, Code128Mode, Code49Interpretation, Command, DiagonalDirection, Encoding, FieldDirection,
+    FontName, Justification, LineColor, LinearKind, Orientation, PostalKind, QrErrorCorrection, QrModel,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +28,9 @@ pub enum DrawInstruction {
         direction: FieldDirection,
         /// ^FP extra gap between characters, in dots.
         char_gap: u32,
+        /// TrueType/OpenType font downloaded with ~DU / ~DT / ~DY and selected through ^A@ or
+        /// a ^CW alias; `None` means the built-in font for `font`.
+        custom_font: Option<Arc<Vec<u8>>>,
     },
     /// Code 128 (^BC).
     DrawBarcode {
@@ -144,8 +151,37 @@ pub enum DrawInstruction {
         magnification_x: u32,
         magnification_y: u32,
     },
+    /// Symbols drawn from `zpl-symbols` encoders that have no dedicated variant. `bottom`: the
+    /// origin came from ^FT, so `y` is the symbol's bottom edge.
+    DrawSymbol {
+        x: u32,
+        y: u32,
+        data: String,
+        orientation: Orientation,
+        bottom: bool,
+        spec: SymbolSpec,
+    },
     /// ^FR / ^LR: the inner element inverts whatever is underneath instead of painting black.
     Reverse(Box<DrawInstruction>),
+}
+
+/// Symbology and resolved sizes (in dots) for `DrawInstruction::DrawSymbol`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SymbolSpec {
+    /// ^BD; fixed physical size.
+    MaxiCode { mode: u8, symbol_number: u8, total_symbols: u8 },
+    /// ^BR; `kind` is the ZPL type 1-12, `height` the linear component's bar height.
+    DataBar { kind: u8, module_width: u32, separator_height: u32, height: u32, segments_per_row: u32 },
+    /// ^BF
+    MicroPdf417 { module_width: u32, row_height: u32, mode: u8 },
+    /// ^BT
+    Tlc39 { code39_module_width: u32, code39_ratio: f32, code39_height: u32, micro_module_width: u32, micro_row_height: u32 },
+    /// ^BB; `mode` is A, E or F.
+    Codablock { module_width: u32, row_height: u32, security: bool, columns: u32, rows: u32, mode: char },
+    /// ^B4
+    Code49 { module_width: u32, row_height: u32, interpretation: Code49Interpretation, start_mode: Option<u8> },
+    /// ^BZ / ^B5
+    Postal { kind: PostalKind, module_width: u32, height: u32, print_interpretation_line: bool, print_above: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,7 +217,7 @@ pub struct PageSetup {
 #[derive(Debug, Clone)]
 enum FieldMode {
     Text,
-    Symbol {
+    GraphicSymbol {
         orientation: Orientation,
         height: u32,
         width: u32,
@@ -229,6 +265,10 @@ enum FieldMode {
         magnification: u32,
         ecc: u32,
     },
+    Symbol {
+        orientation: Orientation,
+        spec: SymbolSpec,
+    },
 }
 
 /// Settings that only last until the field's ^FS.
@@ -244,6 +284,10 @@ struct Field {
     number: Option<u32>,
     /// ^TB orientation override for the text field.
     orientation: Option<Orientation>,
+    /// ^FC primary/secondary/tertiary clock indicators.
+    clock: Option<(char, Option<char>, Option<char>)>,
+    /// ^FE indicator.
+    embed: Option<char>,
 }
 
 impl Default for Field {
@@ -258,6 +302,8 @@ impl Default for Field {
             char_gap: 0,
             number: None,
             orientation: None,
+            clock: None,
+            embed: None,
         }
     }
 }
@@ -282,6 +328,7 @@ pub struct StateManager {
     current_font_orientation: Orientation,
     current_font_height: u32,
     current_font_width: u32,
+    current_custom_font: Option<Arc<Vec<u8>>>,
 
     print_width: Option<u32>,
     label_length: Option<u32>,
@@ -308,6 +355,22 @@ pub struct StateManager {
     field_values: HashMap<u32, String>,
     /// While a stored format is replayed: the ^FN values supplied by the recalling format.
     replay_values: Option<HashMap<u32, String>>,
+    /// ^FN data of the fields printed so far in this format, for ^FE references.
+    format_values: HashMap<u32, String>,
+
+    /// ^ST clock (else the system clock, UTC) and the ^SO offsets of clocks 2 and 3.
+    clock: Option<clock::DateTime>,
+    clock_offsets: [clock::Offset; 2],
+
+    /// Downloaded fonts (~DU / ~DT / ~DY) and ^CW letter aliases, keyed by `stored_name`.
+    fonts: HashMap<String, Arc<Vec<u8>>>,
+    font_aliases: HashMap<char, String>,
+
+    /// ^IS images (the drawing of a whole format) and the pending save of this format.
+    images: HashMap<String, Vec<DrawInstruction>>,
+    save_image: Option<(String, bool)>,
+    /// Index of this format's first instruction in the output.
+    format_start: usize,
 }
 
 /// ^GS symbols by field data character.
@@ -330,36 +393,76 @@ fn stored_name(name: &str) -> String {
     name.trim().to_ascii_uppercase()
 }
 
-/// Decodes ^FH escapes (`<indicator>` + two hex digits). Escaped bytes are UTF-8 under
-/// ^CI28 and single-byte (Latin-1) otherwise.
-fn decode_hex_escapes(data: &str, indicator: char, utf8: bool) -> String {
-    let hex = |b: u8| (b as char).to_digit(16);
-    let bytes = data.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    let mut ind = [0; 4];
-    let ind = indicator.encode_utf8(&mut ind).as_bytes();
-    while i < bytes.len() {
-        if bytes[i..].starts_with(ind) {
-            let at = i + ind.len();
-            if let (Some(&h), Some(&l)) = (bytes.get(at), bytes.get(at + 1)) {
-                if let (Some(h), Some(l)) = (hex(h), hex(l)) {
-                    let byte = (h * 16 + l) as u8;
-                    if utf8 || byte < 0x80 {
-                        out.push(byte);
-                    } else {
-                        let mut buf = [0; 4];
-                        out.extend_from_slice((byte as char).encode_utf8(&mut buf).as_bytes());
-                    }
-                    i = at + 2;
-                    continue;
-                }
+/// Decodes ^FH escapes (`<indicator>` + two hex digits). Each run of consecutive escaped
+/// bytes is decoded with the ^CI character set; literal text is kept as is.
+fn decode_hex_escapes(data: &str, indicator: char, encoding: Encoding) -> String {
+    let hex = |c: Option<char>| c.and_then(|c| c.to_digit(16));
+    let mut out = String::with_capacity(data.len());
+    let mut run = Vec::new();
+    let mut rest = data;
+    while let Some(c) = rest.chars().next() {
+        if c == indicator {
+            let mut it = rest[c.len_utf8()..].chars();
+            if let (Some(h), Some(l)) = (hex(it.next()), hex(it.next())) {
+                run.push((h * 16 + l) as u8);
+                rest = &rest[c.len_utf8() + 2..];
+                continue;
             }
         }
-        out.push(bytes[i]);
-        i += 1;
+        if !run.is_empty() {
+            out.push_str(&charset::decode(&run, encoding));
+            run.clear();
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
     }
-    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    if !run.is_empty() {
+        out.push_str(&charset::decode(&run, encoding));
+    }
+    out
+}
+
+/// Expands ^FE references to ^FN data: `#n#` inserts field n, `#n,f,x,y#` / `#n,b,x,y#` inserts
+/// `y` characters starting at position `x` (1-based) counted from the front or back.
+fn embed_fields(data: &str, indicator: char, lookup: impl Fn(u32) -> Option<String>) -> String {
+    let mut out = String::with_capacity(data.len());
+    let mut parts = data.split(indicator);
+    out.push_str(parts.next().unwrap_or(""));
+    let mut parts = parts.peekable();
+    while let Some(spec) = parts.next() {
+        let mut fields = spec.split(',');
+        let number = fields.next().and_then(|n| n.trim().parse::<u32>().ok());
+        match (number, parts.peek().is_some()) {
+            (Some(n), true) => {
+                let value = lookup(n).unwrap_or_default();
+                let chars: Vec<char> = value.chars().collect();
+                let rest: Vec<&str> = fields.collect();
+                let piece: String = match rest.as_slice() {
+                    [] => value,
+                    [dir, x, y] => {
+                        let (x, y) = (x.trim().parse::<usize>().unwrap_or(0), y.trim().parse::<usize>().unwrap_or(0));
+                        if x == 0 {
+                            String::new()
+                        } else if dir.trim().eq_ignore_ascii_case("b") {
+                            // Counting back from the last character, then taking y characters onwards.
+                            let start = chars.len().saturating_sub(x);
+                            chars[start..].iter().take(y).collect()
+                        } else {
+                            chars.iter().skip(x - 1).take(y).collect()
+                        }
+                    }
+                    _ => String::new(),
+                };
+                out.push_str(&piece);
+                out.push_str(parts.next().unwrap_or(""));
+            }
+            _ => {
+                out.push(indicator);
+                out.push_str(spec);
+            }
+        }
+    }
+    out
 }
 
 impl StateManager {
@@ -382,6 +485,7 @@ impl StateManager {
             current_font_orientation: Orientation::Normal,
             current_font_height: 9,
             current_font_width: 5,
+            current_custom_font: None,
 
             print_width: None,
             label_length: None,
@@ -404,6 +508,17 @@ impl StateManager {
             recall: None,
             field_values: HashMap::new(),
             replay_values: None,
+            format_values: HashMap::new(),
+
+            clock: None,
+            clock_offsets: Default::default(),
+
+            fonts: HashMap::new(),
+            font_aliases: HashMap::new(),
+
+            images: HashMap::new(),
+            save_image: None,
+            format_start: 0,
         }
     }
 
@@ -449,16 +564,20 @@ impl StateManager {
         }
     }
 
+    /// Width 0 means "not given": scalable fonts then use the height, bitmap fonts the
+    /// height's magnification.
     fn set_font_size(&mut self, height: Option<u32>, width: Option<u32>) {
-        // Scalable fonts keep their aspect ratio when only one dimension is given
-        if let Some(h) = height {
-            self.current_font_height = h;
-        }
-        if let Some(w) = width.or(height) {
-            self.current_font_width = w;
-        }
-        if width.is_some() && height.is_none() {
-            self.current_font_height = self.current_font_width;
+        match (height, width) {
+            (Some(h), w) => {
+                self.current_font_height = h;
+                self.current_font_width = w.unwrap_or(0);
+            }
+            // Width only: scalable fonts keep their aspect ratio.
+            (None, Some(w)) => {
+                self.current_font_height = w;
+                self.current_font_width = w;
+            }
+            (None, None) => {}
         }
     }
 
@@ -471,7 +590,10 @@ impl StateManager {
         }
 
         match command {
-            Command::StartFormat => self.reset_format_state(),
+            Command::StartFormat => {
+                self.reset_format_state();
+                self.format_start = out.len();
+            }
             Command::EndFormat => self.end_format(out),
 
             Command::LabelHome { x, y } => {
@@ -503,12 +625,14 @@ impl StateManager {
 
             Command::Font { font, orientation, height, width } => {
                 self.current_font = font;
+                self.current_custom_font = self.aliased_font(font);
                 self.current_font_orientation = orientation.unwrap_or(self.default_orientation);
                 self.set_font_size(height, width);
             }
 
             Command::ChangeFont { font, height, width } => {
                 self.current_font = font;
+                self.current_custom_font = self.aliased_font(font);
                 self.set_font_size(height, width);
             }
 
@@ -556,11 +680,129 @@ impl StateManager {
             Command::FieldNumber { number } => self.field.number = Some(number),
 
             Command::FielData { data } => {
-                let data = match self.field.hex_indicator {
-                    Some(ind) => decode_hex_escapes(&data, ind, self.character_encoding == Encoding::Utf8),
+                let mut data = match self.field.hex_indicator {
+                    Some(ind) => decode_hex_escapes(&data, ind, self.character_encoding),
                     None => data,
                 };
+                if let Some(ind) = self.field.embed {
+                    data = embed_fields(&data, ind, |n| {
+                        self.format_values.get(&n).or_else(|| self.replay_values.as_ref()?.get(&n)).cloned()
+                    });
+                }
+                if let Some((primary, secondary, tertiary)) = self.field.clock {
+                    let now = self.clock.unwrap_or_else(clock::DateTime::now);
+                    let mut clocks = vec![(primary, now)];
+                    clocks.extend(secondary.map(|c| (c, now.offset(&self.clock_offsets[0]))));
+                    clocks.extend(tertiary.map(|c| (c, now.offset(&self.clock_offsets[1]))));
+                    data = clock::expand(&data, &clocks);
+                }
                 self.field.data = Some(data);
+            }
+            Command::FieldClock { primary, secondary, tertiary } => {
+                self.field.clock = Some((primary, secondary, tertiary));
+            }
+            Command::SetClock { month, day, year, hour, minute, second } => {
+                self.clock = Some(clock::DateTime {
+                    year: year as i64,
+                    month: month.clamp(1, 12),
+                    day: day.clamp(1, 31),
+                    hour: hour.min(23),
+                    minute: minute.min(59),
+                    second: second.min(59),
+                });
+            }
+            Command::ClockOffset { clock, months, days, years, hours, minutes, seconds } => {
+                self.clock_offsets[usize::from(clock == 3)] =
+                    clock::Offset { months, days, years, hours, minutes, seconds };
+            }
+            Command::FieldEmbed { indicator } => self.field.embed = Some(indicator),
+            Command::ImageSave { name, print } => self.save_image = Some((stored_name(&name), print)),
+            Command::ImageLoad { name } => {
+                if let Some(image) = self.images.get(&stored_name(&name)) {
+                    out.extend(image.iter().cloned());
+                }
+            }
+            Command::DownloadFont { name, data } => {
+                self.fonts.insert(stored_name(&name), Arc::new(data));
+            }
+            Command::FontAlias { letter, name } => {
+                self.font_aliases.insert(letter, stored_name(&name));
+            }
+            Command::FontByName { orientation, height, width, name } => {
+                self.current_font = FontName::Custom('@');
+                self.current_custom_font = self.fonts.get(&stored_name(&name)).cloned();
+                self.current_font_orientation = orientation.unwrap_or(self.default_orientation);
+                self.set_font_size(height, width);
+            }
+            Command::MaxiCode { mode, symbol_number, total_symbols } => {
+                self.set_symbol(Some(Orientation::Normal), SymbolSpec::MaxiCode { mode, symbol_number, total_symbols });
+            }
+            Command::DataBar { orientation, kind, magnification, separator_height, height, segments_per_row } => {
+                let spec = SymbolSpec::DataBar {
+                    kind,
+                    module_width: magnification.unwrap_or(2),
+                    separator_height,
+                    height: height.unwrap_or(25),
+                    segments_per_row,
+                };
+                self.set_symbol(orientation, spec);
+            }
+            Command::MicroPdf417 { orientation, height, mode } => {
+                let spec = SymbolSpec::MicroPdf417 {
+                    module_width: self.barcode_module_width,
+                    row_height: height.unwrap_or(self.barcode_height),
+                    mode,
+                };
+                self.set_symbol(orientation, spec);
+            }
+            Command::Tlc39 {
+                orientation,
+                code39_module_width,
+                code39_ratio,
+                code39_height,
+                micro_row_height,
+                micro_module_width,
+            } => {
+                let spec = SymbolSpec::Tlc39 {
+                    code39_module_width,
+                    code39_ratio,
+                    code39_height,
+                    micro_module_width,
+                    micro_row_height,
+                };
+                self.set_symbol(orientation, spec);
+            }
+            Command::Codablock { orientation, row_height, security, columns, rows, mode } => {
+                let module_width = self.barcode_module_width;
+                let spec = SymbolSpec::Codablock {
+                    module_width,
+                    row_height: row_height * module_width,
+                    security,
+                    columns,
+                    rows,
+                    mode,
+                };
+                self.set_symbol(orientation, spec);
+            }
+            Command::Code49 { orientation, row_height, interpretation, start_mode } => {
+                let module_width = self.barcode_module_width;
+                let spec = SymbolSpec::Code49 {
+                    module_width,
+                    row_height: row_height.unwrap_or(self.barcode_height) * module_width,
+                    interpretation,
+                    start_mode,
+                };
+                self.set_symbol(orientation, spec);
+            }
+            Command::Postal { kind, orientation, height, print_interpretation_line, print_above } => {
+                let spec = SymbolSpec::Postal {
+                    kind,
+                    module_width: self.barcode_module_width,
+                    height: height.unwrap_or(self.barcode_height),
+                    print_interpretation_line,
+                    print_above,
+                };
+                self.set_symbol(orientation, spec);
             }
             Command::SerializationData { start } => self.field.data = Some(start),
 
@@ -571,7 +813,7 @@ impl StateManager {
 
             Command::GraphicSymbol { orientation, height, width } => {
                 let height = height.unwrap_or(self.current_font_height);
-                self.field.mode = FieldMode::Symbol {
+                self.field.mode = FieldMode::GraphicSymbol {
                     orientation: orientation.unwrap_or(self.default_orientation),
                     height,
                     width: width.unwrap_or(height),
@@ -687,6 +929,19 @@ impl StateManager {
         }
     }
 
+    fn set_symbol(&mut self, orientation: Option<Orientation>, spec: SymbolSpec) {
+        self.field.mode = FieldMode::Symbol { orientation: orientation.unwrap_or(self.default_orientation), spec };
+    }
+
+    /// The downloaded font a ^CW alias maps `font` to, if any.
+    fn aliased_font(&self, font: FontName) -> Option<Arc<Vec<u8>>> {
+        let letter = match font {
+            FontName::Custom(c) => c,
+            other => format!("{other:?}").chars().last()?,
+        };
+        self.fonts.get(self.font_aliases.get(&letter.to_ascii_uppercase())?).cloned()
+    }
+
     fn emit_graphic(&self, out: &mut Vec<DrawInstruction>, bytes_per_row: u32, data: Vec<u8>, mx: u32, my: u32) {
         if bytes_per_row == 0 {
             return;
@@ -710,6 +965,9 @@ impl StateManager {
         }
         let replayed = field.number.and_then(|n| self.replay_values.as_ref()?.get(&n).cloned());
         let Some(data) = replayed.or(field.data) else { return };
+        if let Some(n) = field.number {
+            self.format_values.insert(n, data.clone());
+        }
 
         let (x, y) = self.origin();
         let bottom = self.field_typeset;
@@ -730,12 +988,14 @@ impl StateManager {
                 block: field.block,
                 direction: field.direction,
                 char_gap: field.char_gap,
+                custom_font: self.current_custom_font.clone(),
             },
-            FieldMode::Symbol { orientation, height, width } => DrawInstruction::DrawText {
+            FieldMode::GraphicSymbol { orientation, height, width } => DrawInstruction::DrawText {
                 x,
                 y,
                 text: data.chars().filter_map(graphic_symbol).collect(),
-                font: self.current_font,
+                // The symbols are scalable outlines, not part of a bitmap font.
+                font: FontName::Font0,
                 height,
                 width,
                 orientation,
@@ -744,6 +1004,7 @@ impl StateManager {
                 block: None,
                 direction: FieldDirection::Horizontal,
                 char_gap: 0,
+                custom_font: None,
             },
             FieldMode::Code128 {
                 orientation,
@@ -830,6 +1091,7 @@ impl StateManager {
             FieldMode::Aztec { orientation, magnification, ecc } => {
                 DrawInstruction::DrawAztec { x, y, data, orientation, magnification, ecc, bottom }
             }
+            FieldMode::Symbol { orientation, spec } => DrawInstruction::DrawSymbol { x, y, data, orientation, bottom, spec },
         };
 
         self.emit(out, instruction);
@@ -841,14 +1103,21 @@ impl StateManager {
             self.formats.insert(name, commands);
             return;
         }
-        let Some(name) = self.recall.take() else { return };
-        let Some(commands) = self.formats.get(&name).cloned() else { return };
-        self.replay_values = Some(std::mem::take(&mut self.field_values));
-        self.field = Field::default();
-        for command in commands {
-            self.process_command(command, out);
+        if let Some(name) = self.recall.take() {
+            if let Some(commands) = self.formats.get(&name).cloned() {
+                self.replay_values = Some(std::mem::take(&mut self.field_values));
+                self.field = Field::default();
+                for command in commands {
+                    self.process_command(command, out);
+                }
+                self.replay_values = None;
+            }
         }
-        self.replay_values = None;
+        if let Some((name, print)) = self.save_image.take() {
+            let start = self.format_start.min(out.len());
+            let image = if print { out[start..].to_vec() } else { out.split_off(start) };
+            self.images.insert(name, image);
+        }
     }
 
     fn reset_format_state(&mut self) {
@@ -859,6 +1128,8 @@ impl StateManager {
         self.field = Field::default();
         self.recall = None;
         self.field_values.clear();
+        self.format_values.clear();
+        self.save_image = None;
         self.label_reverse = false;
     }
 }
@@ -889,11 +1160,13 @@ mod tests {
 
     #[test]
     fn hex_escapes() {
-        assert_eq!(decode_hex_escapes("a_41_7e_", '_', false), "aA~_");
-        assert_eq!(decode_hex_escapes("_C3_A9", '_', true), "é");
-        assert_eq!(decode_hex_escapes("_E9", '_', false), "é");
-        assert_eq!(decode_hex_escapes("#41", '#', false), "A");
+        assert_eq!(decode_hex_escapes("a_41_7e_", '_', Encoding::Usa1), "aA~_");
+        assert_eq!(decode_hex_escapes("_C3_A9", '_', Encoding::Utf8), "é");
+        assert_eq!(decode_hex_escapes("_E9", '_', Encoding::Cp1252), "é");
+        assert_eq!(decode_hex_escapes("_82", '_', Encoding::Usa1), "é");
+        assert_eq!(decode_hex_escapes("#41", '#', Encoding::Usa1), "A");
         let ins = run("^XA^FO1,1^FH^FDx_41^FS^FO1,1^FDx_41^FS^XZ");
+        assert_eq!(texts(&run("^XA^CI28^FO1,1^FH^FD_C3_A9^FS^CI27^FO1,1^FH^FD_E9^FS^XZ")), ["é", "é"]);
         assert_eq!(texts(&ins), ["xA", "x_41"]);
     }
 
@@ -958,6 +1231,58 @@ mod tests {
     fn field_orientation_default() {
         let ins = run("^XA^FWR^FO1,1^A0,20^FDa^FS^XZ");
         assert!(matches!(ins[0], DrawInstruction::DrawText { orientation: Orientation::Rotated90, .. }));
+    }
+
+    #[test]
+    fn field_embedding() {
+        let zpl = "^XA^FN2^FDField FN 2 Data^FS^FE#^FD#2# and #2,f,1,5#|#2,b,4,4#|#9#^FS^XZ";
+        assert_eq!(texts(&run(zpl))[1], "Field FN 2 Data and Field|Data|");
+        assert_eq!(embed_fields("50# off", '#', |_| None), "50# off");
+    }
+
+    #[test]
+    fn clock_fields() {
+        let zpl = "^XA^ST10,13,2026,14,5,9^SO2,0,1^FO1,1^FC%,{^FD%Y-%m-%d {d %%^FS^XZ";
+        assert_eq!(texts(&run(zpl)), ["2026-10-13 14 %%"]);
+    }
+
+    #[test]
+    fn saved_images_and_fonts() {
+        let ins = run("^XA^FO1,1^FDbg^FS^ISR:BG.GRF,N^XZ^XA^ILR:BG.GRF^FO1,1^FDfg^FS^XZ");
+        assert_eq!(texts(&ins), ["bg", "fg"]);
+        let ins = run("~DUR:MYFONT.TTF,2,ABCD^XA^CWQ,R:MYFONT.TTF^FO1,1^AQN,20^FDx^FS^A@N,20,20,R:MYFONT.TTF^FDy^FS^A0N,20^FDz^FS^XZ");
+        let fonts: Vec<_> = ins
+            .iter()
+            .map(|i| match i {
+                DrawInstruction::DrawText { custom_font, .. } => custom_font.as_deref().cloned(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(fonts, [Some(vec![0xAB, 0xCD]), Some(vec![0xAB, 0xCD]), None]);
+    }
+
+    #[test]
+    fn new_symbols() {
+        let ins = run("^XA^BY3^FO10,10^BD^FDdata^FS^FO1,1^BRN,6,4,1,50,10^FD(01)123^FS^FO1,1^BB,4,N,10,2^FDabc^FS^XZ");
+        assert!(matches!(ins[0], DrawInstruction::DrawSymbol { spec: SymbolSpec::MaxiCode { mode: 2, .. }, .. }));
+        assert!(matches!(
+            ins[1],
+            DrawInstruction::DrawSymbol { spec: SymbolSpec::DataBar { kind: 6, module_width: 4, height: 50, segments_per_row: 10, .. }, .. }
+        ));
+        assert!(matches!(ins[2], DrawInstruction::DrawSymbol { spec: SymbolSpec::Codablock { row_height: 12, mode: 'F', .. }, .. }));
+    }
+
+    #[test]
+    fn units_of_measure() {
+        let ins = run("^XA^MUM^FO10,2.5^GB25,25,1^FS^MUD^FO10,10^GB5,5,1^FS^XZ");
+        assert!(matches!(ins[0], DrawInstruction::DrawBox { x: 80, y: 20, width: 200, .. }));
+        assert!(matches!(ins[1], DrawInstruction::DrawBox { x: 10, y: 10, width: 5, .. }));
+    }
+
+    #[test]
+    fn bad_parameters_skip_the_command() {
+        let ins = run("^XA^FOx,1^GB5,5,1^FS^CI99^FO1,1^FDok^FS^XZ");
+        assert_eq!(texts(&ins), ["ok"]);
     }
 
     #[test]

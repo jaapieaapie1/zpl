@@ -5,26 +5,34 @@
 //! CFF fonts an identity GID -> CID charset, so text is shown with 2-byte codes that are the
 //! *remapped* glyph IDs: for TrueType `/CIDToGIDMap /Identity` maps CID == GID, and for CFF
 //! the CIDs address the subset's glyphs directly.
+//!
+//! Besides the built-in fonts ([`FontId`]) the registry holds TrueType/OpenType fonts
+//! downloaded by the label (~DU / ~DT / ~DY), registered per render with
+//! [`FontRegistry::register_custom`] and parsed once per registry.
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use pdf_writer::types::{CidFontType, FontFlags, SystemInfo, UnicodeCmap};
 use pdf_writer::{Filter, Finish, Name, Pdf, Rect, Ref, Str};
 use subsetter::GlyphRemapper;
 use ttf_parser::{Face, GlyphId, RawFace, Tag};
 
-/// Fonts available to the renderer.
+/// Fonts built into the renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FontId {
     /// ATTriumvirate-BoldCd.otf (CFF) — ZPL scalable font 0 / text default.
     Triumvirate,
-    /// DejaVuSansMono.ttf — barcode interpretation lines.
+    /// DejaVuSansMono.ttf — barcode interpretation lines and the bitmap fonts A–H.
     DejaVuMono,
+    /// DejaVuSans-Bold.ttf — per-character fallback for glyphs the other fonts lack
+    /// (Greek, Cyrillic, symbols such as ™ ® €, ...).
+    DejaVuSansBold,
 }
 
 static TRIUMVIRATE_DATA: &[u8] = include_bytes!("../../png-renderer/fonts/ATTriumvirate-BoldCd.otf");
 static DEJAVU_MONO_DATA: &[u8] = include_bytes!("../../png-renderer/fonts/DejaVuSansMono.ttf");
+static DEJAVU_SANS_BOLD_DATA: &[u8] = include_bytes!("../fonts/DejaVuSans-Bold.ttf");
 
 impl FontId {
     /// Raw font file bytes.
@@ -32,18 +40,14 @@ impl FontId {
         match self {
             FontId::Triumvirate => TRIUMVIRATE_DATA,
             FontId::DejaVuMono => DEJAVU_MONO_DATA,
+            FontId::DejaVuSansBold => DEJAVU_SANS_BOLD_DATA,
         }
     }
 
     /// Parsed font face (parsed once, cached for the process lifetime).
     pub(crate) fn face(self) -> &'static Face<'static> {
-        static TRIUMVIRATE: OnceLock<Face<'static>> = OnceLock::new();
-        static DEJAVU_MONO: OnceLock<Face<'static>> = OnceLock::new();
-        let cell = match self {
-            FontId::Triumvirate => &TRIUMVIRATE,
-            FontId::DejaVuMono => &DEJAVU_MONO,
-        };
-        cell.get_or_init(|| Face::parse(self.data(), 0).expect("embedded font must parse"))
+        static FACES: [OnceLock<Face<'static>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+        FACES[self as usize].get_or_init(|| Face::parse(self.data(), 0).expect("embedded font must parse"))
     }
 
     /// Page resource name of this font.
@@ -51,6 +55,7 @@ impl FontId {
         match self {
             FontId::Triumvirate => Name(b"F0"),
             FontId::DejaVuMono => Name(b"F1"),
+            FontId::DejaVuSansBold => Name(b"F2"),
         }
     }
 
@@ -59,6 +64,7 @@ impl FontId {
         match self {
             FontId::Triumvirate => "ATTriumvirate-BoldCd",
             FontId::DejaVuMono => "DejaVuSansMono",
+            FontId::DejaVuSansBold => "DejaVuSans-Bold",
         }
     }
 
@@ -68,9 +74,115 @@ impl FontId {
     }
 }
 
+/// A font the registry can show text in: built in, or downloaded by the label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum FontKey {
+    Builtin(FontId),
+    /// Index into [`FontRegistry::custom`].
+    Custom(u16),
+}
+
+impl From<FontId> for FontKey {
+    fn from(id: FontId) -> Self {
+        FontKey::Builtin(id)
+    }
+}
+
+/// Page resource name (`F0`.. for built-ins, `C0`.. for downloaded fonts), stored inline so
+/// it can be held while the registry is borrowed mutably.
+#[derive(Clone, Copy)]
+pub(crate) struct ResName {
+    buf: [u8; 8],
+    len: u8,
+}
+
+impl ResName {
+    fn of(key: FontKey) -> Self {
+        let mut buf = [0u8; 8];
+        let len = match key {
+            FontKey::Builtin(id) => {
+                let n = id.resource_name().0;
+                buf[..n.len()].copy_from_slice(n);
+                n.len()
+            }
+            FontKey::Custom(i) => {
+                use std::io::Write;
+                let mut cur = std::io::Cursor::new(&mut buf[..]);
+                let _ = write!(cur, "C{i}");
+                cur.position() as usize
+            }
+        };
+        ResName { buf, len: len as u8 }
+    }
+
+    pub(crate) fn name(&self) -> Name<'_> {
+        Name(&self.buf[..self.len as usize])
+    }
+}
+
+/// A downloaded font. `face` borrows `data`'s heap buffer, so it is declared first and
+/// therefore dropped first; the buffer is never mutated (it sits behind an `Arc`).
+struct CustomFont {
+    face: Option<Face<'static>>,
+    data: Arc<Vec<u8>>,
+    /// PostScript name for /BaseFont.
+    base_font: String,
+}
+
+impl CustomFont {
+    fn new(data: &Arc<Vec<u8>>, index: usize) -> Self {
+        let data = Arc::clone(data);
+        // SAFETY: the bytes live on the heap owned by `data`, which this struct keeps alive
+        // and never mutates; `face` is dropped before `data` (field order), and the face is
+        // only handed out with lifetimes bounded by a borrow of the registry.
+        let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+        let face = Face::parse(bytes, 0).ok().filter(|face| usable(bytes, face));
+        let base_font = face
+            .as_ref()
+            .and_then(postscript_name)
+            .unwrap_or_else(|| format!("ZplCustom{index}"));
+        CustomFont { face, data, base_font }
+    }
+}
+
+/// Whether `face` has outlines the subsetter can embed. TrueType subsetting failures are
+/// survivable (the whole font is embedded instead, see [`FontProgram::build`]); CFF ones are
+/// not, so CFF fonts get a trial subset up front. CFF2 / bitmap-only fonts are rejected.
+fn usable(data: &[u8], face: &Face) -> bool {
+    let raw = face.raw_face();
+    if raw.table(Tag::from_bytes(b"glyf")).is_some() {
+        return face.number_of_glyphs() > 0;
+    }
+    if raw.table(Tag::from_bytes(b"CFF ")).is_some() {
+        let mut remapper = GlyphRemapper::new();
+        for ch in ['A', '0', 'a'] {
+            if let Some(g) = face.glyph_index(ch) {
+                remapper.remap(g.0);
+            }
+        }
+        return subsetter::subset(data, 0, &remapper).is_ok();
+    }
+    false
+}
+
+/// PostScript name from the `name` table, restricted to characters valid in a PDF name.
+fn postscript_name(face: &Face) -> Option<String> {
+    let name = face
+        .names()
+        .into_iter()
+        .filter(|n| n.name_id == ttf_parser::name_id::POST_SCRIPT_NAME)
+        // Non-Unicode (e.g. Mac Roman) records: keep the bytes; non-ASCII is filtered below.
+        .map(|n| n.to_string().unwrap_or_else(|| n.name.iter().map(|&b| b as char).collect()))
+        .next()?;
+    let clean: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(60).collect();
+    (!clean.is_empty()).then_some(clean)
+}
+
 #[derive(Default)]
 pub(crate) struct FontRegistry {
-    used: BTreeMap<FontId, UsedGlyphs>,
+    used: BTreeMap<FontKey, UsedGlyphs>,
+    /// Downloaded fonts seen in this render (parsed or not), in registration order.
+    custom: Vec<CustomFont>,
 }
 
 /// Glyphs used from one font.
@@ -88,21 +200,98 @@ impl Default for UsedGlyphs {
     }
 }
 
+impl UsedGlyphs {
+    /// Records `gid` (showing `ch`) and returns its subset ID.
+    fn add(&mut self, ch: char, gid: u16) -> u16 {
+        let cid = self.remapper.remap(gid);
+        self.glyphs.entry(cid).or_insert_with(|| (gid, if gid == 0 { String::new() } else { ch.to_string() }));
+        cid
+    }
+}
+
 impl FontRegistry {
+    /// Registers a downloaded font. Returns `None` when it can't be parsed or embedded, in
+    /// which case callers fall back to a built-in font. The same `Arc` (or identical bytes)
+    /// yields the same key, so a font is parsed at most once per render.
+    pub fn register_custom(&mut self, data: &Arc<Vec<u8>>) -> Option<FontKey> {
+        let index = match self
+            .custom
+            .iter()
+            .position(|c| Arc::ptr_eq(&c.data, data) || (c.data.len() == data.len() && c.data[..] == data[..]))
+        {
+            Some(i) => i,
+            None => {
+                let index = self.custom.len();
+                if index > u16::MAX as usize {
+                    return None;
+                }
+                self.custom.push(CustomFont::new(data, index));
+                index
+            }
+        };
+        self.custom[index].face.as_ref().map(|_| FontKey::Custom(index as u16))
+    }
+
+    /// Parsed face of `key`. Custom keys only come from [`FontRegistry::register_custom`],
+    /// which hands them out for parsed fonts only.
+    pub fn face(&self, key: FontKey) -> &Face<'_> {
+        match key {
+            FontKey::Builtin(id) => id.face(),
+            FontKey::Custom(i) => self.custom[i as usize].face.as_ref().expect("custom font key without a face"),
+        }
+    }
+
+    fn data(&self, key: FontKey) -> &[u8] {
+        match key {
+            FontKey::Builtin(id) => id.data(),
+            FontKey::Custom(i) => &self.custom[i as usize].data,
+        }
+    }
+
+    fn base_font(&self, key: FontKey) -> &str {
+        match key {
+            FontKey::Builtin(id) => id.base_font(),
+            FontKey::Custom(i) => &self.custom[i as usize].base_font,
+        }
+    }
+
     /// Records the glyphs needed to show `text` in `font`. Returns the font's resource
     /// name and the subset glyph IDs (2-byte CIDs) in display order.
+    #[allow(dead_code)]
     pub fn use_glyphs(&mut self, font: FontId, text: &str) -> (Name<'static>, Vec<u16>) {
-        let used = self.used.entry(font).or_default();
-        let gids = text
-            .chars()
-            .map(|ch| {
-                let gid = font.glyph(ch);
-                let cid = used.remapper.remap(gid);
-                used.glyphs.entry(cid).or_insert_with(|| (gid, if gid == 0 { String::new() } else { ch.to_string() }));
-                cid
-            })
-            .collect();
+        let used = self.used.entry(font.into()).or_default();
+        let gids = text.chars().map(|ch| used.add(ch, font.glyph(ch))).collect();
         (font.resource_name(), gids)
+    }
+
+    /// Records the `(char, original GID)` pairs shown in `key` and appends their 2-byte
+    /// subset codes to `out`. Returns the font's resource name.
+    pub fn use_glyph_ids(&mut self, key: FontKey, glyphs: impl Iterator<Item = (char, u16)>, out: &mut Vec<u8>) -> ResName {
+        let used = self.used.entry(key).or_default();
+        for (ch, gid) in glyphs {
+            out.extend_from_slice(&used.add(ch, gid).to_be_bytes());
+        }
+        ResName::of(key)
+    }
+
+    /// Records `text` shown entirely in `key` and appends its 2-byte subset codes to
+    /// `out`. Returns `None` (leaving `out` truncated to its old length) as soon as `key`
+    /// lacks a glyph, so the caller can lay the text out with fallback fonts instead.
+    pub fn use_text(&mut self, key: FontKey, text: &str, out: &mut Vec<u8>) -> Option<ResName> {
+        let face = match key {
+            FontKey::Builtin(id) => id.face(),
+            FontKey::Custom(i) => self.custom[i as usize].face.as_ref()?,
+        };
+        let used = self.used.entry(key).or_default();
+        let start = out.len();
+        for ch in text.chars() {
+            let Some(gid) = face.glyph_index(ch) else {
+                out.truncate(start);
+                return None;
+            };
+            out.extend_from_slice(&used.add(ch, gid.0).to_be_bytes());
+        }
+        Some(ResName::of(key))
     }
 
     /// Subsets and deflates the program of every used font (the bulk of the document's
@@ -111,14 +300,14 @@ impl FontRegistry {
     pub fn build_programs<R: Send>(&self, parallel: bool, main: impl FnOnce() -> R) -> (Vec<FontProgram>, R) {
         if !parallel {
             let result = main();
-            let programs = self.used.iter().map(|(&font, used)| FontProgram::build(font, used)).collect();
+            let programs = self.used.iter().map(|(&key, used)| FontProgram::build(self, key, used)).collect();
             return (programs, result);
         }
         std::thread::scope(|scope| {
             let handles: Vec<_> = self
                 .used
                 .iter()
-                .map(|(&font, used)| scope.spawn(move || FontProgram::build(font, used)))
+                .map(|(&key, used)| scope.spawn(move || FontProgram::build(self, key, used)))
                 .collect();
             let result = main();
             let programs = handles.into_iter().map(|h| h.join().expect("font program thread panicked")).collect();
@@ -132,9 +321,9 @@ impl FontRegistry {
         self.used
             .iter()
             .zip(programs)
-            .map(|((&font, used), program)| {
-                let id = write_font(pdf, alloc, font, used, program);
-                (String::from_utf8_lossy(font.resource_name().0).into_owned(), id)
+            .map(|((&key, used), program)| {
+                let id = write_font(pdf, alloc, self.face(key), self.base_font(key), used, program);
+                (String::from_utf8_lossy(ResName::of(key).name().0).into_owned(), id)
             })
             .collect()
     }
@@ -147,20 +336,42 @@ pub(crate) struct FontProgram {
     cff: bool,
     /// Uncompressed length (TrueType /Length1).
     raw_len: usize,
+    /// Deflated CIDToGIDMap stream when the whole (unsubset) TrueType font is embedded
+    /// because subsetting failed; `None` means `/Identity`.
+    cid_to_gid: Option<Vec<u8>>,
 }
 
 impl FontProgram {
-    fn build(font: FontId, used: &UsedGlyphs) -> Self {
-        let subset = subsetter::subset(font.data(), 0, &used.remapper).expect("embedded font must subset");
+    fn build(registry: &FontRegistry, key: FontKey, used: &UsedGlyphs) -> Self {
+        let data = registry.data(key);
         // CFF outlines: embed the bare (now CID-keyed) CFF table.
-        let is_cff = font.face().raw_face().table(Tag::from_bytes(b"CFF ")).is_some();
+        let is_cff = registry.face(key).raw_face().table(Tag::from_bytes(b"CFF ")).is_some();
+        let subset = match subsetter::subset(data, 0, &used.remapper) {
+            Ok(subset) => subset,
+            Err(_) if !is_cff => {
+                // Only reachable for downloaded TrueType fonts: embed them whole and map
+                // the subset IDs used in the content stream back to the original glyphs.
+                let max = used.glyphs.keys().next_back().copied().unwrap_or(0) as usize;
+                let mut map = vec![0u8; (max + 1) * 2];
+                for (&cid, &(gid, _)) in &used.glyphs {
+                    map[cid as usize * 2..cid as usize * 2 + 2].copy_from_slice(&gid.to_be_bytes());
+                }
+                return FontProgram {
+                    data: crate::compress(data),
+                    cff: false,
+                    raw_len: data.len(),
+                    cid_to_gid: Some(crate::compress(&map)),
+                };
+            }
+            Err(e) => panic!("font must subset (custom CFF fonts are trial-subset on registration): {e:?}"),
+        };
         let program = if is_cff {
             let raw = RawFace::parse(&subset, 0).expect("subset font must parse");
             raw.table(Tag::from_bytes(b"CFF ")).expect("subset keeps CFF table")
         } else {
             &subset
         };
-        FontProgram { data: crate::compress(program), cff: is_cff, raw_len: program.len() }
+        FontProgram { data: crate::compress(program), cff: is_cff, raw_len: program.len(), cid_to_gid: None }
     }
 }
 
@@ -176,18 +387,18 @@ fn subset_tag<'a>(gids: impl Iterator<Item = &'a u16>) -> String {
     (0..6).map(|i| (b'A' + ((hash >> (i * 8)) % 26) as u8) as char).collect()
 }
 
-fn write_font(pdf: &mut Pdf, alloc: &mut Ref, font: FontId, used: &UsedGlyphs, program: FontProgram) -> Ref {
+fn write_font(pdf: &mut Pdf, alloc: &mut Ref, face: &Face, name: &str, used: &UsedGlyphs, program: FontProgram) -> Ref {
     let glyphs = &used.glyphs;
     let type0_id = alloc.bump();
     let cid_id = alloc.bump();
     let descriptor_id = alloc.bump();
     let file_id = alloc.bump();
     let cmap_id = alloc.bump();
+    let map_id = program.cid_to_gid.as_ref().map(|_| alloc.bump());
 
-    let face = font.face();
     let upem = face.units_per_em() as f32;
     let to_pdf = |v: f32| v * 1000.0 / upem;
-    let base_font = format!("{}+{}", subset_tag(glyphs.keys().chain(glyphs.values().map(|(gid, _)| gid))), font.base_font());
+    let base_font = format!("{}+{}", subset_tag(glyphs.keys().chain(glyphs.values().map(|(gid, _)| gid))), name);
 
     let cff = program.cff;
 
@@ -223,7 +434,14 @@ fn write_font(pdf: &mut Pdf, alloc: &mut Ref, font: FontId, used: &UsedGlyphs, p
         }
     }
     if !cff {
-        cid.cid_to_gid_map_predefined(Name(b"Identity"));
+        match map_id {
+            Some(id) => {
+                cid.cid_to_gid_map_stream(id);
+            }
+            None => {
+                cid.cid_to_gid_map_predefined(Name(b"Identity"));
+            }
+        }
     }
     cid.finish();
 
@@ -283,6 +501,10 @@ fn write_font(pdf: &mut Pdf, alloc: &mut Ref, font: FontId, used: &UsedGlyphs, p
         stream.pair(Name(b"Length1"), program.raw_len as i32);
     }
     stream.finish();
+
+    if let (Some(id), Some(map)) = (map_id, &program.cid_to_gid) {
+        pdf.stream(id, map).filter(Filter::FlateDecode);
+    }
 
     // ToUnicode CMap.
     let mut cmap = UnicodeCmap::new(

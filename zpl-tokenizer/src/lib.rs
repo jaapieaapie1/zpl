@@ -39,11 +39,16 @@ pub enum Token<'a> {
 pub struct Tokenizer<'a> {
     input: &'a str,
     position: usize,
+    /// Format and control prefixes and the parameter delimiter; changed by ^CC/~CC, ^CT/~CT
+    /// and ^CD/~CD.
+    caret: char,
+    tilde: char,
+    delimiter: char,
 }
 
 impl<'a> Tokenizer<'a> {
     pub fn new(input: &'a str) -> Self {
-        Self { input, position: 0 }
+        Self { input, position: 0, caret: '^', tilde: '~', delimiter: ',' }
     }
 
     #[inline]
@@ -122,10 +127,10 @@ impl<'a> Tokenizer<'a> {
 
             while let Some(c) = self.peek() {
                 match c {
-                    ',' => {
+                    c if c == self.delimiter => {
                         break;
                     }
-                    '^' | '~' => {
+                    c if c == self.caret || c == self.tilde => {
                         params.push(&self.input[start..self.position]);
                         return params;
                     }
@@ -142,7 +147,7 @@ impl<'a> Tokenizer<'a> {
 
             self.skip_whitespace();
 
-            if self.peek() == Some(',') {
+            if self.peek() == Some(self.delimiter) {
                 self.consume();
                 continue;
             } else {
@@ -157,7 +162,7 @@ impl<'a> Tokenizer<'a> {
         let start = self.position;
 
         // Field data runs up to the next command (normally ^FS); a literal caret needs ^FH.
-        match self.input[start..].find('^') {
+        match self.input[start..].find(self.caret) {
             Some(end) => {
                 self.position = start + end;
                 return Some(&self.input[start..self.position]);
@@ -177,7 +182,7 @@ impl<'a> Tokenizer<'a> {
 
         while !self.is_eof() {
             if let Some(c) = self.peek() {
-                if c == '^' || c == '~' {
+                if c == self.caret || c == self.tilde {
                     break;
                 }
             }
@@ -191,9 +196,9 @@ impl<'a> Tokenizer<'a> {
     /// data parameter extending to the next `^` or `~`.
     fn raw_command(&mut self, prefix: CommandPrefix, name: &'a str, start: usize, leading: usize) -> Token<'a> {
         let rest = &self.input[self.position..];
-        let end = rest.find(['^', '~']).unwrap_or(rest.len());
+        let end = rest.find([self.caret, self.tilde]).unwrap_or(rest.len());
         self.position += end;
-        let params = rest[..end].splitn(leading + 1, ',').map(str::trim).collect();
+        let params = rest[..end].splitn(leading + 1, self.delimiter).map(str::trim).collect();
         Token::Command { prefix, name, params, span: Span { start, end: self.position } }
     }
 
@@ -207,17 +212,17 @@ impl<'a> Tokenizer<'a> {
         let start = self.position;
 
         let prefix = match self.peek()? {
-            '^' => {
+            c if c == self.caret => {
                 self.consume();
                 CommandPrefix::Caret
             }
-            '~' => {
+            c if c == self.tilde => {
                 self.consume();
                 CommandPrefix::Tilde
             }
             _ => {
                 while !self.is_eof() {
-                    if matches!(self.peek(), Some('^') | Some('~')) {
+                    if matches!(self.peek(), Some(c) if c == self.caret || c == self.tilde) {
                         break;
                     }
                     self.consume();
@@ -234,6 +239,21 @@ impl<'a> Tokenizer<'a> {
         };
 
         let name = self.parse_command_name()?;
+
+        // ^CC / ^CT / ^CD (and their ~ forms) take the very next character, which may well be
+        // the current prefix or delimiter, and apply to everything after it.
+        if ["CC", "CT", "CD"].iter().any(|n| name.eq_ignore_ascii_case(n)) {
+            let Some(c) = self.consume() else {
+                return Some(Token::Command { prefix, name, params: vec![], span: Span { start, end: self.position } });
+            };
+            match name.to_ascii_uppercase().as_str() {
+                "CC" => self.caret = c,
+                "CT" => self.tilde = c,
+                _ => self.delimiter = c,
+            }
+            let param = &self.input[self.position - c.len_utf8()..self.position];
+            return Some(Token::Command { prefix, name, params: vec![param], span: Span { start, end: self.position } });
+        }
 
         let token = match (prefix, name) {
             (CommandPrefix::Caret, "XA") => Token::StartToken,
@@ -286,6 +306,7 @@ impl<'a> Tokenizer<'a> {
             (CommandPrefix::Caret, "GF") => self.raw_command(prefix, name, start, 4),
             (CommandPrefix::Tilde, "DG") => self.raw_command(prefix, name, start, 3),
             (CommandPrefix::Tilde, "DY") => self.raw_command(prefix, name, start, 5),
+            (CommandPrefix::Tilde, "DU" | "DT") => self.raw_command(prefix, name, start, 2),
 
             _ => {
                 let params = self.parse_parameters();
@@ -665,7 +686,8 @@ mod tests {
 
     #[test]
     fn test_mixed_prefixes() {
-        let input = "^XA~SD15^LT100~CC^XZ";
+        // ~CC+ makes '+' the format prefix for the rest of the input.
+        let input = "^XA~SD15^LT100~CC++XZ";
         let tokens: Vec<Token> = Tokenizer::new(input).collect();
 
         assert_eq!(tokens.len(), 5);
@@ -696,6 +718,14 @@ mod tests {
         }
 
         assert_eq!(tokens[4], Token::EndToken);
+    }
+
+    #[test]
+    fn test_changed_prefixes_and_delimiter() {
+        let tokens: Vec<Token> = Tokenizer::new("^CD;^FO1;2^CC!!FDa^b!FS").collect();
+        assert_eq!(tokens[1], Token::Command { prefix: CommandPrefix::Caret, name: "FO", params: vec!["1", "2"], span: Span { start: 4, end: 10 } });
+        assert!(matches!(tokens[3], Token::FieldData { data: "a^b", .. }));
+        assert_eq!(tokens[4], Token::FieldSeparator);
     }
 
     #[test]

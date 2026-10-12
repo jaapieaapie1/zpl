@@ -75,10 +75,10 @@ fn main() {
 
     let mut timings = Timings::new();
 
-    let mut input = String::new();
-    io::stdin()
-        .read_to_string(&mut input)
-        .expect("Failed to read from stdin");
+    let mut bytes = Vec::new();
+    io::stdin().read_to_end(&mut bytes).expect("Failed to read from stdin");
+    // UTF-8, or else one character per byte (Latin-1) for legacy single-byte labels.
+    let input = String::from_utf8(bytes).unwrap_or_else(|e| e.into_bytes().into_iter().map(char::from).collect());
     timings.mark("read stdin");
 
     let commands = Parser::new(&input)

@@ -14,6 +14,8 @@ mod extra;
 pub struct Parser<'a> {
     tokenizer: Tokenizer<'a>,
     peeked: Option<Token<'a>>,
+    /// Dots per ^MU unit: 1 for dots, 8 for millimetres, 203.2 for inches (8 dots/mm).
+    unit_scale: std::cell::Cell<f32>,
 }
 
 impl<'a> Parser<'a> {
@@ -21,6 +23,7 @@ impl<'a> Parser<'a> {
         Self {
             tokenizer: Tokenizer::new(zpl),
             peeked: None,
+            unit_scale: std::cell::Cell::new(1.0),
         }
     }
 
@@ -62,7 +65,17 @@ impl<'a> Parser<'a> {
                 name,
                 params,
                 span,
-            } => self.parse_command(prefix, name, &params, span)?,
+            } => {
+                // Printers skip a command with bad parameters instead of rejecting the label.
+                self.parse_command(prefix, name, &params, span).unwrap_or_else(|_| Command::Unknown {
+                    prefix: match prefix {
+                        CommandPrefix::Caret => CmdPrefix::Carot,
+                        CommandPrefix::Tilde => CmdPrefix::Tilde,
+                    },
+                    name: name.to_string(),
+                    params: params.iter().map(|s| s.to_string()).collect(),
+                })
+            }
 
             Token::Unknown { content, .. } => Command::Unknown {
                 prefix: CmdPrefix::Carot,
@@ -130,8 +143,8 @@ impl<'a> Parser<'a> {
     fn parse_field_origin(&self, params: &[&str], span: Span) -> Result<Command, ParseError> {
         // ^FOx,y[,justification]
 
-        let x = self.parse_u32_param(params, 0, "x", span)?;
-        let y = self.parse_u32_param(params, 1, "y", span)?;
+        let x = self.dim_param(params, 0, "x", span)?;
+        let y = self.dim_param(params, 1, "y", span)?;
 
         let justification = if params.len() >= 3 {
             self.parse_justification(params[2], span)?
@@ -149,8 +162,8 @@ impl<'a> Parser<'a> {
     fn parse_field_typeset(&self, params: &[&str], span: Span) -> Result<Command, ParseError> {
         // ^FTx,y (Zebra continues after the previous field when omitted; we use 0)
 
-        let x = self.parse_optional_u32(params, 0, span)?.unwrap_or(0);
-        let y = self.parse_optional_u32(params, 1, span)?.unwrap_or(0);
+        let x = self.opt_dim(params, 0, span)?.unwrap_or(0);
+        let y = self.opt_dim(params, 1, span)?.unwrap_or(0);
 
         let justification = if params.len() >= 3 {
             self.parse_justification(params[2], span)?
@@ -168,8 +181,8 @@ impl<'a> Parser<'a> {
     fn parse_label_home(&self, params: &[&str], span: Span) -> Result<Command, ParseError> {
         // ^LHx,y
 
-        let x = self.parse_u32_param(params, 0, "x", span)?;
-        let y = self.parse_u32_param(params, 1, "y", span)?;
+        let x = self.dim_param(params, 0, "x", span)?;
+        let y = self.dim_param(params, 1, "y", span)?;
 
         Ok(Command::LabelHome { x, y })
     }
@@ -177,7 +190,7 @@ impl<'a> Parser<'a> {
     fn parse_label_top(&self, params: &[&str], span: Span) -> Result<Command, ParseError> {
         // ^LTx
 
-        let offset = self.parse_i32_param(params, 0, "x", span)?;
+        let offset = self.dim_i32(params.first().copied().unwrap_or("0"), span)?;
 
         Ok(Command::LabelTop { offset })
     }
@@ -185,7 +198,7 @@ impl<'a> Parser<'a> {
     fn parse_print_width(&self, params: &[&str], span: Span) -> Result<Command, ParseError> {
         // ^PWa
 
-        let width = self.parse_u32_param(params, 0, "a", span)?;
+        let width = self.dim_param(params, 0, "a", span)?;
 
         Ok(Command::PrintWidth { width })
     }
@@ -193,7 +206,7 @@ impl<'a> Parser<'a> {
     fn parse_label_length(&self, params: &[&str], span: Span) -> Result<Command, ParseError> {
         // ^LLy,x
 
-        let length = self.parse_u32_param(params, 0, "y", span)?;
+        let length = self.dim_param(params, 0, "y", span)?;
 
         let apply_to_all_media = if params.len() >= 2 && !params[1].is_empty() {
             Some(self.parse_yes_no(params[1], span)?)
@@ -208,18 +221,32 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_font(&self, params: &[&str], span: Span) -> Result<Command, ParseError> {
+        // ^A@o,h,w,d:o.x selects a stored font by name.
+        if params.first().is_some_and(|p| p.starts_with('@')) {
+            let orientation = match params[0][1..].chars().next() {
+                Some(c) => Some(self.parse_orientation(&c.to_string(), span)?),
+                None => None,
+            };
+            return Ok(Command::FontByName {
+                orientation,
+                height: self.opt_dim(params, 1, span)?,
+                width: self.opt_dim(params, 2, span)?,
+                name: params.get(3).map(|s| s.trim().to_string()).unwrap_or_default(),
+            });
+        }
+
         // ^Afo,h,w
         let (font_name, orientation) =
             self.parse_font_name_orientation(params, 0, "font_orientation", span)?;
 
         let height = if params.len() > 1 && !params[1].is_empty() {
-            Some(self.parse_u32_param(params, 1, "h", span)?)
+            Some(self.dim_param(params, 1, "h", span)?)
         } else {
             None
         };
 
         let width = if params.len() > 2 && !params[2].is_empty() {
-            Some(self.parse_u32_param(params, 2, "w", span)?)
+            Some(self.dim_param(params, 2, "w", span)?)
         } else {
             None
         };
@@ -255,13 +282,13 @@ impl<'a> Parser<'a> {
         let font = self.convert_font(font_char);
 
         let height = if params.len() > 1 && !params[1].is_empty() {
-            Some(self.parse_u32(params[1], span)?)
+            Some(self.dim(params[1], span)?)
         } else {
             None
         };
 
         let width = if params.len() > 2 && !params[2].is_empty() {
-            Some(self.parse_u32(params[2], span)?)
+            Some(self.dim(params[2], span)?)
         } else {
             None
         };
@@ -278,7 +305,7 @@ impl<'a> Parser<'a> {
         let width = if params.is_empty() || params[0].is_empty() {
             0
         } else {
-            self.parse_u32(params[0], span)?
+            self.dim(params[0], span)?
         };
 
         let max_lines = if params.len() < 2 || params[1].is_empty() {
@@ -290,7 +317,7 @@ impl<'a> Parser<'a> {
         let line_spacing = if params.len() < 3 || params[2].is_empty() {
             0
         } else {
-            self.parse_i32(params[2], span)?
+            self.dim_i32(params[2], span)?
         };
 
         let justification = if params.len() < 4 || params[3].is_empty() {
@@ -302,7 +329,7 @@ impl<'a> Parser<'a> {
         let hanging_indent = if params.len() < 5 || params[4].is_empty() {
             0
         } else {
-            self.parse_u32(params[4], span)?
+            self.dim(params[4], span)?
         };
 
         Ok(Command::FieldBlock {
@@ -317,7 +344,7 @@ impl<'a> Parser<'a> {
     fn parse_graphic_box(&self, params: &[&str], span: Span) -> Result<Command, ParseError> {
         // ^GBw,h,t,c,r
         let thickness = if params.len() >= 3 && !params[2].is_empty() {
-            self.parse_u32(params[2], span)?
+            self.dim(params[2], span)?
         } else {
             1
         };
@@ -325,13 +352,13 @@ impl<'a> Parser<'a> {
         let width = if params.is_empty() || params[0].is_empty() {
             thickness
         } else {
-            self.parse_u32(params[0], span)?
+            self.dim(params[0], span)?
         };
 
         let height = if params.len() < 2 || params[1].is_empty() {
             thickness
         } else {
-            self.parse_u32(params[1], span)?
+            self.dim(params[1], span)?
         };
 
         let line_color = if params.len() < 4 || params[3].is_empty() {
@@ -514,7 +541,7 @@ impl<'a> Parser<'a> {
         let height = if params.len() < 2 || params[1].is_empty() {
             None
         } else {
-            Some(self.parse_u32(params[1], span)?)
+            Some(self.dim(params[1], span)?)
         };
 
         let print_interpetation_line = if params.len() < 3 || params[2].is_empty() {
@@ -572,7 +599,7 @@ impl<'a> Parser<'a> {
         let height = if params.len() < 3 || params[2].is_empty() {
             10
         } else {
-            self.parse_u32(params[2], span)?
+            self.dim(params[2], span)?
         };
 
         Ok(Command::BarcodeFieldDefaults {
@@ -640,7 +667,7 @@ impl<'a> Parser<'a> {
         let height = if params.len() < 3 || params[2].is_empty() {
             None
         } else {
-            Some(self.parse_u32(params[2], span)?)
+            Some(self.dim(params[2], span)?)
         };
 
         let print_interpetation_line = if params.len() < 4 || params[3].is_empty() {
@@ -750,13 +777,13 @@ impl<'a> Parser<'a> {
         let diameter = if params.is_empty() || params[0].is_empty() {
             3
         } else {
-            self.parse_u32(params[0], span)?
+            self.dim(params[0], span)?
         };
 
         let thickness = if params.len() < 2 || params[1].is_empty() {
             1
         } else {
-            self.parse_u32(params[1], span)?
+            self.dim(params[1], span)?
         };
 
         let color = if params.len() < 3 || params[2].is_empty() {
@@ -781,7 +808,7 @@ impl<'a> Parser<'a> {
         let thickness = if params.len() < 3 || params[2].is_empty() {
             1
         } else {
-            self.parse_u32(params[2], span)?
+            self.dim(params[2], span)?
         };
 
         let width = if params.is_empty() || params[0].is_empty() {
@@ -791,7 +818,7 @@ impl<'a> Parser<'a> {
                 3
             }
         } else {
-            self.parse_u32(params[0], span)?
+            self.dim(params[0], span)?
         };
 
         let height = if params.len() < 2 || params[1].is_empty() {
@@ -801,7 +828,7 @@ impl<'a> Parser<'a> {
                 3
             }
         } else {
-            self.parse_u32(params[1], span)?
+            self.dim(params[1], span)?
         };
 
         let color = if params.len() < 4 || params[3].is_empty() {
@@ -1048,6 +1075,14 @@ impl<'a> Parser<'a> {
             24 => Ok(Encoding::SingleByteAsian),
             26 => Ok(Encoding::MultibyteAsian),
             28 => Ok(Encoding::Utf8),
+            29 => Ok(Encoding::Utf16BigEndian),
+            30 => Ok(Encoding::Utf16LittleEndian),
+            27 => Ok(Encoding::Cp1252),
+            31 => Ok(Encoding::Cp1250),
+            33 => Ok(Encoding::Cp1251),
+            34 => Ok(Encoding::Cp1253),
+            35 => Ok(Encoding::Cp1254),
+            36 => Ok(Encoding::Cp1255),
             _ => Err(ParseError::InvalidNumber {
                 value: s.to_string(),
                 span,
@@ -1067,6 +1102,42 @@ impl<'a> Parser<'a> {
                 value: s.to_string(),
                 span,
             }),
+        }
+    }
+
+    /// A length in the current ^MU units, converted to dots. Inches and millimetres may be
+    /// fractional.
+    fn dim(&self, s: &str, span: Span) -> Result<u32, ParseError> {
+        let scale = self.unit_scale.get();
+        if scale == 1.0 {
+            return self.parse_u32(s, span);
+        }
+        let v = self.parse_f32(s, span)?;
+        if v < 0.0 {
+            return Err(ParseError::InvalidNumber { value: s.to_string(), span });
+        }
+        Ok((v * scale).round() as u32)
+    }
+
+    fn dim_i32(&self, s: &str, span: Span) -> Result<i32, ParseError> {
+        let scale = self.unit_scale.get();
+        if scale == 1.0 {
+            return self.parse_i32(s, span);
+        }
+        Ok((self.parse_f32(s, span)? * scale).round() as i32)
+    }
+
+    fn dim_param(&self, params: &[&str], index: usize, name: &'static str, span: Span) -> Result<u32, ParseError> {
+        match params.get(index) {
+            Some(s) => self.dim(s, span),
+            None => Err(ParseError::MissingRequiredParameter { command: "", parameter: name, span }),
+        }
+    }
+
+    fn opt_dim(&self, params: &[&str], index: usize, span: Span) -> Result<Option<u32>, ParseError> {
+        match params.get(index) {
+            Some(s) if !s.is_empty() => self.dim(s, span).map(Some),
+            _ => Ok(None),
         }
     }
 
@@ -1115,24 +1186,6 @@ impl<'a> Parser<'a> {
             value: s.to_string(),
             span,
         })
-    }
-
-    fn parse_i32_param(
-        &self,
-        params: &[&str],
-        index: usize,
-        name: &'static str,
-        span: Span,
-    ) -> Result<i32, ParseError> {
-        if index >= params.len() {
-            return Err(ParseError::MissingRequiredParameter {
-                command: "",
-                parameter: name,
-                span,
-            });
-        }
-
-        self.parse_i32(params[index], span)
     }
 
     #[inline]

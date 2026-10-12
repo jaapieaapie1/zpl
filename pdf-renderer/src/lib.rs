@@ -16,6 +16,7 @@ mod fonts;
 mod graphic;
 mod matrix;
 mod shapes;
+mod symbols;
 mod text;
 
 pub use fonts::FontId;
@@ -234,6 +235,7 @@ fn render_instruction(ctx: &mut Ctx, instruction: &DrawInstruction) {
         | DrawInstruction::DrawEllipse { .. }
         | DrawInstruction::DrawDiagonalLine { .. } => shapes::render(ctx, instruction),
         DrawInstruction::DrawGraphicField { .. } => graphic::render(ctx, instruction),
+        DrawInstruction::DrawSymbol { .. } => symbols::render(ctx, instruction),
         DrawInstruction::Reverse(inner) => {
             // Painting white with the Difference blend mode inverts the backdrop.
             ctx.uses_difference = true;

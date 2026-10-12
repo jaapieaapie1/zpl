@@ -4,9 +4,15 @@ use zpl_tokenizer::Span;
 
 use super::Parser;
 use crate::{
-    command::{Command, FieldDirection, LinearKind, LineColor, MsiCheck, Orientation},
+    command::{Code49Interpretation, Command, FieldDirection, LinearKind, LineColor, MsiCheck, Orientation, PostalKind},
     error::ParseError,
 };
+
+/// Plain ASCII hex (no ZPL compression), ignoring anything that isn't a hex digit.
+fn decode_hex(raw: &str) -> Vec<u8> {
+    let digits: Vec<u8> = raw.bytes().filter_map(|b| (b as char).to_digit(16).map(|d| d as u8)).collect();
+    digits.chunks_exact(2).map(|p| p[0] << 4 | p[1]).collect()
+}
 
 /// Parameter `i`, or "" when absent.
 fn param<'p>(params: &[&'p str], i: usize) -> &'p str {
@@ -36,6 +42,11 @@ impl Parser<'_> {
         Ok(self.parse_optional_u32(params, i, span)?.unwrap_or(default))
     }
 
+    /// A length parameter in ^MU units, or `default` dots.
+    fn dim_or(&self, params: &[&str], i: usize, default: u32, span: Span) -> Result<u32, ParseError> {
+        Ok(self.opt_dim(params, i, span)?.unwrap_or(default))
+    }
+
     pub(super) fn parse_extra(&self, tilde: bool, name: &str, params: &[&str], span: Span) -> Option<Result<Command, ParseError>> {
         Some(match (tilde, name) {
             (false, "FH") => Ok(Command::FieldHexIndicator { indicator: first_char(params, 0).unwrap_or('_') }),
@@ -62,19 +73,132 @@ impl Parser<'_> {
             (false, "LS") => Ok(Command::LabelShift {
                 shift: match param(params, 0) {
                     "" => 0,
-                    s => self.parse_i32(s, span).ok()?,
+                    s => self.dim_i32(s, span).ok()?,
                 },
             }),
             (false, "GE") => self.parse_graphic_ellipse(params, span),
             (false, "GS") => self.parse_graphic_symbol(params, span),
             (false, "BX") => self.parse_data_matrix(params, span),
+            (false, "BD") => Ok(Command::MaxiCode {
+                mode: self.u32_or(params, 0, 2, span).ok()?.clamp(2, 6) as u8,
+                symbol_number: self.u32_or(params, 1, 1, span).ok()?.clamp(1, 8) as u8,
+                total_symbols: self.u32_or(params, 2, 1, span).ok()?.clamp(1, 8) as u8,
+            }),
+            (false, "BR") => Ok(Command::DataBar {
+                // ^BR defaults to rotated.
+                orientation: Some(self.opt_orientation(params, 0, span).ok()?.unwrap_or(Orientation::Rotated90)),
+                kind: self.u32_or(params, 1, 1, span).ok()?.clamp(1, 12) as u8,
+                magnification: self.parse_optional_u32(params, 2, span).ok()?.map(|m| m.clamp(1, 10)),
+                separator_height: self.u32_or(params, 3, 1, span).ok()?.clamp(1, 2),
+                height: self.opt_dim(params, 4, span).ok()?,
+                segments_per_row: self.u32_or(params, 5, 22, span).ok()?,
+            }),
+            (false, "BF") => Ok(Command::MicroPdf417 {
+                orientation: self.opt_orientation(params, 0, span).ok()?,
+                height: self.opt_dim(params, 1, span).ok()?,
+                mode: self.u32_or(params, 2, 0, span).ok()?.min(33) as u8,
+            }),
+            (false, "BT") => Ok(Command::Tlc39 {
+                orientation: self.opt_orientation(params, 0, span).ok()?,
+                code39_module_width: self.dim_or(params, 1, 2, span).ok()?,
+                code39_ratio: match param(params, 2) {
+                    "" => 2.0,
+                    s => self.parse_f32(s, span).ok()?.clamp(2.0, 3.0),
+                },
+                code39_height: self.dim_or(params, 3, 40, span).ok()?,
+                micro_row_height: self.dim_or(params, 4, 4, span).ok()?,
+                micro_module_width: self.dim_or(params, 5, 2, span).ok()?,
+            }),
+            (false, "BB") => Ok(Command::Codablock {
+                orientation: self.opt_orientation(params, 0, span).ok()?,
+                row_height: self.u32_or(params, 1, 8, span).ok()?,
+                security: self.yes_no_or(params, 2, true, span).ok()?,
+                columns: self.u32_or(params, 3, 0, span).ok()?,
+                rows: self.u32_or(params, 4, 0, span).ok()?,
+                mode: first_char(params, 5).map(|c| c.to_ascii_uppercase()).filter(|c| matches!(c, 'A' | 'E' | 'F')).unwrap_or('F'),
+            }),
+            (false, "B4") => Ok(Command::Code49 {
+                orientation: self.opt_orientation(params, 0, span).ok()?,
+                row_height: self.parse_optional_u32(params, 1, span).ok()?,
+                interpretation: match param(params, 2).to_ascii_uppercase().as_str() {
+                    "A" => Code49Interpretation::Above,
+                    "B" => Code49Interpretation::Below,
+                    _ => Code49Interpretation::None,
+                },
+                start_mode: first_char(params, 3).and_then(|c| c.to_digit(10)).map(|d| d as u8),
+            }),
+            (false, "B5") => Ok(Command::Postal {
+                kind: PostalKind::Planet,
+                orientation: self.opt_orientation(params, 0, span).ok()?,
+                height: self.opt_dim(params, 1, span).ok()?,
+                print_interpretation_line: self.yes_no_or(params, 2, false, span).ok()?,
+                print_above: self.yes_no_or(params, 3, false, span).ok()?,
+            }),
+            (false, "BZ") => Ok(Command::Postal {
+                kind: match param(params, 4) {
+                    "1" => PostalKind::Planet,
+                    "3" => PostalKind::UspsImb,
+                    _ => PostalKind::Postnet,
+                },
+                orientation: self.opt_orientation(params, 0, span).ok()?,
+                height: self.opt_dim(params, 1, span).ok()?,
+                print_interpretation_line: self.yes_no_or(params, 2, false, span).ok()?,
+                print_above: self.yes_no_or(params, 3, false, span).ok()?,
+            }),
+            (false, "MU") => {
+                self.unit_scale.set(match first_char(params, 0).map(|c| c.to_ascii_uppercase()) {
+                    Some('I') => 203.2,
+                    Some('M') => 8.0,
+                    _ => 1.0,
+                });
+                Ok(Command::Comment { text: String::new() })
+            }
+            (false, "FC") => Ok(Command::FieldClock {
+                primary: first_char(params, 0).unwrap_or('%'),
+                secondary: first_char(params, 1),
+                tertiary: first_char(params, 2),
+            }),
+            (false, "ST") => Ok(Command::SetClock {
+                month: self.u32_or(params, 0, 1, span).ok()?,
+                day: self.u32_or(params, 1, 1, span).ok()?,
+                year: self.u32_or(params, 2, 2000, span).ok()?,
+                hour: self.u32_or(params, 3, 0, span).ok()?,
+                minute: self.u32_or(params, 4, 0, span).ok()?,
+                second: self.u32_or(params, 5, 0, span).ok()?,
+            }),
+            (false, "SO") => {
+                let n = |i| match param(params, i) {
+                    "" => Some(0),
+                    s => self.parse_i32(s, span).ok(),
+                };
+                Ok(Command::ClockOffset {
+                    clock: if param(params, 0) == "3" { 3 } else { 2 },
+                    months: n(1)?,
+                    days: n(2)?,
+                    years: n(3)?,
+                    hours: n(4)?,
+                    minutes: n(5)?,
+                    seconds: n(6)?,
+                })
+            }
+            (false, "FE") => Ok(Command::FieldEmbed { indicator: first_char(params, 0).unwrap_or('#') }),
+            (false, "IL") => Ok(Command::ImageLoad { name: param(params, 0).to_string() }),
+            (false, "IS") => Ok(Command::ImageSave {
+                name: param(params, 0).to_string(),
+                print: self.yes_no_or(params, 1, true, span).ok()?,
+            }),
+            (false, "CW") => Ok(Command::FontAlias {
+                letter: first_char(params, 0)?.to_ascii_uppercase(),
+                name: param(params, 1).to_string(),
+            }),
+            (true, "DU" | "DT") => self.parse_download_font(params, span),
             (false, "B7") => self.parse_pdf417(params, span),
             (false, "BO" | "B0") => self.parse_aztec(params, span),
             // ^BLo,h,g: LOGMARS is Code 39 with a mandatory check digit.
             (false, "BL") => Ok(Command::LinearBarcode {
                 kind: LinearKind::Code39 { check_digit: true },
                 orientation: self.opt_orientation(params, 0, span).ok()?,
-                height: self.parse_optional_u32(params, 1, span).ok()?,
+                height: self.opt_dim(params, 1, span).ok()?,
                 print_interpretation_line: true,
                 print_above: self.yes_no_or(params, 2, false, span).ok()?,
             }),
@@ -105,8 +229,8 @@ impl Parser<'_> {
         // ^TBa,b,c
         Ok(Command::TextBlock {
             orientation: self.opt_orientation(params, 0, span)?,
-            width: self.u32_or(params, 1, 0, span)?,
-            height: self.u32_or(params, 2, 0, span)?,
+            width: self.dim_or(params, 1, 0, span)?,
+            height: self.dim_or(params, 2, 0, span)?,
         })
     }
 
@@ -117,9 +241,9 @@ impl Parser<'_> {
             s => self.parse_line_color(s, span)?,
         };
         Ok(Command::GraphicEllipse {
-            width: self.u32_or(params, 0, 3, span)?,
-            height: self.u32_or(params, 1, 3, span)?,
-            thickness: self.u32_or(params, 2, 1, span)?,
+            width: self.dim_or(params, 0, 3, span)?,
+            height: self.dim_or(params, 1, 3, span)?,
+            thickness: self.dim_or(params, 2, 1, span)?,
             color,
         })
     }
@@ -128,8 +252,8 @@ impl Parser<'_> {
         // ^GSo,h,w
         Ok(Command::GraphicSymbol {
             orientation: self.opt_orientation(params, 0, span)?,
-            height: self.parse_optional_u32(params, 1, span)?,
-            width: self.parse_optional_u32(params, 2, span)?,
+            height: self.opt_dim(params, 1, span)?,
+            width: self.opt_dim(params, 2, span)?,
         })
     }
 
@@ -158,8 +282,26 @@ impl Parser<'_> {
     /// ~DYd:f,b,x,t,w,data. Only GRF bitmaps (`x` = G) can be drawn; other objects (fonts,
     /// PNG, ...) are ignored.
     fn parse_download_object(&self, params: &[&str], span: Span) -> Option<Result<Command, ParseError>> {
-        if !param(params, 2).eq_ignore_ascii_case("G") {
-            return Some(Ok(Command::Comment { text: String::new() }));
+        let format = param(params, 1).to_ascii_uppercase();
+        let raw = || params.get(5..).map(|rest| rest.join(",")).unwrap_or_default();
+        match param(params, 2).to_ascii_uppercase().as_str() {
+            "G" => {}
+            // TrueType (T), TrueType extension (E) and OpenType (O... firmware dependent).
+            "T" | "E" | "O" => {
+                let raw = raw();
+                let data = if raw.trim_start().starts_with(':') {
+                    match self.decode_graphic(&raw, 0) {
+                        Ok(d) => d,
+                        Err(e) => return Some(Err(e)),
+                    }
+                } else if format == "A" {
+                    decode_hex(&raw)
+                } else {
+                    raw.into_bytes()
+                };
+                return Some(Ok(Command::DownloadFont { name: param(params, 0).to_string(), data }));
+            }
+            _ => return Some(Ok(Command::Comment { text: String::new() })),
         }
         let bytes_per_row = match self.u32_or(params, 4, 0, span) {
             Ok(v) => v,
@@ -172,6 +314,11 @@ impl Parser<'_> {
             Ok(raw.into_bytes())
         };
         Some(data.map(|data| Command::DownloadGraphic { name: param(params, 0).to_string(), bytes_per_row, data }))
+    }
+
+    /// ~DUd:o.x,s,data / ~DTd:o.x,s,data: the font file as ASCII hex.
+    fn parse_download_font(&self, params: &[&str], _span: Span) -> Result<Command, ParseError> {
+        Ok(Command::DownloadFont { name: param(params, 0).to_string(), data: decode_hex(&params.get(2..).map(|p| p.join(",")).unwrap_or_default()) })
     }
 
     fn parse_data_matrix(&self, params: &[&str], span: Span) -> Result<Command, ParseError> {
@@ -263,7 +410,7 @@ impl Parser<'_> {
             Ok(Command::LinearBarcode {
                 kind,
                 orientation: self.opt_orientation(params, 0, span)?,
-                height: self.parse_optional_u32(params, h, span)?,
+                height: self.opt_dim(params, h, span)?,
                 print_interpretation_line: yes(param(params, h + 1), true)?,
                 print_above: yes(param(params, h + 2), above_default)?,
             })

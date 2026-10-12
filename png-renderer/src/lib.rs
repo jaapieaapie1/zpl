@@ -1,14 +1,18 @@
-use ab_glyph::{FontRef, PxScale};
+use std::sync::Arc;
+
+use ab_glyph::{FontArc, FontRef, FontVec, PxScale};
 use image::{ImageBuffer, Rgb, RgbImage};
 use imageproc::drawing;
 use zpl_parser::command::{
-    BlockJustification, Code128Mode, DiagonalDirection, Justification, LineColor, LinearKind, Orientation,
+    BlockJustification, Code128Mode, DiagonalDirection, FontName, Justification, LineColor, LinearKind,
+    Orientation,
 };
 use zpl_state_manager::{DrawInstruction, TextAnchor, TextBlock};
 use zpl_symbols::linear::{self, LinearSymbol, Symbology};
 use zpl_symbols::matrix::{self, Matrix};
 
 pub mod code128;
+mod symbols;
 
 const WHITE: Rgb<u8> = Rgb([255, 255, 255]);
 const BLACK: Rgb<u8> = Rgb([0, 0, 0]);
@@ -19,22 +23,138 @@ pub struct PngRenderer {
     debug: bool,
 }
 
-/// Scalable text font (^A0 and friends) at a given field size.
+/// Text font of a field at its size: the scalable font 0 (Triumvirate), a downloaded
+/// TrueType/OpenType font, or a monospaced stand-in for the bitmap fonts A–H.
 struct TextFont {
-    font: FontRef<'static>,
+    font: FontArc,
     scale: PxScale,
     /// Distance from ab_glyph's draw origin (ascent line) down to the cap line.
     y_offset: i32,
     /// Cap height in dots: distance from the top of capitals to the baseline.
     cap: i32,
+    /// Line height in dots (em size, or the bitmap cell height).
+    line_h: u32,
+    /// Bitmap fonts: (character pitch, pen offset into the cell) in dots.
+    cell: Option<(f32, f32)>,
+    /// Uppercase-only bitmap font (B, H).
+    uppercase: bool,
+}
+
+/// Bitmap font matrices at 8 dots/mm (H, W, intercharacter gap, baseline, uppercase only);
+/// see docs/commands/other/FONTS.md and pdf-renderer's text.rs.
+fn bitmap_cell(font: FontName) -> Option<(u32, u32, u32, u32, bool)> {
+    Some(match font {
+        FontName::FontA => (9, 5, 1, 7, false),
+        FontName::FontB => (11, 7, 2, 11, true),
+        FontName::FontC | FontName::FontD => (18, 10, 2, 14, false),
+        FontName::FontE => (28, 15, 5, 23, false),
+        FontName::FontF => (26, 13, 3, 21, false),
+        FontName::FontG => (60, 40, 8, 48, false),
+        FontName::FontH => (21, 13, 6, 21, true),
+        _ => return None,
+    })
+}
+
+/// Fonts P–V: fixed-size font 0 (H x W).
+fn fixed_scalable(font: FontName) -> Option<(u32, u32)> {
+    Some(match font {
+        FontName::FontP => (20, 18),
+        FontName::FontQ => (28, 24),
+        FontName::FontR => (35, 31),
+        FontName::FontS => (40, 35),
+        FontName::FontT => (48, 42),
+        FontName::FontU => (59, 53),
+        FontName::FontV => (80, 71),
+        _ => return None,
+    })
+}
+
+/// Integer magnifications (vertical, horizontal), nearest multiple of the matrix, 1 to 10.
+/// `width == height` means only a height was given (see pdf-renderer's `magnification`).
+fn magnification(height: u32, width: u32, base_h: u32, base_w: u32) -> (u32, u32) {
+    let mag = |v: u32, base: u32| (v > 0).then(|| ((v as f32 / base as f32).round() as u32).clamp(1, 10));
+    let width = if width == height && base_h != base_w { 0 } else { width };
+    match (mag(height, base_h), mag(width, base_w)) {
+        (Some(h), Some(w)) => (h, w),
+        (Some(m), None) | (None, Some(m)) => (m, m),
+        (None, None) => (1, 1),
+    }
+}
+
+/// Downloaded fonts parsed recently, so each field does not copy and reparse the bytes.
+fn custom_font(data: &Arc<Vec<u8>>) -> Option<FontArc> {
+    use std::cell::RefCell;
+    type Cache = Vec<(Arc<Vec<u8>>, Option<FontArc>)>;
+    thread_local! {
+        static CACHE: RefCell<Cache> = const { RefCell::new(Vec::new()) };
+    }
+    CACHE.with_borrow_mut(|cache| {
+        if let Some((_, font)) = cache.iter().find(|(d, _)| Arc::ptr_eq(d, data)) {
+            return font.clone();
+        }
+        let font = FontVec::try_from_vec(data.to_vec()).ok().map(FontArc::new);
+        if cache.len() >= 8 {
+            cache.remove(0);
+        }
+        cache.push((Arc::clone(data), font.clone()));
+        font
+    })
 }
 
 impl TextFont {
-    fn new(height: u32, width: u32) -> Self {
+    fn new(name: FontName, custom: Option<&Arc<Vec<u8>>>, height: u32, width: u32) -> Self {
         use ab_glyph::Font;
 
-        let font_data: &'static [u8] = include_bytes!("../fonts/ATTriumvirate-BoldCd.otf");
-        let font = FontRef::try_from_slice(font_data).expect("Error loading font");
+        static TRIUMVIRATE: &[u8] = include_bytes!("../fonts/ATTriumvirate-BoldCd.otf");
+        static MONO: &[u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
+
+        if let (None, Some((h, w, gap, base, uppercase))) = (custom, bitmap_cell(name)) {
+            let font = FontArc::try_from_slice(MONO).expect("Error loading font");
+            let (mh, mw) = magnification(height, width, h, w);
+            let upem = font.units_per_em().unwrap_or(2048.0);
+            // Outline bounds may be y-down; 'H' sits on the baseline, so its extent is the cap height.
+            let cap_unscaled =
+                font.outline(font.glyph_id('H')).map_or(upem * 0.73, |o| (o.bounds.max.y - o.bounds.min.y).abs());
+            let (ink_min, ink_w) = font
+                .outline(font.glyph_id('M'))
+                .map_or((0.0, upem * 0.5), |o| (o.bounds.min.x, o.bounds.max.x - o.bounds.min.x));
+            // Cap height = character height above the baseline; 'M' fills the cell width.
+            let cap = (base * mh) as f32;
+            let em_y = cap * upem / cap_unscaled;
+            let em_x = (w * mw) as f32 * upem / ink_w;
+            let px_per_em = font.height_unscaled() / upem;
+            let scale = PxScale { x: em_x * px_per_em, y: em_y * px_per_em };
+            let y_offset = ((font.ascent_unscaled() - cap_unscaled) / upem * em_y).round() as i32;
+            return Self {
+                font,
+                scale,
+                y_offset,
+                cap: cap.round() as i32,
+                line_h: h * mh,
+                cell: Some((((w + gap) * mw) as f32, -ink_min / upem * em_x)),
+                uppercase,
+            };
+        }
+
+        let (font, cap_em) = match custom.and_then(custom_font) {
+            Some(font) => {
+                let upem = font.units_per_em().unwrap_or(1000.0);
+                let cap = font
+                    .outline(font.glyph_id('H'))
+                    .map(|o| (o.bounds.max.y - o.bounds.min.y).abs() / upem)
+                    .filter(|&c| c > 0.0)
+                    .unwrap_or(0.7);
+                (font, cap)
+            }
+            None => (FontArc::try_from_slice(TRIUMVIRATE).expect("Error loading font"), 0.75),
+        };
+        let (height, width) = match fixed_scalable(name).filter(|_| custom.is_none()) {
+            Some((h, w)) => {
+                let (mh, mw) = magnification(height, width, h, w);
+                (h * mh, w * mw)
+            }
+            None => (height, width),
+        };
 
         // Zebra sizes scalable fonts in em units, ab_glyph's PxScale is ascent - descent
         let units_per_em = font.units_per_em().unwrap_or(1000.0);
@@ -46,17 +166,35 @@ impl TextFont {
         };
 
         // Zebra places the top of capital letters at the field origin, ab_glyph places the ascent there
-        let cap_height = units_per_em * 0.75;
+        let cap_height = units_per_em * cap_em;
         let y_offset = ((font.ascent_unscaled() - cap_height) / units_per_em * height as f32).round() as i32;
-        let cap = (height as f32 * 0.75).round() as i32;
-        Self { font, scale, y_offset, cap }
+        let cap = (height as f32 * cap_em).round() as i32;
+        Self { font, scale, y_offset, cap, line_h: height, cell: None, uppercase: false }
     }
 
     /// Advance width of `text` in dots.
     fn measure(&self, text: &str) -> f32 {
         use ab_glyph::{Font, ScaleFont};
+        if let Some((pitch, _)) = self.cell {
+            return pitch * text.chars().count() as f32;
+        }
         let scaled = self.font.as_scaled(self.scale);
         text.chars().map(|c| scaled.h_advance(self.font.glyph_id(c))).sum()
+    }
+
+    /// Draws one line with the top of its capitals at `top`.
+    fn draw(&self, image: &mut RgbImage, x: i32, top: i32, line: &str) {
+        let y = top - self.y_offset;
+        match self.cell {
+            None => drawing::draw_text_mut(image, BLACK, x, y, self.scale, &self.font, line),
+            Some((pitch, offset)) => {
+                let mut buf = [0u8; 4];
+                for (i, c) in line.chars().enumerate() {
+                    let cx = (x as f32 + i as f32 * pitch + offset).round() as i32;
+                    drawing::draw_text_mut(image, BLACK, cx, y, self.scale, &self.font, c.encode_utf8(&mut buf));
+                }
+            }
+        }
     }
 }
 
@@ -216,13 +354,15 @@ impl PngRenderer {
     fn render_instruction(&self, image: &mut RgbImage, instruction: &DrawInstruction) {
         match instruction {
             DrawInstruction::DrawText {
-                x, y, text, height, width, orientation, justification, anchor, block, ..
+                x, y, text, font, height, width, orientation, justification, anchor, block, custom_font, ..
             } => {
                 if self.debug {
                     self.draw_origin_cross(image, *x, *y, Rgb([255, 0, 0]));
                 }
+                let font = TextFont::new(*font, custom_font.as_ref(), *height, *width);
+                let text = if font.uppercase { text.to_uppercase() } else { text.clone() };
                 self.render_text(
-                    image, *x, *y, text, *height, *width, *orientation, *justification, *anchor, block.as_ref(),
+                    image, *x, *y, &text, &font, *orientation, *justification, *anchor, block.as_ref(),
                 );
             }
             DrawInstruction::DrawBarcode {
@@ -293,6 +433,7 @@ impl PngRenderer {
                 }
                 self.render_graphic_field(image, *x, *y, *bytes_per_row, data, *magnification_x, *magnification_y);
             }
+            DrawInstruction::DrawSymbol { .. } => self.render_symbol(image, instruction),
             DrawInstruction::Reverse(inner) => self.render_reverse(image, inner),
         }
     }
@@ -318,14 +459,13 @@ impl PngRenderer {
         x: u32,
         y: u32,
         text: &str,
-        height: u32,
-        width: u32,
+        font: &TextFont,
         orientation: Orientation,
         justification: Justification,
         anchor: TextAnchor,
         block: Option<&TextBlock>,
     ) {
-        let font = TextFont::new(height, width);
+        let height = font.line_h;
 
         // Height of the unrotated frame per orientation; the placement below is tuned to these.
         let frame_extra = match orientation {
@@ -343,7 +483,7 @@ impl PngRenderer {
             }
             Some(b) => {
                 let line_height = (height as i32 + b.line_spacing).max(1);
-                let mut lines = wrap_lines(&font, text, b.width, b.hanging_indent);
+                let mut lines = wrap_lines(font, text, b.width, b.hanging_indent);
                 if let Some(clip) = b.clip_height {
                     // ^TB: drop lines that do not fit in the block height (keep at least one).
                     let fit = ((clip as i32 - height as i32) / line_height + 1).max(1) as usize;
@@ -375,7 +515,7 @@ impl PngRenderer {
 
         let mut temp: RgbImage = ImageBuffer::from_pixel(frame_w, frame_h, WHITE);
         for (x_off, top, line) in &rows {
-            drawing::draw_text_mut(&mut temp, BLACK, *x_off, top - font.y_offset, font.scale, &font.font, line);
+            font.draw(&mut temp, *x_off, *top, line);
         }
 
         // ^FT: the origin is the baseline of the (last) line; move it to where the top would be.
@@ -931,7 +1071,7 @@ mod tests {
 
     #[test]
     fn wrap_respects_width_and_forced_breaks() {
-        let font = TextFont::new(30, 30);
+        let font = TextFont::new(FontName::Font0, None, 30, 30);
         let lines = wrap_lines(&font, "aaa bbb ccc\\&ddd", font.measure("aaa bbb") as u32 + 1, 0);
         assert_eq!(lines, vec!["aaa bbb", "ccc", "ddd"]);
     }

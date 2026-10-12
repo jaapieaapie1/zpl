@@ -104,6 +104,12 @@ pub fn warm_up() {
     }
 }
 
+/// ZPL is normally UTF-8 (^CI28); anything else is taken as a single-byte code page, one
+/// character per byte, so legacy Latin-1/CP1252 labels still render.
+pub fn zpl_text(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|e| e.into_bytes().into_iter().map(char::from).collect())
+}
+
 fn error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, message.into()).into_response()
 }
@@ -127,10 +133,7 @@ async fn render(Query(params): Query<HashMap<String, String>>, body: Body) -> Re
     };
     let read = start.elapsed();
 
-    let zpl = match String::from_utf8(body.into()) {
-        Ok(zpl) => zpl,
-        Err(_) => return error(StatusCode::BAD_REQUEST, "body must be UTF-8 ZPL"),
-    };
+    let zpl = zpl_text(body.into());
 
     // Rendering is CPU-bound (PNG takes milliseconds), so keep it off the async workers.
     let queued = Instant::now();
@@ -240,9 +243,14 @@ mod tests {
     #[tokio::test]
     async fn rejects_bad_input() {
         assert_eq!(post("/render?format=gif", LABEL).await.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(post("/render", vec![0xff, 0xfe]).await.status(), StatusCode::BAD_REQUEST);
         let huge = vec![b'A'; MAX_BODY_BYTES + 1];
         assert_eq!(post("/render", huge).await.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn non_utf8_is_latin1() {
+        assert_eq!(zpl_text(b"^FD\xe9^FS".to_vec()), "^FD\u{e9}^FS");
+        assert_eq!(zpl_text("é".as_bytes().to_vec()), "é");
     }
 
     #[test]

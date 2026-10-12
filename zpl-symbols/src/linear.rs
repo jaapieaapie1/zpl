@@ -675,6 +675,8 @@ const EAN_L: [[u8; 4]; 10] = [
 ];
 /// EAN-13 left-half parity by leading digit, 6 bits MSB first (1 = G).
 const EAN13_PARITY: [u8; 10] = [0x00, 0x0B, 0x0D, 0x0E, 0x13, 0x19, 0x1C, 0x15, 0x16, 0x1A];
+/// UPC-E (number system 0) parity by check digit, 6 bits MSB first (1 = G/even).
+const UPCE_PARITY: [u8; 10] = [0x38, 0x34, 0x32, 0x31, 0x2C, 0x26, 0x23, 0x2A, 0x29, 0x25];
 /// 5-digit add-on parity by checksum, 5 bits MSB first (1 = G).
 const EXT5_PARITY: [u8; 10] = [0x18, 0x14, 0x12, 0x11, 0x0C, 0x06, 0x03, 0x0A, 0x09, 0x05];
 
@@ -831,11 +833,12 @@ fn upce(data: &str) -> Result<LinearSymbol, EncodeError> {
     let mut upca = vec![ns];
     upca.extend(upce_expand(&body));
     let check = mod10_weighted(&upca);
-    // Number system 0 uses the inverted EAN-13 parity table.
+    // Number system 0 parity by check digit (1 = even/G); number system 1 is its inverse.
+    // Not EAN-13's table: check digit 0 is EEEOOO, where EAN-13's leading 0 is all odd.
     let parity = if ns == 0 {
-        !EAN13_PARITY[check as usize] & 0x3F
+        UPCE_PARITY[check as usize]
     } else {
-        EAN13_PARITY[check as usize]
+        !UPCE_PARITY[check as usize] & 0x3F
     };
     let mut b = Builder::default();
     b.widths(&GUARD_NORMAL, true);

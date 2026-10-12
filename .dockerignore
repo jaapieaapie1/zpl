@@ -10,3 +10,4 @@ generated-images
 docs
 *.pdf
 *.png
+zpl-wasm/www/pkg

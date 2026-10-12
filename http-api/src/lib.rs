@@ -5,28 +5,47 @@
 //! - Add `timings` (`?timings` or `?format=png&timings=1`) to get a `Server-Timing` header
 //!   with the duration of each stage, which browser devtools display as well.
 //! - `GET /health` returns `ok`.
+//! - `GET /playground/` serves the live ZPL editor (`zpl-wasm/www`), which renders in the
+//!   browser with WebAssembly. Files come from `ZPL_PLAYGROUND_DIR`; a `.gz` next to a
+//!   file is sent instead when the client accepts gzip.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body};
 use axum::extract::Query;
 use axum::http::{header, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use pdf_renderer::PdfRenderer;
 use png_renderer::PngRenderer;
+use tower_http::services::ServeDir;
 use zpl_parser::Parser;
 use zpl_state_manager::StateManager;
 
 /// Largest accepted ZPL body. Labels with big ^GF graphics run to a few megabytes.
 pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+/// The playground's files: `ZPL_PLAYGROUND_DIR`, or `zpl-wasm/www` in this repository.
+pub fn playground_dir() -> PathBuf {
+    std::env::var_os("ZPL_PLAYGROUND_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../zpl-wasm/www"))
+}
+
 pub fn router() -> Router {
+    router_with_playground(&playground_dir())
+}
+
+pub fn router_with_playground(dir: &Path) -> Router {
     Router::new()
         .route("/render", post(render))
         .route("/health", get(|| async { "ok" }))
+        // The page loads its scripts relative to itself, so it needs the trailing slash.
+        .route("/playground", get(|| async { Redirect::permanent("/playground/") }))
+        .nest_service("/playground/", ServeDir::new(dir).precompressed_gzip())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +264,33 @@ mod tests {
         assert_eq!(post("/render?format=gif", LABEL).await.status(), StatusCode::BAD_REQUEST);
         let huge = vec![b'A'; MAX_BODY_BYTES + 1];
         assert_eq!(post("/render", huge).await.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn serves_playground() {
+        let dir = std::env::temp_dir().join(format!("zpl-playground-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        std::fs::write(dir.join("index.html"), "<!doctype html>").unwrap();
+        std::fs::write(dir.join("pkg/zpl_wasm_bg.wasm"), b"\0asm").unwrap();
+        let get = |uri: &str| {
+            let request = Request::get(uri).body(Body::empty()).unwrap();
+            router_with_playground(&dir).oneshot(request)
+        };
+
+        let response = get("/playground").await.unwrap();
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(response.headers()[header::LOCATION], "/playground/");
+
+        let response = get("/playground/").await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await, b"<!doctype html>");
+
+        let response = get("/playground/pkg/zpl_wasm_bg.wasm").await.unwrap();
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/wasm");
+
+        assert_eq!(get("/playground/missing.js").await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(get("/playground/../Cargo.toml").await.unwrap().status(), StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

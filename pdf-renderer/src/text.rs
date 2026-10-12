@@ -79,6 +79,19 @@ pub(crate) fn bitmap_cell(font: FontName, dpmm: u32) -> Option<BitmapCell> {
     })
 }
 
+/// ^TB line pitch of font 0 in line heights (Labelary); the bitmap fonts' is a little over one.
+const TEXT_BLOCK_PITCH: f32 = 1.26;
+
+/// ^GS symbol matrix (dots) and the size its outlines are drawn at, in cells (Labelary).
+const SYMBOL_CELL: u32 = 24;
+const SYMBOL_EM: f32 = 1.42;
+
+/// Smallest font 0 size (dots); docs/commands/zpl/A.md.
+const MIN_SCALABLE: u32 = 10;
+
+/// Fonts P–V: glyph height and width against the matrix (Labelary).
+const FIXED_EM: (f32, f32) = (0.82, 0.945);
+
 /// Fonts P–V: fixed-size renditions of the scalable font 0 (H x W in dots at magnification 1).
 fn fixed_scalable(font: FontName) -> Option<(u32, u32)> {
     Some(match font {
@@ -269,7 +282,8 @@ impl Field {
     }
 
     /// `frame` moved left on the page by the field's justification: by the rotated box's
-    /// page width (right) or half of it (auto), whatever the orientation.
+    /// page width when right-justified, whatever the orientation. Auto is left for
+    /// left-to-right text (Labelary).
     fn placed(&self, w: f32, h: f32) -> [f32; 6] {
         let page_w = match self.orientation {
             Orientation::Normal | Orientation::Rotated180 => w,
@@ -277,9 +291,8 @@ impl Field {
         };
         let mut matrix = self.frame(w, h);
         matrix[4] -= match self.justification {
-            Justification::Left => 0.0,
+            Justification::Left | Justification::Auto => 0.0,
             Justification::Right => page_w,
-            Justification::Auto => page_w / 2.0,
         };
         matrix
     }
@@ -447,15 +460,31 @@ fn field_for(
         };
     }
 
+    if font == FontName::Symbol {
+        // ^GS: font 0 outlines a little larger than the magnified 24 x 24 cell, which is
+        // the line height (as png-renderer draws them).
+        let (mh, mw) = magnification(height, width, SYMBOL_CELL, SYMBOL_CELL);
+        let (cell_h, cell_w) = ((SYMBOL_CELL * mh) as f32, (SYMBOL_CELL * mw) as f32);
+        let mut field = scalable(FontId::Triumvirate.into(), CAP_HEIGHT_EM, cell_h * SYMBOL_EM, cell_w * SYMBOL_EM);
+        field.line_h = cell_h;
+        return field;
+    }
+
     let (size_y, size_x) = match fixed_scalable(font) {
         Some((h, w)) => {
+            // Labelary draws these glyphs smaller than the matrix (as png-renderer does), on
+            // the baseline and line height of a full-size font 0.
             let (mh, mw) = magnification(height, width, h, w);
-            ((h * mh) as f32, (w * mw) as f32)
+            let (size_y, size_x) = ((h * mh) as f32, (w * mw) as f32);
+            let mut field = scalable(FontId::Triumvirate.into(), CAP_HEIGHT_EM, size_y, size_x);
+            (field.size_y, field.size_x) = (size_y * FIXED_EM.0, size_x * FIXED_EM.1);
+            return field;
         }
-        // ZPL font sizes are em sizes; width 0 means "same as height".
+        // ZPL font sizes are em sizes; width 0 means "same as height". Font 0 is at least
+        // 10 dots each way (Labelary).
         None => {
-            let size_y = em_height as f32;
-            (size_y, if width == 0 { size_y } else { width as f32 })
+            let size_y = em_height.max(MIN_SCALABLE);
+            (size_y as f32, if width == 0 { size_y } else { width.max(MIN_SCALABLE) } as f32)
         }
     };
     scalable(FontId::Triumvirate.into(), CAP_HEIGHT_EM, size_y, size_x)
@@ -503,10 +532,14 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
     } else {
         Cow::Borrowed(text)
     };
-    // Uppercase-only bitmap fonts print lowercase letters as capitals.
+    // Uppercase-only bitmap fonts: B prints lowercase letters as capitals, OCR-A (H) leaves
+    // them blank (Labelary).
     let text: Cow<str> = match bitmap_cell(*font, ctx.dpmm) {
         Some(cell) if cell.uppercase && custom_font.is_none() && text.chars().any(char::is_lowercase) => {
-            Cow::Owned(text.to_uppercase())
+            match font {
+                FontName::FontH => Cow::Owned(text.chars().map(|c| if c.is_lowercase() { ' ' } else { c }).collect()),
+                _ => Cow::Owned(text.to_uppercase()),
+            }
         }
         _ => text,
     };
@@ -514,6 +547,14 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
     field.notdef = layout.default_glyph;
     field.justification = *justification;
     let reverse = matches!(direction, FieldDirection::Reverse);
+    let block_pitch = match bitmap_cell(*font, ctx.dpmm).filter(|_| custom_font.is_none()) {
+        None => TEXT_BLOCK_PITCH,
+        Some(_) => match font {
+            FontName::FontA => 1.074,
+            FontName::FontE => 1.0,
+            _ => 1.05,
+        },
+    };
 
     // ^FPV prints one character per line in logical order: there is nothing to reorder or
     // join, so vertical fields always take the classic path.
@@ -523,7 +564,7 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
     };
     if mode != Mode::Classic {
         match block {
-            Some(block) => render_block(ctx, &field, text, block, reverse, mode, layout),
+            Some(block) => render_block(ctx, &field, text, block, reverse, mode, layout, block_pitch),
             None => {
                 let info = shape::bidi_info(layout, text);
                 let line = match mode {
@@ -537,7 +578,7 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
                         Shown::Shaped(line, reverse)
                     }
                 };
-                render_line(ctx, &field, &line);
+                render_line(ctx, &field, &line, 0.0);
             }
         }
         return;
@@ -545,12 +586,16 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
 
     match (direction, block) {
         (FieldDirection::Vertical, _) => render_vertical(ctx, &field, text),
-        (_, Some(block)) => render_block(ctx, &field, text, block, reverse, Mode::Classic, layout),
+        (_, Some(block)) => render_block(ctx, &field, text, block, reverse, Mode::Classic, layout, block_pitch),
         (FieldDirection::Reverse, None) => {
-            let reversed: String = text.chars().rev().collect();
-            render_line(ctx, &field, &Shown::Text(reversed));
+            // Drawn backwards from the origin: the first character (last on the line)
+            // starts there, as Labelary places it.
+            let first = text.chars().next().map_or(0.0, |c| field.char_width(&ctx.fonts, c));
+            let reversed = Shown::Text(text.chars().rev().collect());
+            let back = field.width_of(&ctx.fonts, &reversed) - first;
+            render_line(ctx, &field, &reversed, back);
         }
-        (FieldDirection::Horizontal, None) => render_line(ctx, &field, &Shown::Plain(text)),
+        (FieldDirection::Horizontal, None) => render_line(ctx, &field, &Shown::Plain(text), 0.0),
     }
 }
 
@@ -580,20 +625,22 @@ impl Field {
     }
 }
 
-/// A single unblocked line: a box as wide as the text and one line high, placed by `frame`.
-fn render_line(ctx: &mut Ctx, field: &Field, text: &Shown) {
+/// A single unblocked line: a box as wide as the text and one line high, placed by `frame`
+/// and moved `back` dots against the text direction.
+fn render_line(ctx: &mut Ctx, field: &Field, text: &Shown, back: f32) {
     let advance = field.width_of(&ctx.fonts, text);
     let matrix = field.placed(advance, field.line_h);
     let baseline = match field.anchor {
         TextAnchor::Top => field.ascent,
         TextAnchor::Baseline => 0.0,
     };
-    field.in_frame(ctx, matrix, |ctx, ox, oy| field.show_line(ctx, text, ox, oy + baseline));
+    field.in_frame(ctx, matrix, |ctx, ox, oy| field.show_line(ctx, text, ox - back, oy + baseline));
 }
 
-/// ^FPV: one character per line, top to bottom, each starting at the origin's x.
+/// ^FPV: one character per line, top to bottom, each starting at the origin's x. Labelary
+/// ignores the character gap here.
 fn render_vertical(ctx: &mut Ctx, field: &Field, text: &str) {
-    let step = field.line_h + field.gap;
+    let step = field.line_h;
     let count = text.chars().count();
     let widest = text.chars().map(|c| field.char_width(&ctx.fonts, c)).fold(0.0, f32::max);
     let first = match field.anchor {
@@ -713,7 +760,11 @@ fn wrap(
 /// ^FB / ^TB: word-wrapped block of lines. Lines are wrapped in logical order; with ^PA
 /// bidi each line is then reordered on its own (UBA rule L), with its paragraph's level.
 #[allow(clippy::too_many_arguments)]
-fn render_block(ctx: &mut Ctx, field: &Field, text: &str, block: &TextBlock, reverse: bool, mode: Mode, layout: &TextLayout) {
+/// `pitch` is the ^TB line pitch in line heights (see `TEXT_BLOCK_PITCH`).
+fn render_block(
+    ctx: &mut Ctx, field: &Field, text: &str, block: &TextBlock, reverse: bool, mode: Mode, layout: &TextLayout,
+    pitch: f32,
+) {
     let (clean, paragraphs) = split_paragraphs(text);
     let text: &str = &clean;
     let indent = block.hanging_indent as f32;
@@ -752,12 +803,16 @@ fn render_block(ctx: &mut Ctx, field: &Field, text: &str, block: &TextBlock, rev
         }
     }
 
-    let line_height = (field.line_h + block.line_spacing as f32).max(1.0);
+    let line_height = match block.clip_height {
+        Some(_) => field.line_h * pitch,
+        None => (field.line_h + block.line_spacing as f32).max(1.0),
+    };
     let max_lines = block.max_lines.max(1) as usize;
-    // Rows actually occupied; lines past them are dropped (^TB) or overprinted on the last row (^FB).
+    // Rows actually occupied; lines past them are dropped (^TB: those starting below the
+    // block, the last one is cut off at its bottom edge) or overprinted on the last row (^FB).
     let (rows, keep) = match block.clip_height {
         Some(h) => {
-            let fit = (h as f32 / line_height).floor() as usize;
+            let fit = ((h as f32 / line_height).ceil() as usize).max(1);
             (lines.len().min(fit), lines.len().min(fit))
         }
         None => (lines.len().min(max_lines), lines.len()),
@@ -786,20 +841,41 @@ fn render_block(ctx: &mut Ctx, field: &Field, text: &str, block: &TextBlock, rev
     let widths: Vec<f32> = shown.iter().map(|l| field.width_of(&ctx.fonts, l)).collect();
     let box_w = if block.width > 0 { width } else { widths.iter().copied().fold(0.0, f32::max) };
     let ascent = field.ascent;
+    // ^FB: the block is as tall as its maximum number of lines, used or not (Labelary).
+    let nominal = if block.clip_height.is_some() { rows } else { max_lines };
     let baseline_of = |row: usize| match field.anchor {
         TextAnchor::Top => row as f32 * line_height + ascent,
-        // ^FT: the origin is the baseline of the last line.
-        TextAnchor::Baseline => -((rows - 1 - row) as f32 * line_height),
+        // ^FT: the origin is the baseline of the block's last line.
+        TextAnchor::Baseline => -((nominal - 1 - row) as f32 * line_height),
     };
-    let matrix = field.placed(box_w, rows as f32 * line_height);
+    let box_h = block.clip_height.map_or(nominal as f32 * line_height, |h| h as f32);
+    let matrix = field.placed(box_w, box_h);
 
+    let space = field.char_width(&ctx.fonts, ' ') + field.gap;
     field.in_frame(ctx, matrix, |ctx, ox, oy| {
+        if let Some(h) = block.clip_height {
+            // ^TB: nothing below the block (with room for overhangs on the other sides).
+            let top = oy + baseline_of(0) - ascent;
+            let pad = field.line_h;
+            ctx.content.save_state();
+            ctx.content.rect(ox - pad, top - pad, box_w + 2.0 * pad, h as f32 + pad).clip_nonzero().end_path();
+        }
         let mut reversed = String::new();
         for (i, ((line, shown), &line_w)) in lines[..keep].iter().zip(&shown).zip(&widths).enumerate() {
             let row = i.min(rows - 1);
             let baseline = oy + baseline_of(row);
             let room = if block.width > 0 { width - indent_of(i) } else { box_w - indent_of(i) };
             let left = ox + indent_of(i);
+            // Labelary justifies wrapped lines as if they still ended in the space they broke
+            // at (on the left of right-to-left lines), and centers the last line as if it
+            // ended in one too.
+            let trailing = match block.justification {
+                _ if rtl(line.para) => 0.0,
+                BlockJustification::Center if !line.para_end || i + 1 == lines.len() => space,
+                BlockJustification::Right if !line.para_end => space,
+                _ => 0.0,
+            };
+            let line_w = line_w + trailing;
             let mut s = match shown {
                 Shown::Plain(s) => *s,
                 Shown::Text(s) => s.as_str(),
@@ -853,6 +929,9 @@ fn render_block(ctx: &mut Ctx, field: &Field, text: &str, block: &TextBlock, rev
                     }
                 }
             }
+        }
+        if block.clip_height.is_some() {
+            ctx.content.restore_state();
         }
     });
 }
@@ -1238,18 +1317,25 @@ mod tests {
     #[test]
     fn block_baseline_anchor_is_last_line() {
         let w = em("AAAA ") as u32 + 2;
-        let tm = text_matrices(&content(&field("AAAA BBBB CCCC", |o| {
-            o.block = Some(block(w, 10, BlockJustification::Left));
-            o.anchor = TextAnchor::Baseline;
-        })));
+        let at = |max_lines| {
+            text_matrices(&content(&field("AAAA BBBB CCCC", |o| {
+                o.block = Some(block(w, max_lines, BlockJustification::Left));
+                o.anchor = TextAnchor::Baseline;
+            })))
+        };
+        let tm = at(3);
         assert!(approx(tm[2][5], 60.0) && approx(tm[0][5], -20.0), "{tm:?}");
+        // The block's last line, even when the text leaves it empty (Labelary).
+        let tm = at(4);
+        assert!(approx(tm[2][5], 20.0) && approx(tm[0][5], -60.0), "{tm:?}");
     }
 
     #[test]
     fn block_center_and_right_justification() {
         let line = em("AB");
         let c = text_matrices(&content(&field("AB", |o| o.block = Some(block(200, 1, BlockJustification::Center)))));
-        assert!(approx(c[0][4], 50.0 + (200.0 - line) / 2.0), "{c:?}");
+        // Centred as if followed by a space (Labelary).
+        assert!(approx(c[0][4], 50.0 + (200.0 - line - em(" ")) / 2.0), "{c:?}");
         let r = text_matrices(&content(&field("AB", |o| o.block = Some(block(200, 1, BlockJustification::Right)))));
         assert!(approx(r[0][4], 50.0 + 200.0 - line), "{r:?}");
     }
@@ -1270,11 +1356,11 @@ mod tests {
     fn rotated_block_rotates_whole_block() {
         let w = em("AAAA ") as u32 + 2;
         let c = content(&field("AAAA BBBB", |o| {
-            o.block = Some(block(w, 10, BlockJustification::Left));
+            o.block = Some(block(w, 3, BlockJustification::Left));
             o.orientation = Orientation::Rotated90;
         }));
-        // Two lines of 40 dots: the rotated box spans x 50..130.
-        assert!(c.contains("0 1 -1 0 130 60 cm"), "{c}");
+        // Three lines of 40 dots, one left empty: the rotated box spans x 50..170.
+        assert!(c.contains("0 1 -1 0 170 60 cm"), "{c}");
         let tm = text_matrices(&c);
         assert!(approx(tm[0][5], 30.0) && approx(tm[1][5], 70.0), "{tm:?}");
     }
@@ -1320,8 +1406,9 @@ mod tests {
             o.char_gap = 5;
         })));
         assert_eq!(tm.len(), 3);
+        // One line height apart: the gap does not apply (Labelary).
         for (i, m) in tm.iter().enumerate() {
-            assert!(approx(m[4], 50.0) && approx(m[5], 90.0 + 45.0 * i as f32), "{tm:?}");
+            assert!(approx(m[4], 50.0) && approx(m[5], 90.0 + 40.0 * i as f32), "{tm:?}");
         }
     }
 
@@ -1345,8 +1432,15 @@ mod tests {
             ctx.content.finish().to_vec()
         };
         let reversed = pair(field("AB", |o| o.direction = FieldDirection::Reverse));
-        assert_eq!(reversed, pair(field("BA", |_| {})));
-        assert_ne!(reversed, pair(field("AB", |_| {})));
+        let ba = pair(field("BA", |_| {}));
+        let glyphs = |c: &[u8]| {
+            String::from_utf8_lossy(c).lines().filter(|l| l.ends_with("Tj")).map(str::to_owned).collect::<Vec<_>>()
+        };
+        assert_eq!(glyphs(&reversed), glyphs(&ba));
+        assert_ne!(glyphs(&reversed), glyphs(&pair(field("AB", |_| {}))));
+        // The first character starts at the origin; the rest runs back from it.
+        let tm = text_matrices(&content(&field("AB", |o| o.direction = FieldDirection::Reverse)));
+        assert!(approx(tm[0][4], 50.0 - (em("BA") - em("A"))), "{tm:?}");
     }
 
     fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -1504,16 +1598,16 @@ mod tests {
             let tj: Vec<String> = c.lines().filter(|l| l.ends_with("Tj")).map(str::to_owned).collect();
             tj[0] == tj[1]
         };
-        assert!(shown(FontName::FontB) && shown(FontName::FontH));
-        assert!(!shown(FontName::FontD));
+        assert!(shown(FontName::FontB));
+        assert!(!shown(FontName::FontD) && !shown(FontName::FontH));
     }
 
     #[test]
     fn fonts_p_to_v_are_fixed_size_font_zero() {
         let tm = text_matrices(&content(&with_font("Hi", FontName::FontP, 0, 0)));
-        assert!(approx(tm[0][0], 18.0) && approx(tm[0][3], -20.0), "{tm:?}");
+        assert!(approx(tm[0][0], 18.0 * 0.945) && approx(tm[0][3], -20.0 * 0.82), "{tm:?}");
         let tm = text_matrices(&content(&with_font("Hi", FontName::FontQ, 56, 56)));
-        assert!(approx(tm[0][0], 48.0) && approx(tm[0][3], -56.0), "{tm:?}");
+        assert!(approx(tm[0][0], 48.0 * 0.945) && approx(tm[0][3], -56.0 * 0.82), "{tm:?}");
     }
 
     #[test]

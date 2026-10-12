@@ -579,6 +579,8 @@ pub enum FontName {
     FontT,
     FontU,
     FontV,
+    /// The ^GS symbol font: a 24 x 24 dot matrix magnified in whole steps.
+    Symbol,
     Custom(char),
 }
 

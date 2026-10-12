@@ -920,12 +920,19 @@ fn test_units_follow_printer_resolution() {
         Command::FieldOrigin { x, y, .. } => (x, y),
         ref other => panic!("{other:?}"),
     };
-    // Inches are 25.4 mm: 152.4, 203.2, 304.8 and 609.6 dots.
-    for (dpmm, mm, inch, half_inch) in [(6, (60, 15), 152, 76), (8, (80, 20), 203, 102), (12, (120, 30), 305, 152), (24, (240, 60), 610, 305)] {
+    // Inches are the nominal 150, 200, 300 and 600 dpi (Labelary), not 25.4 mm.
+    for (dpmm, mm, inch, half_inch) in [(6, (60, 15), 150, 75), (8, (80, 20), 200, 100), (12, (120, 30), 300, 150), (24, (240, 60), 600, 300)] {
         assert_eq!(origin("^MUM^FO10,2.5", dpmm), mm, "{dpmm}");
         assert_eq!(origin("^MUI^FO1,0.5", dpmm), (inch, half_inch), "{dpmm}");
         assert_eq!(origin("^MUD^FO10,20", dpmm), (10, 20), "{dpmm}");
     }
+    // ^BY's module width is a length too.
+    let module = |zpl: &str| match Parser::new(zpl).parse().unwrap()[1] {
+        Command::BarcodeFieldDefaults { module_width, .. } => module_width,
+        ref other => panic!("{other:?}"),
+    };
+    assert_eq!(module("^MUM^BY0.25"), 2);
+    assert_eq!(module("^MUD^BY3"), 3);
     // Parser::new is 8 dots/mm.
     assert_eq!(origin("^MUM^FO10,1", 8), match Parser::new("^MUM^FO10,1").parse().unwrap()[1] {
         Command::FieldOrigin { x, y, .. } => (x, y),

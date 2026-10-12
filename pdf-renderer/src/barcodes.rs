@@ -97,7 +97,21 @@ pub(crate) fn fill_rects(ctx: &mut Ctx, matrix: [f32; 6], rects: &[(f32, f32, f3
     ctx.content.restore_state();
 }
 
-/// Interpretation line layout for a Code 128 symbol (all in dots).
+/// Space between the bars and an interpretation line (dots, matches Labelary): below them a
+/// fixed 6 (EAN/UPC: twice the module, their guard bars reaching into the digits), above
+/// them 8 plus twice the module.
+fn line_gap(module: u32, above: bool, guards: bool) -> f32 {
+    match (above, guards) {
+        (true, _) => (8 + 2 * module) as f32,
+        (false, true) => (2 * module) as f32,
+        (false, false) => 6.0,
+    }
+}
+
+/// How far EAN/UPC guard bars reach below the others when the digits are printed above.
+const GUARD_EXTENSION_ABOVE: u32 = 13;
+
+/// Interpretation line layout for a 1D symbol (all in dots).
 struct Interpretation {
     char_advance: f32,
     digit_height: f32,
@@ -108,7 +122,8 @@ struct Interpretation {
 
 fn interpretation(bar_width: u32) -> Interpretation {
     let font = FontId::DejaVuMono;
-    // Same constants as the PNG renderer (Labelary-compatible).
+    // Same constants as the PNG renderer (Labelary-compatible): no larger than at module 10.
+    let bar_width = bar_width.min(10);
     let char_advance = bar_width as f32 * 143.0 / 24.0;
     let digit_height = (bar_width * 7) as f32;
 
@@ -122,6 +137,14 @@ fn interpretation(bar_width: u32) -> Interpretation {
     Interpretation { char_advance, digit_height, size_x, size_y, descent: descent_em * size_y }
 }
 
+impl Interpretation {
+    /// Height of the text and its gap to the bars, in whole dots.
+    fn area(&self, gap: f32, above: bool) -> u32 {
+        let below = if above { 0.0 } else { self.descent };
+        (gap + self.digit_height + below).ceil() as u32
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_code128(
     ctx: &mut Ctx, origin: (u32, u32, bool), data: &str, orientation: Orientation, height: u32,
@@ -133,11 +156,11 @@ fn render_code128(
     let barcode_width: u32 = widths.iter().map(|&w| w as u32 * bar_width).sum();
 
     let ip = interpretation(bar_width);
-    let text_gap = (bar_width * 2) as f32;
+    let text_gap = line_gap(bar_width, line_above, false);
     let show_text = print_line && !code.text.is_empty();
     let n_chars = code.text.chars().count() as f32;
     let text_width = if show_text { (ip.char_advance * n_chars).ceil() as u32 } else { 0 };
-    let text_area = if show_text { (text_gap + ip.digit_height + ip.descent).ceil() as u32 } else { 0 };
+    let text_area = if show_text { ip.area(text_gap, line_above) } else { 0 };
 
     let pad = text_width.saturating_sub(barcode_width) / 2;
     let (bars_y, baseline) = if line_above {
@@ -225,13 +248,15 @@ fn render_linear(
     let width = symbol.width_dots(module, ratio);
 
     let ip = interpretation(module);
-    let text_gap = (module * 2) as f32;
+    // The UPC/EAN add-on keeps its digits close above the bars.
+    let add_on = matches!(kind, LinearKind::UpcEanExtension);
+    let text_gap = if add_on { (2 * module) as f32 } else { line_gap(module, line_above, symbol.has_guards) };
     let show_text = print_line && !symbol.text.is_empty();
-    let text_area = if show_text { (text_gap + ip.digit_height + ip.descent).ceil() as u32 } else { 0 };
-    let guard_ext = if symbol.has_guards && show_text && !line_above {
-        (text_gap + ip.digit_height / 2.0).round() as u32
-    } else {
-        0
+    let text_area = if show_text { ip.area(text_gap, line_above && !add_on) } else { 0 };
+    let guard_ext = match (symbol.has_guards && show_text, line_above) {
+        (false, _) => 0,
+        (true, true) => GUARD_EXTENSION_ABOVE,
+        (true, false) => (text_gap + ip.digit_height / 2.0).round() as u32,
     };
     let bars_y = if line_above { text_area } else { 0 };
 
@@ -253,11 +278,18 @@ fn render_linear(
         ctx.content.save_state();
         ctx.content.transform(matrix);
         ctx.content.set_fill_gray(ctx.ink);
-        for seg in &symbol.text {
-            let (start, end) = symbol.text_extent_dots(seg, module, ratio);
-            let text_w = ip.char_advance * seg.text.chars().count() as f32;
-            let text_x = (start + end - text_w) / 2.0;
-            text::show_text(ctx, FontId::DejaVuMono, &seg.text, text_x, baseline, ip.size_x, ip.size_y);
+        if line_above && symbol.has_guards {
+            // Above the bars EAN/UPC digits are one line centred over the symbol.
+            let text: String = symbol.text.iter().map(|seg| seg.text.as_str()).collect();
+            let text_x = (width as f32 - ip.char_advance * text.chars().count() as f32) / 2.0;
+            text::show_text(ctx, FontId::DejaVuMono, &text, text_x, baseline, ip.size_x, ip.size_y);
+        } else {
+            for seg in &symbol.text {
+                let (start, end) = symbol.text_extent_dots(seg, module, ratio);
+                let text_w = ip.char_advance * seg.text.chars().count() as f32;
+                let text_x = (start + end - text_w) / 2.0;
+                text::show_text(ctx, FontId::DejaVuMono, &seg.text, text_x, baseline, ip.size_x, ip.size_y);
+            }
         }
         ctx.content.restore_state();
     }

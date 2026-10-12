@@ -66,7 +66,8 @@ impl<'a> Parser<'a> {
         let format_scale = desired as f32 / base as f32 * if self.half_density.get() { 2.0 } else { 1.0 };
         let per_mm = self.dpmm as f32 / format_scale;
         self.unit_scale.set(match self.units.get() {
-            'I' => per_mm * 25.4,
+            // Nominal dpi: 8 dots/mm is "203 dpi" but Labelary converts 200 dots per inch.
+            'I' => per_mm * 25.0,
             'M' => per_mm,
             _ => 1.0,
         });
@@ -643,11 +644,11 @@ impl<'a> Parser<'a> {
         params: &[&str],
         span: Span,
     ) -> Result<Command, ParseError> {
-        // ^BYw,r,h
+        // ^BYw,r,h; ^MU converts the module width too (Labelary).
         let module_width = if params.is_empty() || params[0].is_empty() {
             2
         } else {
-            self.parse_u32(params[0], span)?
+            self.dim(params[0], span)?
         };
 
         let wide_bar_ratio = if params.len() < 2 || params[1].is_empty() {

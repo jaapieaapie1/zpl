@@ -248,6 +248,9 @@ pub struct TextBlock {
 /// Printer resolution used unless [`StateManager::set_dpmm`] says otherwise: 8 dots/mm.
 pub use zpl_parser::DEFAULT_DPMM;
 
+/// Text height (dots) when neither ^A nor ^CF gave a size: the power-up ^CF value.
+const DEFAULT_FONT_HEIGHT: u32 = 9;
+
 /// The printhead resolutions Zebra makes, in dots per millimetre.
 pub const DPMM_VALUES: [u32; 4] = [6, 8, 12, 24];
 
@@ -412,6 +415,12 @@ pub struct StateManager {
     default_orientation: Orientation,
     default_justification: Justification,
 
+    /// ^CF default font and the sizes it gave (`None`: not given). ^A overrides it for one
+    /// field only, taking any size it leaves out from here (Labelary).
+    default_font: FontName,
+    default_font_height: Option<u32>,
+    default_font_width: Option<u32>,
+    /// Font of the next text field: ^A, else the ^CF default.
     current_font: FontName,
     /// ^A orientation; `None` follows the ^FW default in force when the field is printed.
     current_font_orientation: Option<Orientation>,
@@ -582,10 +591,13 @@ impl StateManager {
             default_orientation: Orientation::Normal,
             default_justification: Justification::Left,
 
+            default_font: FontName::FontA,
+            default_font_height: None,
+            default_font_width: None,
             current_font: FontName::FontA,
             current_font_orientation: None,
-            current_font_height: 9,
-            current_font_width: 5,
+            current_font_height: DEFAULT_FONT_HEIGHT,
+            current_font_width: 0,
             current_custom_font: None,
             text_layout: TextLayout::default(),
 
@@ -727,6 +739,16 @@ impl StateManager {
         if self.field_typeset { (x, y.saturating_sub(height)) } else { (x, y) }
     }
 
+    /// [`Self::graphic_origin`] of a graphic `width` dots wide: right-justified (^FO / ^FT z=1)
+    /// it ends at the origin.
+    fn sized_graphic_origin(&self, width: u32, height: u32) -> (u32, u32) {
+        let (x, y) = self.graphic_origin(height);
+        match self.field_justification {
+            Justification::Right => (x.saturating_sub(width), y),
+            _ => (x, y),
+        }
+    }
+
     fn emit(&self, out: &mut Vec<DrawInstruction>, instruction: DrawInstruction) {
         if self.field.reverse || self.label_reverse {
             out.push(DrawInstruction::Reverse(Box::new(instruction)));
@@ -735,21 +757,26 @@ impl StateManager {
         }
     }
 
-    /// 0 means "not given". Height only: scalable fonts are as wide as tall, bitmap fonts
-    /// magnify both ways by the height's factor. Width only (height 0): scalable fonts are as
-    /// tall as wide, bitmap fonts magnify both ways by the width's factor (^AF,,26 is 2x2).
+    /// Sizes the next text field: what ^A (or ^CF) gave, the rest from ^CF. 0 means "not
+    /// given": height only makes scalable fonts as wide as tall and bitmap fonts magnify both
+    /// ways by the height's factor; width only likewise (^AF,,26 is 2x2). Neither, here or in
+    /// ^CF, is the power-up 9 dots high.
     fn set_font_size(&mut self, height: Option<u32>, width: Option<u32>) {
-        match (height, width) {
-            (Some(h), w) => {
-                self.current_font_height = h;
-                self.current_font_width = w.unwrap_or(0);
-            }
-            (None, Some(w)) => {
-                self.current_font_height = 0;
-                self.current_font_width = w;
-            }
-            (None, None) => {}
-        }
+        let height = height.filter(|&h| h > 0).or(self.default_font_height);
+        let width = width.filter(|&w| w > 0).or(self.default_font_width);
+        self.current_font_height = match (height, width) {
+            (None, None) => DEFAULT_FONT_HEIGHT,
+            _ => height.unwrap_or(0),
+        };
+        self.current_font_width = width.unwrap_or(0);
+    }
+
+    /// Back to the ^CF font after a field: ^A selects the font of one field only.
+    fn restore_default_font(&mut self) {
+        self.current_font = self.default_font;
+        self.current_custom_font = self.aliased_font(self.default_font);
+        self.current_font_orientation = None;
+        self.set_font_size(None, None);
     }
 
     fn process_command(&mut self, command: Command, out: &mut Vec<DrawInstruction>) {
@@ -809,10 +836,12 @@ impl StateManager {
             }
 
             Command::ChangeFont { font, height, width } => {
-                self.current_font = font;
-                self.current_font_orientation = None;
-                self.current_custom_font = self.aliased_font(font);
-                self.set_font_size(height, width);
+                // ^CF without sizes goes back to the power-up size rather than keeping the
+                // previous ^CF's (Labelary).
+                self.default_font = font;
+                self.default_font_height = height.filter(|&h| h > 0);
+                self.default_font_width = width.filter(|&w| w > 0);
+                self.restore_default_font();
             }
 
             Command::PrintWidth { width } => self.print_width = Some(width),
@@ -997,6 +1026,7 @@ impl StateManager {
             Command::FieldSeperator => {
                 let field = std::mem::take(&mut self.field);
                 self.finish_field(field, out);
+                self.restore_default_font();
             }
 
             Command::GraphicSymbol { orientation, height, width } => {
@@ -1075,17 +1105,17 @@ impl StateManager {
             }
 
             Command::GraphicBox { width, height, thickness, line_color, rounding } => {
-                let (x, y) = self.graphic_origin(height.max(thickness));
+                let (x, y) = self.sized_graphic_origin(width.max(thickness), height.max(thickness));
                 self.emit(out, DrawInstruction::DrawBox { x, y, width, height, thickness, color: line_color, rounding });
             }
 
             Command::GraphicCircle { diameter, thickness, color } => {
-                let (x, y) = self.graphic_origin(diameter);
+                let (x, y) = self.sized_graphic_origin(diameter, diameter);
                 self.emit(out, DrawInstruction::DrawCircle { x, y, diameter, thickness, color });
             }
 
             Command::GraphicEllipse { width, height, thickness, color } => {
-                let (x, y) = self.graphic_origin(height);
+                let (x, y) = self.sized_graphic_origin(width, height);
                 self.emit(out, DrawInstruction::DrawEllipse { x, y, width, height, thickness, color });
             }
 
@@ -1126,6 +1156,9 @@ impl StateManager {
 
     /// The downloaded font a ^CW alias maps `font` to, if any.
     fn aliased_font(&self, font: FontName) -> Option<Arc<Vec<u8>>> {
+        if self.font_aliases.is_empty() {
+            return None;
+        }
         let letter = match font {
             FontName::Custom(c) => c,
             other => format!("{other:?}").chars().last()?,
@@ -1139,7 +1172,7 @@ impl StateManager {
         }
         let (mx, my) = (mx.max(1), my.max(1));
         let rows = data.len().div_ceil(bytes_per_row as usize) as u32;
-        let (x, y) = self.graphic_origin(rows * my);
+        let (x, y) = self.sized_graphic_origin(bytes_per_row * 8 * mx, rows * my);
         self.emit(
             out,
             DrawInstruction::DrawGraphicField { x, y, bytes_per_row, data, magnification_x: mx, magnification_y: my },
@@ -1195,9 +1228,9 @@ impl StateManager {
             FieldMode::GraphicSymbol { orientation, height, width } => DrawInstruction::DrawText {
                 x,
                 y,
-                text: data.chars().filter_map(graphic_symbol).collect(),
-                // The symbols are scalable outlines, not part of a bitmap font.
-                font: FontName::Font0,
+                // One symbol per field: Labelary ignores the data after the first character.
+                text: data.chars().next().and_then(graphic_symbol).into_iter().collect(),
+                font: FontName::Symbol,
                 height,
                 width,
                 orientation,
@@ -1656,9 +1689,52 @@ mod tests {
         assert_eq!(page_texts(&pages), [["a"], ["a"], ["b"]]);
     }
 
+    /// (font, height, width) of each text field.
+    fn fonts(ins: &[DrawInstruction]) -> Vec<(FontName, u32, u32)> {
+        ins.iter()
+            .filter_map(|i| match i {
+                DrawInstruction::DrawText { font, height, width, .. } => Some((*font, *height, *width)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn font_command_applies_to_one_field() {
+        // ^A sets the font of the next field only; sizes it leaves out come from ^CF.
+        let ins = run("^XA^CF0,40^FO1,1^ADN,54,30^FDa^FS^FO1,1^FDb^FS^FO1,1^ADN^FDc^FS^FO1,1^A0N,,80^FDd^FS^XZ");
+        use FontName::*;
+        assert_eq!(fonts(&ins), [(FontD, 54, 30), (Font0, 40, 0), (FontD, 40, 0), (Font0, 40, 80)]);
+    }
+
+    #[test]
+    fn change_font_without_size_resets_it() {
+        use FontName::*;
+        // Power-up: 9 dots high, proportional; a size given alone keeps the other proportional.
+        assert_eq!(fonts(&run("^XA^FO1,1^A0N,60^FDa^FS^FO1,1^FDb^FS^XZ")), [(Font0, 60, 0), (FontA, 9, 0)]);
+        // ^CF with a font only goes back to the power-up size.
+        assert_eq!(fonts(&run("^XA^CF0,40^CFD^FO1,1^FDa^FS^XZ")), [(FontD, 9, 0)]);
+        // A width-only ^CF sizes ^A fields that only give a height.
+        assert_eq!(fonts(&run("^XA^CF0,,30^FO1,1^ADN,40^FDa^FS^XZ")), [(FontD, 40, 30)]);
+    }
+
+    #[test]
+    fn right_justified_graphics_end_at_the_origin() {
+        let ins = run("^XA^FO400,10,1^GB100,50,3^FS^FO400,100,1^GC40,2^FS^FO400,200^GB10,10,1^FS^XZ");
+        let xs: Vec<u32> = ins
+            .iter()
+            .map(|i| match i {
+                DrawInstruction::DrawBox { x, .. } | DrawInstruction::DrawCircle { x, .. } => *x,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(xs, [300, 360, 400]);
+    }
+
     #[test]
     fn graphic_symbol() {
+        // Only the first character picks a symbol (Labelary).
         let ins = run("^XA^FO1,1^GSN,30,30^FDAC^FS^XZ");
-        assert_eq!(texts(&ins), ["\u{00AE}\u{2122}"]);
+        assert_eq!(texts(&ins), ["\u{00AE}"]);
     }
 }

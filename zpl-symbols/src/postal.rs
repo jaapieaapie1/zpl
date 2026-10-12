@@ -10,9 +10,8 @@
 //! `f = Y` prints the interpretation line ([`PostalSymbol::hri`]) and `g = Y` puts it above
 //! the symbol instead of below.
 //!
-//! Geometry: every bar is a [`PostalBar`] whose `top`/`bottom` are fractions of `h`. Bars are
-//! all equally wide and laid out at a fixed pitch; see [`PostalSymbol::bar_width`] and
-//! [`PostalSymbol::pitch`].
+//! Geometry: every bar is a [`PostalBar`] whose rows follow from `h` ([`PostalBar::rows`]).
+//! Bars are one `^BY` module wide and laid out at a fixed pitch ([`PostalSymbol::pitch`]).
 
 use crate::{PostalBar, SymbolError};
 
@@ -45,53 +44,40 @@ impl PostalKind {
 pub struct PostalSymbol {
     /// Bars from left to right.
     pub bars: Vec<PostalBar>,
-    /// Width of one bar, in bar-width units: always `1.0`. The renderer draws each bar
-    /// `^BY` module width dots wide.
-    pub bar_width: f32,
-    /// Distance from the left edge of one bar to the left edge of the next, in bar widths.
-    /// USPS fixes the physical layout (bar width 0.020", 22 bars per inch, i.e. pitch
-    /// 0.04545") for all three symbologies, so this is `(1/22) / 0.020 = 2.2727`; a renderer
-    /// with module width `w` dots places bar `i` at `x = round(i * pitch * w)` and draws it
-    /// `w` dots wide (at 203 dpi, `w = 4` gives 0.020" bars and 0.045" pitch).
-    pub pitch: f32,
-    /// Interpretation line text (the digits as encoded, without spaces or separators;
-    /// POSTNET/PLANET include the computed check digit).
+    /// Interpretation line text as Labelary prints it: POSTNET/PLANET the data digits
+    /// without the check digit, IMb the fields separated by spaces (barcode ID, service
+    /// type, mailer ID, serial number, then the routing code split 5-4-2).
     pub hri: Option<String>,
 }
 
-/// USPS nominal bar pitch (22 bars/inch) divided by the nominal bar width (0.020").
-const PITCH: f32 = (1.0 / 22.0) / 0.020;
+impl PostalSymbol {
+    /// Distance in dots from one bar's left edge to the next for bars `module` dots wide:
+    /// `floor(2.5 * module)` (Labelary; USPS nominally has 0.020" bars at 22 per inch).
+    pub fn pitch(module: u32) -> u32 {
+        module.max(1) * 5 / 2
+    }
 
-/// POSTNET/PLANET (DMM 708.4): full bar 0.125", half bar 0.050" — the half bar is 0.4 of the
-/// full bar, bottom aligned.
-const POSTNET_FULL: PostalBar = PostalBar {
-    top: 0.0,
-    bottom: 1.0,
-};
-const POSTNET_HALF: PostalBar = PostalBar {
-    top: 0.6,
-    bottom: 1.0,
-};
+    /// Left edge of bar `i` in dots.
+    pub fn bar_x(i: usize, module: u32) -> u32 {
+        i as u32 * Self::pitch(module)
+    }
 
-/// IMb (USPS-B-3200 §2.3.1, mid-tolerance values): overall height 0.145" (0.125–0.165"),
-/// tracker 0.048" (0.039–0.057") centred, ascender/descender extending 0.0485" beyond it.
-const IMB_EXT: f32 = 0.0485 / 0.145;
-const IMB_FULL: PostalBar = PostalBar {
-    top: 0.0,
-    bottom: 1.0,
-};
-const IMB_ASCENDER: PostalBar = PostalBar {
-    top: 0.0,
-    bottom: 1.0 - IMB_EXT,
-};
-const IMB_DESCENDER: PostalBar = PostalBar {
-    top: IMB_EXT,
-    bottom: 1.0,
-};
-const IMB_TRACKER: PostalBar = PostalBar {
-    top: IMB_EXT,
-    bottom: 1.0 - IMB_EXT,
-};
+    /// Width in dots of the bars drawn `module` dots wide.
+    pub fn width(&self, module: u32) -> u32 {
+        Self::bar_x(self.bars.len().saturating_sub(1), module) + module.max(1)
+    }
+}
+
+/// POSTNET/PLANET (DMM 708.4): full bar 0.125", half bar 0.050" (0.4 of it), bottom aligned.
+const POSTNET_FULL: PostalBar = PostalBar::Full;
+const POSTNET_HALF: PostalBar = PostalBar::Half;
+
+/// IMb (USPS-B-3200 §2.3.1): tracker centred, ascender/descender extending beyond it; the
+/// proportions are Labelary's thirds (see [`PostalBar::rows`]).
+const IMB_FULL: PostalBar = PostalBar::Full;
+const IMB_ASCENDER: PostalBar = PostalBar::Ascender;
+const IMB_DESCENDER: PostalBar = PostalBar::Descender;
+const IMB_TRACKER: PostalBar = PostalBar::Tracker;
 
 pub fn encode(kind: PostalKind, data: &str) -> Result<PostalSymbol, SymbolError> {
     match kind {
@@ -138,6 +124,7 @@ fn encode_postnet_planet(
     if !lengths.contains(&d.len()) {
         return Err(SymbolError::InvalidLength(d.len()));
     }
+    let hri = d.iter().map(|&x| char::from(b'0' + x)).collect();
     let sum: u32 = d.iter().map(|&x| x as u32).sum();
     d.push(((10 - sum % 10) % 10) as u8);
 
@@ -153,12 +140,7 @@ fn encode_postnet_planet(
         }
     }
     bars.push(POSTNET_FULL);
-    Ok(PostalSymbol {
-        bars,
-        bar_width: 1.0,
-        pitch: PITCH,
-        hri: Some(d.iter().map(|&x| char::from(b'0' + x)).collect()),
-    })
+    Ok(PostalSymbol { bars, hri: Some(hri) })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -330,17 +312,14 @@ fn encode_imb(data: &str) -> Result<PostalSymbol, SymbolError> {
             _ => IMB_FULL,
         })
         .collect();
-    let hri = tracking
-        .iter()
-        .chain(&routing)
-        .map(|&x| char::from(b'0' + x))
-        .collect();
-    Ok(PostalSymbol {
-        bars,
-        bar_width: 1.0,
-        pitch: PITCH,
-        hri: Some(hri),
-    })
+    let mut hri = String::with_capacity(37);
+    for (i, &x) in tracking.iter().chain(&routing).enumerate() {
+        if matches!(i, 2 | 5 | 11 | 20 | 25 | 29) {
+            hri.push(' ');
+        }
+        hri.push(char::from(b'0' + x));
+    }
+    Ok(PostalSymbol { bars, hri: Some(hri) })
 }
 
 #[cfg(test)]
@@ -422,15 +401,21 @@ mod tests {
         assert!(encode(PostalKind::UspsImb, "0123456709498765432X").is_err());
         let s = encode(PostalKind::UspsImb, &format!("{t}-01234")).unwrap();
         assert_eq!(s.bars.len(), 65);
-        assert_eq!(s.hri.as_deref(), Some("0123456709498765432101234"));
-        assert!((IMB_TRACKER.bottom - IMB_TRACKER.top - 0.048 / 0.145).abs() < 1e-4);
+        assert_eq!(s.hri.as_deref(), Some("01 234 567094 987654321 01234"));
+        let s = encode(PostalKind::UspsImb, &format!("{t}01234567891")).unwrap();
+        assert_eq!(s.hri.as_deref(), Some("01 234 567094 987654321 01234 5678 91"));
+        // Labelary at h = 40: ascender 0..26, tracker 14..27, descender 14..40.
+        assert_eq!(IMB_ASCENDER.rows(40), (0, 26));
+        assert_eq!(IMB_TRACKER.rows(40), (14, 27));
+        assert_eq!(IMB_DESCENDER.rows(40), (14, 40));
+        assert_eq!(IMB_TRACKER.rows(57), (19, 37));
     }
 
     #[test]
     fn postal_postnet() {
         // 12345 -> sum 15 -> check 5. Frame, 1 2 3 4 5 5, frame.
         let s = encode(PostalKind::Postnet, "12345").unwrap();
-        assert_eq!(s.hri.as_deref(), Some("123455"));
+        assert_eq!(s.hri.as_deref(), Some("12345"));
         assert_eq!(
             postnet_pattern(&s),
             format!(
@@ -446,8 +431,10 @@ mod tests {
         // DMM example: ZIP+4+DPC 55555-1237-12 -> check digit 9 (sum 41).
         let s = encode(PostalKind::Postnet, "55555123712").unwrap();
         assert_eq!(s.bars.len(), 62);
-        assert_eq!(s.hri.as_deref(), Some("555551237129"));
-        assert!((POSTNET_HALF.bottom - POSTNET_HALF.top - 0.4).abs() < 1e-6);
+        assert_eq!(s.hri.as_deref(), Some("55555123712"));
+        assert!(postnet_pattern(&s).ends_with("101001")); // check digit 9 = 10100, frame
+        assert_eq!(POSTNET_HALF.rows(57), (35, 57));
+        assert_eq!((PostalSymbol::pitch(2), PostalSymbol::pitch(3), s.width(2)), (5, 7, 307));
         assert!(encode(PostalKind::Postnet, "1234").is_err());
         assert!(encode(PostalKind::Postnet, "1234A").is_err());
     }
@@ -456,7 +443,7 @@ mod tests {
     fn postal_planet() {
         let s = encode(PostalKind::Planet, "40123456789").unwrap();
         // sum 49 -> check 1
-        assert_eq!(s.hri.as_deref(), Some("401234567891"));
+        assert_eq!(s.hri.as_deref(), Some("40123456789"));
         assert_eq!(s.bars.len(), 62);
         let p = postnet_pattern(&s);
         // Frame, 4 = inverse of 01001 = 10110, 0 = 00111.

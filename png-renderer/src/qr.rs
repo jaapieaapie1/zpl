@@ -14,9 +14,11 @@ use zpl_parser::command::Orientation;
 /// Top-left corner of a `size` x `size` module QR symbol of `module` dot modules. The
 /// symbol is never turned, but Labelary keeps a 10 dot band above it in its own frame and
 /// turns that: ^FO normal moves the symbol down by it, ^FO B (270) right. ^FT puts the bottom
-/// edge 3 modules above the origin, whatever the orientation.
-pub fn top_left(x: u32, y: u32, size: u32, module: u32, orientation: Orientation, bottom: bool) -> (u32, u32) {
+/// edge 3 modules above the origin, whatever the orientation; right justified (z=1) its
+/// right edge is 3 modules left of it.
+pub fn top_left(x: u32, y: u32, size: u32, module: u32, orientation: Orientation, bottom: bool, right: bool) -> (u32, u32) {
     const BAND: u32 = 10;
+    let x = if right { x.saturating_sub((size + 3) * module) } else { x };
     match (bottom, orientation) {
         (true, _) => (x, y.saturating_sub((size + 3) * module)),
         (false, Orientation::Normal) => (x, y + BAND),
@@ -154,12 +156,14 @@ mod tests {
 
     #[test]
     fn placement_follows_labelary() {
-        let at = |o, bottom| top_left(100, 200, 21, 4, o, bottom);
+        let at = |o, bottom| top_left(100, 200, 21, 4, o, bottom, false);
         assert_eq!(at(Orientation::Normal, false), (100, 210));
         assert_eq!(at(Orientation::Rotated90, false), (100, 200));
         assert_eq!(at(Orientation::Rotated180, false), (100, 200));
         assert_eq!(at(Orientation::Rotated270, false), (110, 200));
         assert_eq!(at(Orientation::Rotated90, true), (100, 200 - 96));
+        // Right justified: the right edge 3 modules left of x.
+        assert_eq!(top_left(400, 200, 21, 4, Orientation::Normal, true, true), (400 - 96, 200 - 96));
     }
 
     #[test]

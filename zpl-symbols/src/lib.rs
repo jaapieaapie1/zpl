@@ -42,13 +42,36 @@ pub enum RowHeight {
     Bar { weight: u32 },
 }
 
-/// One bar of a height-modulated (postal) symbol. `top` and `bottom` are fractions of the
-/// full bar height measured from the top (0.0 = top, 1.0 = bottom), so a full bar is
-/// `0.0..1.0`, a POSTNET short bar `0.6..1.0` and an IMb tracker `0.375..0.625`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PostalBar {
-    pub top: f32,
-    pub bottom: f32,
+/// One bar of a height-modulated (postal) symbol; [`PostalBar::rows`] gives its extent in
+/// dots for a full bar height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostalBar {
+    /// Full height (POSTNET/PLANET tall bar, IMb full bar).
+    Full,
+    /// POSTNET/PLANET short bar, bottom aligned.
+    Half,
+    /// IMb tracker plus ascender.
+    Ascender,
+    /// IMb tracker plus descender.
+    Descender,
+    /// IMb tracker only.
+    Tracker,
+}
+
+impl PostalBar {
+    /// `(top, bottom)` rows of the bar for a full bar height of `h` dots, rounded as
+    /// Labelary does: a short bar is `floor(2h/5)` tall; IMb ascenders and descenders are
+    /// `floor(2h/3)` tall and the tracker `floor((h-1)/3)` starts where the descender does.
+    pub fn rows(self, h: u32) -> (u32, u32) {
+        let two_thirds = 2 * h / 3;
+        match self {
+            PostalBar::Full => (0, h),
+            PostalBar::Half => (h - 2 * h / 5, h),
+            PostalBar::Ascender => (0, two_thirds),
+            PostalBar::Descender => (h - two_thirds, h),
+            PostalBar::Tracker => (h - two_thirds, h - two_thirds + h.saturating_sub(1) / 3),
+        }
+    }
 }
 
 /// Common error for the encoders that don't define their own.

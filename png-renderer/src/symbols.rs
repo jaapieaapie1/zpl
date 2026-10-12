@@ -5,16 +5,16 @@
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use image::{ImageBuffer, RgbImage};
 use imageproc::drawing;
-use zpl_parser::command::{Code49Interpretation, Orientation, PostalKind};
+use zpl_parser::command::{Code49Interpretation, PostalKind};
 use zpl_state_manager::{DrawInstruction, SymbolSpec};
 use zpl_symbols::{RowHeight, Stacked, composite, databar, maxicode, micropdf, postal, stacked};
 
-use crate::{BLACK, PngRenderer, WHITE};
+use crate::{BLACK, Interpretation, PngRenderer, WHITE, line_gap};
 
 impl PngRenderer {
     pub(crate) fn render_symbol(&self, image: &mut RgbImage, instruction: &DrawInstruction) {
-        let DrawInstruction::DrawSymbol { x, y, data, orientation, bottom, spec } = instruction else { return };
-        let at = Place { x: *x, y: *y, orientation: *orientation, bottom: *bottom };
+        let DrawInstruction::DrawSymbol { x, y, data, orientation, bottom, right, spec } = instruction else { return };
+        let at = (*x, *y, *bottom, *right);
         let frame = match *spec {
             SymbolSpec::MaxiCode { mode, symbol_number, total_symbols } => {
                 maxicode::encode(data, mode, symbol_number, total_symbols).ok().map(|s| maxicode_frame(&s, self.dpmm))
@@ -67,25 +67,21 @@ impl PngRenderer {
                     PostalKind::Planet => postal::PostalKind::Planet,
                     PostalKind::UspsImb => postal::PostalKind::UspsImb,
                 };
-                postal::encode(kind, data).ok().map(|symbol| {
-                    postal_frame(&symbol, module_width, height, print_interpretation_line.then_some(print_above))
-                })
+                let text = print_interpretation_line.then_some(print_above);
+                if let Ok(symbol) = postal::encode(kind, data) {
+                    // Placed by the bars, like 1D barcodes.
+                    let (frame, bars) = postal_frame(&symbol, kind, module_width, height, text);
+                    self.place_bars(image, &frame, at, *orientation, bars);
+                }
+                return;
             }
         };
         if let Some(frame) = frame {
             // ^FT: the bottom-left corner of the unrotated frame, rotated with it.
             let bars = (0, 0, frame.width(), frame.height());
-            self.place_bars(image, &frame, at.x, at.y, at.bottom, at.orientation, bars);
+            self.place_bars(image, &frame, at, *orientation, bars);
         }
     }
-}
-
-#[derive(Clone, Copy)]
-struct Place {
-    x: u32,
-    y: u32,
-    orientation: Orientation,
-    bottom: bool,
 }
 
 /// ^BR types 1-6 are plain DataBar unless the data has a `|` composite separator; 7-12 are
@@ -260,26 +256,47 @@ fn tlc39_frame(
     img
 }
 
-/// Height-modulated bars at the USPS pitch; optional interpretation line above (`Some(true)`)
-/// or below.
-fn postal_frame(symbol: &postal::PostalSymbol, module: u32, height: u32, text: Option<bool>) -> RgbImage {
-    let module = module.max(1) as f32;
-    let bar_w = (symbol.bar_width * module).max(1.0);
-    let pitch = symbol.pitch * module;
-    let size = module * 5.0;
-    let line = if text.is_some() { (size * 1.4).ceil() } else { 0.0 };
-    let top = if text == Some(true) { line } else { 0.0 };
-    let h = height as f32;
-    let width = ((symbol.bars.len().max(1) - 1) as f32 * pitch + bar_w).ceil() as u32;
-    let mut img = blank(width, (h + line) as u32);
+/// Height-modulated bars at the Labelary pitch plus the interpretation line, and the bars'
+/// box in the frame. POSTNET/PLANET digits are the 1D barcode line, above (`Some(true)`) or
+/// below the bars; the IMb line is always below, left aligned in a small fixed-height font
+/// whose digits advance `4w - 0.5` dots and spaces `2w + 1.5` (`w` = module; Labelary).
+fn postal_frame(
+    symbol: &postal::PostalSymbol,
+    kind: postal::PostalKind,
+    module: u32,
+    height: u32,
+    text: Option<bool>,
+) -> (RgbImage, (u32, u32, u32, u32)) {
+    let module = module.max(1);
+    let width = symbol.width(module);
+    let hri = symbol.hri.as_deref().filter(|_| text.is_some()).unwrap_or("");
+    let imb = kind == postal::PostalKind::UspsImb;
+    let above = text == Some(true) && !imb;
+    let (digit, space) = (4.0 * module as f32 - 0.5, 2.0 * module as f32 + 1.5);
+    let ip = if imb { Interpretation::sized(digit, 7.0) } else { Interpretation::new(module) };
+    let gap = line_gap(module, above, false);
+    let area = if hri.is_empty() { 0 } else { ip.area(gap, above) };
+    let top = if above { area } else { 0 };
+    let mut img = blank(width, height + area);
     for (i, bar) in symbol.bars.iter().enumerate() {
-        fill_rect(&mut img, (i as f32 * pitch).round(), top + bar.top * h, bar_w, (bar.bottom - bar.top) * h);
+        let (y0, y1) = bar.rows(height);
+        fill_rect(&mut img, postal::PostalSymbol::bar_x(i, module) as f32, (top + y0) as f32, module as f32, (y1 - y0) as f32);
     }
-    if let (Some(above), Some(hri)) = (text, &symbol.hri) {
-        let baseline = if above { size } else { h + size * 1.2 };
-        centered_text(&mut img, hri, width as f32 / 2.0, baseline, size);
+    if !hri.is_empty() {
+        let baseline = if above { ip.digit_height } else { height as f32 + gap + ip.digit_height };
+        if imb {
+            let mut x = 0.0;
+            for c in hri.chars() {
+                if c != ' ' {
+                    ip.draw(&mut img, c.encode_utf8(&mut [0; 4]), x, baseline);
+                }
+                x += if c == ' ' { space } else { digit };
+            }
+        } else {
+            ip.draw(&mut img, hri, (width as f32 - ip.text_width(hri)) / 2.0, baseline);
+        }
     }
-    img
+    (img, (0, top, width, height))
 }
 
 /// MaxiCode at its fixed physical size on a `dpmm` printhead: pointy-top hexagons plus the
@@ -325,6 +342,7 @@ fn maxicode_frame(symbol: &maxicode::MaxiCode, dpmm: u32) -> RgbImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zpl_parser::command::Orientation;
 
     fn black(image: &RgbImage, x: u32, y: u32) -> bool {
         image.get_pixel(x, y)[0] < 128
@@ -344,7 +362,7 @@ mod tests {
     }
 
     fn symbol(x: u32, y: u32, data: &str, orientation: Orientation, bottom: bool, spec: SymbolSpec) -> DrawInstruction {
-        DrawInstruction::DrawSymbol { x, y, data: data.into(), orientation, bottom, spec }
+        DrawInstruction::DrawSymbol { x, y, data: data.into(), orientation, bottom, right: false, spec }
     }
 
     #[test]
@@ -393,9 +411,9 @@ mod tests {
             kind: PostalKind::Postnet, module_width: 2, height: 40, print_interpretation_line: true, print_above: false,
         };
         let image = PngRenderer::new(400, 100).render(&[symbol(0, 0, "12345", Orientation::Normal, false, spec)]);
-        // First bar is the full-height frame bar; the next starts at round(pitch * 2).
+        // First bar is the full-height frame bar; the next starts at floor(2.5 * 2).
         assert!(black(&image, 0, 1) && black(&image, 1, 39));
-        assert!(!black(&image, 2, 39) && black(&image, 5, 39));
+        assert!(!black(&image, 2, 39) && black(&image, 5, 39) && !black(&image, 5, 23));
         // Interpretation text below the bars.
         assert!((0..400).any(|x| (41..60).any(|y| black(&image, x, y))));
     }

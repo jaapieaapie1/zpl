@@ -1,7 +1,7 @@
 //! `DrawSymbol`: stacked symbols (DataBar, composites, MicroPDF417, Codablock, Code 49, TLC39),
 //! postal codes and MaxiCode.
 
-use crate::barcodes::{bars_placement, fill_rects, runs};
+use crate::barcodes::{bars_placement, fill_rects, interpretation, interpretation_sized, line_gap, runs};
 use crate::text;
 use crate::{Ctx, FontId};
 use zpl_parser::command::{Code49Interpretation, Orientation, PostalKind};
@@ -9,8 +9,8 @@ use zpl_state_manager::{DrawInstruction, SymbolSpec};
 use zpl_symbols::{RowHeight, Stacked, composite, databar, maxicode, micropdf, postal, stacked};
 
 pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
-    let DrawInstruction::DrawSymbol { x, y, data, orientation, bottom, spec } = instruction else { return };
-    let at = Place { x: *x, y: *y, orientation: *orientation, bottom: *bottom };
+    let DrawInstruction::DrawSymbol { x, y, data, orientation, bottom, right, spec } = instruction else { return };
+    let at = Place { x: *x, y: *y, orientation: *orientation, bottom: *bottom, right: *right };
     match *spec {
         SymbolSpec::MaxiCode { mode, symbol_number, total_symbols } => {
             if let Ok(symbol) = maxicode::encode(data, mode, symbol_number, total_symbols) {
@@ -67,7 +67,7 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
             };
             if let Ok(symbol) = postal::encode(kind, data) {
                 let text = print_interpretation_line.then_some(print_above);
-                draw_postal(ctx, &symbol, at, module_width, height, text);
+                draw_postal(ctx, &symbol, kind, at, module_width, height, text);
             }
         }
     }
@@ -83,13 +83,15 @@ struct Place {
     orientation: Orientation,
     /// ^FT: the origin is the frame's bottom-left corner, rotated with it.
     bottom: bool,
+    /// Right justified (z=1): the rotated frame ends at `x`.
+    right: bool,
 }
 
 impl Place {
     /// Transform for a local `w` x `h` frame (y down) at this place.
     fn matrix(&self, w: u32, h: u32) -> [f32; 6] {
         let frame = [0.0, 0.0, w.max(1) as f32, h.max(1) as f32];
-        bars_placement(self.orientation, (self.x, self.y, self.bottom), frame)
+        bars_placement(self.orientation, (self.x, self.y, self.bottom, self.right), frame)
     }
 }
 
@@ -237,27 +239,57 @@ fn draw_tlc39(
     fill_rects(ctx, matrix, &rects);
 }
 
-fn draw_postal(ctx: &mut Ctx, symbol: &postal::PostalSymbol, at: Place, module: u32, height: u32, text: Option<bool>) {
-    let module = module.max(1) as f32;
-    let bar_w = (symbol.bar_width * module).max(1.0);
-    let pitch = symbol.pitch * module;
-    let size = module * 5.0;
-    let line = if text.is_some() { (size * 1.4).ceil() } else { 0.0 };
-    let top = if text == Some(true) { line } else { 0.0 };
-    let h = height as f32;
+/// Height-modulated bars placed by the bars like 1D barcodes; the interpretation line as the
+/// PNG renderer's `postal_frame` draws it.
+fn draw_postal(
+    ctx: &mut Ctx,
+    symbol: &postal::PostalSymbol,
+    kind: postal::PostalKind,
+    at: Place,
+    module: u32,
+    height: u32,
+    text: Option<bool>,
+) {
+    let module = module.max(1);
+    let width = symbol.width(module);
+    let hri = symbol.hri.as_deref().filter(|_| text.is_some()).unwrap_or("");
+    let imb = kind == postal::PostalKind::UspsImb;
+    let above = text == Some(true) && !imb;
+    let (digit, space) = (4.0 * module as f32 - 0.5, 2.0 * module as f32 + 1.5);
+    let ip = if imb { interpretation_sized(digit, 7.0) } else { interpretation(module) };
+    let gap = line_gap(module, above, false);
+    let top = if above && !hri.is_empty() { ip.area(gap, true) } else { 0 };
     let rects: Vec<_> = symbol
         .bars
         .iter()
         .enumerate()
-        .map(|(i, bar)| ((i as f32 * pitch).round(), top + bar.top * h, bar_w, (bar.bottom - bar.top) * h))
+        .map(|(i, bar)| {
+            let (y0, y1) = bar.rows(height);
+            let x = postal::PostalSymbol::bar_x(i, module);
+            (x as f32, (top + y0) as f32, module as f32, (y1 - y0) as f32)
+        })
         .collect();
-    let width = ((symbol.bars.len().max(1) - 1) as f32 * pitch + bar_w).ceil() as u32;
-    let matrix = at.matrix(width, (h + line) as u32);
+    let bars = [0.0, top as f32, width as f32, height as f32];
+    let matrix = bars_placement(at.orientation, (at.x, at.y, at.bottom, at.right), bars);
     fill_rects(ctx, matrix, &rects);
-    if let (Some(above), Some(hri)) = (text, &symbol.hri) {
-        let baseline = if above { size } else { h + size * 1.2 };
-        centered_text(ctx, matrix, hri, width as f32 / 2.0, baseline, size);
+    if hri.is_empty() {
+        return;
     }
+    let baseline = if above { ip.digit_height } else { height as f32 + gap + ip.digit_height };
+    ctx.content.save_state();
+    ctx.content.transform(matrix);
+    ctx.content.set_fill_gray(ctx.ink);
+    if imb {
+        let mut x = 0.0;
+        for group in hri.split(' ') {
+            text::show_text(ctx, FontId::DejaVuMono, group, x, baseline, ip.size_x, ip.size_y);
+            x += digit * group.len() as f32 + space;
+        }
+    } else {
+        let text_w = hri.len() as f32 * ip.size_x * text::char_advance(FontId::DejaVuMono, '0');
+        text::show_text(ctx, FontId::DejaVuMono, hri, (width as f32 - text_w) / 2.0, baseline, ip.size_x, ip.size_y);
+    }
+    ctx.content.restore_state();
 }
 
 /// MaxiCode at its fixed physical size on the printhead: pointy-top hexagons plus the
@@ -316,6 +348,7 @@ mod tests {
             data: data.into(),
             orientation: Orientation::Normal,
             bottom: false,
+            right: false,
             spec,
         };
         render(&mut ctx, &ins);

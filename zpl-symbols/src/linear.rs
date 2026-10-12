@@ -53,7 +53,8 @@ pub enum MsiCheck {
 pub struct Element {
     /// `true` = black bar, `false` = space.
     pub bar: bool,
-    /// Module count (module-based) or 1 = narrow / 2 = wide (ratio-based).
+    /// Module count (module-based) or 1 = narrow / 2 = wide (ratio-based; 3 = wide plus
+    /// narrow).
     pub width: u8,
     /// EAN/UPC guard bar that extends below the normal bars into the text area.
     pub guard: bool,
@@ -93,10 +94,12 @@ pub enum EncodeError {
 }
 
 impl LinearSymbol {
-    /// Width of one element in dots: wide = round(module * ratio), at least module + 1.
+    /// Width of one element in dots: wide = floor(module * ratio) (as Labelary), at least
+    /// module + 1.
     fn dots(&self, e: &Element, module: u32, ratio: f32) -> u32 {
         if self.ratio_based && e.width >= 2 {
-            ((module as f32 * ratio).round() as u32).max(module + 1)
+            let wide = ((module as f32 * ratio + 1e-3).floor() as u32).max(module + 1);
+            wide + (e.width as u32 - 2) * module
         } else {
             e.width as u32 * module
         }
@@ -648,7 +651,8 @@ fn plessey(data: &str, check_digit: bool) -> Result<LinearSymbol, EncodeError> {
         .chain(bits)
         .chain(crc)
         .for_each(|bit| push_bit(&mut b, bit));
-    b.widths(&[2, 2, 1, 2, 1, 1, 2, 1, 2], false); // stop + termination bar
+    // Stop + termination bar; Labelary's first stop bar is wide plus narrow.
+    b.widths(&[3, 2, 1, 2, 1, 1, 2, 1, 2], false);
     let mut text = data.to_ascii_uppercase();
     if check_digit {
         let nibble = |r: &[bool]| r.iter().rev().fold(0u32, |a, &x| a << 1 | x as u32);

@@ -9,7 +9,7 @@
 use crate::text;
 use crate::{Ctx, FontId};
 use crate::matrix;
-use png_renderer::{code128, qr};
+use png_renderer::{GUARD_EXTENSION_BELOW, code128, guarded_line, qr};
 use zpl_parser::command::{Code128Mode, LinearKind, Orientation};
 use zpl_symbols::linear::{self, LinearSymbol, MsiCheck, Symbology};
 use zpl_state_manager::DrawInstruction;
@@ -17,21 +17,21 @@ use zpl_state_manager::DrawInstruction;
 pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
     match instruction {
         DrawInstruction::DrawBarcode {
-            x, y, bottom, data, orientation, height, module_width,
+            x, y, bottom, right, data, orientation, height, module_width,
             print_interpretation_line, print_interpretation_line_above, mode, ..
         } => render_code128(
-            ctx, (*x, *y, *bottom), data, *orientation, *height, *module_width,
+            ctx, (*x, *y, *bottom, *right), data, *orientation, *height, *module_width,
             *print_interpretation_line, *print_interpretation_line_above, *mode,
         ),
         DrawInstruction::DrawLinear {
-            x, y, bottom, kind, data, orientation, height, module_width, wide_bar_ratio,
+            x, y, bottom, right, kind, data, orientation, height, module_width, wide_bar_ratio,
             print_interpretation_line, print_interpretation_line_above,
         } => render_linear(
-            ctx, (*x, *y, *bottom), *kind, data, *orientation, *height, *module_width, *wide_bar_ratio,
+            ctx, (*x, *y, *bottom, *right), *kind, data, *orientation, *height, *module_width, *wide_bar_ratio,
             *print_interpretation_line, *print_interpretation_line_above,
         ),
-        DrawInstruction::DrawQrCode { x, y, data, magnification, orientation, bottom, .. } => {
-            render_qr_code(ctx, *x, *y, data, *magnification, *orientation, *bottom)
+        DrawInstruction::DrawQrCode { x, y, data, magnification, orientation, bottom, right, .. } => {
+            render_qr_code(ctx, (*x, *y, *bottom, *right), data, *magnification, *orientation)
         }
         DrawInstruction::DrawDataMatrix { .. }
         | DrawInstruction::DrawPdf417 { .. }
@@ -40,10 +40,15 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
     }
 }
 
+/// Symbol origin: `(x, y, bottom, right)`, ^FT and right justification (z=1) flags as in
+/// `DrawInstruction::DrawBarcode`.
+pub(crate) type Origin = (u32, u32, bool, bool);
+
 /// Transform for a symbol whose bars are the local box `bars` (x, y, w, h): ^FO puts the
 /// rotated bars' top-left on (`x`, `y`), ^FT (`bottom`) the bars' bottom-left corner, rotated
-/// with the symbol; the interpretation line follows the bars (as the PNG renderer's `place_bars`).
-pub(crate) fn bars_placement(orientation: Orientation, (x, y, bottom): (u32, u32, bool), bars: [f32; 4]) -> [f32; 6] {
+/// with the symbol; right justified the rotated bars end at `x` (not left of the page edge).
+/// The interpretation line follows the bars (as the PNG renderer's `place_bars`).
+pub(crate) fn bars_placement(orientation: Orientation, (x, y, bottom, right): Origin, bars: [f32; 4]) -> [f32; 6] {
     let [bx, by, bw, bh] = bars;
     let (x, y) = (x as f32, y as f32);
     // Top-left of the rotated bars on the page.
@@ -52,6 +57,11 @@ pub(crate) fn bars_placement(orientation: Orientation, (x, y, bottom): (u32, u32
         (true, Orientation::Normal) => (x, y - bh),
         (true, Orientation::Rotated180) => (x - bw, y),
         (true, Orientation::Rotated270) => (x - bh, y - bw),
+    };
+    let left = match orientation {
+        _ if !right => left,
+        Orientation::Normal | Orientation::Rotated180 => (left - bw).max(0.0),
+        Orientation::Rotated90 | Orientation::Rotated270 => (left - bh).max(0.0),
     };
     match orientation {
         Orientation::Normal => [1.0, 0.0, 0.0, 1.0, left - bx, top - by],
@@ -81,7 +91,7 @@ pub(crate) fn fill_rects(ctx: &mut Ctx, matrix: [f32; 6], rects: &[(f32, f32, f3
 /// Space between the bars and an interpretation line (dots, matches Labelary): below them a
 /// fixed 6 (EAN/UPC: twice the module, their guard bars reaching into the digits), above
 /// them 8 plus twice the module.
-fn line_gap(module: u32, above: bool, guards: bool) -> f32 {
+pub(crate) fn line_gap(module: u32, above: bool, guards: bool) -> f32 {
     match (above, guards) {
         (true, _) => (8 + 2 * module) as f32,
         (false, true) => (2 * module) as f32,
@@ -93,20 +103,32 @@ fn line_gap(module: u32, above: bool, guards: bool) -> f32 {
 const GUARD_EXTENSION_ABOVE: u32 = 13;
 
 /// Interpretation line layout for a 1D symbol (all in dots).
-struct Interpretation {
+pub(crate) struct Interpretation {
     char_advance: f32,
-    digit_height: f32,
-    size_x: f32,
-    size_y: f32,
+    pub(crate) digit_height: f32,
+    pub(crate) size_x: f32,
+    pub(crate) size_y: f32,
     descent: f32,
 }
 
-fn interpretation(bar_width: u32) -> Interpretation {
-    let font = FontId::DejaVuMono;
+pub(crate) fn interpretation(bar_width: u32) -> Interpretation {
     // Same constants as the PNG renderer (Labelary-compatible): no larger than at module 10.
     let bar_width = bar_width.min(10);
-    let char_advance = bar_width as f32 * 143.0 / 24.0;
-    let digit_height = (bar_width * 7) as f32;
+    interpretation_sized(bar_width as f32 * 143.0 / 24.0, (bar_width * 7) as f32)
+}
+
+/// The interpretation font unstretched, its digits `digit_height` dots tall.
+fn interpretation_upright(digit_height: f32) -> Interpretation {
+    let font = FontId::DejaVuMono;
+    let adv_em = Some(text::char_advance(font, '0')).filter(|v| *v > 0.0).unwrap_or(1233.0 / 2048.0);
+    let zero_h_em = Some(text::glyph_height(font, '0')).filter(|v| *v > 0.0).unwrap_or(1493.0 / 2048.0);
+    interpretation_sized(digit_height * adv_em / zero_h_em, digit_height)
+}
+
+/// The interpretation font stretched to `char_advance` dots per character and `digit_height`
+/// dots tall digits.
+pub(crate) fn interpretation_sized(char_advance: f32, digit_height: f32) -> Interpretation {
+    let font = FontId::DejaVuMono;
 
     // DejaVu Sans Mono fallbacks (em units) in case metrics are unavailable.
     let adv_em = Some(text::char_advance(font, '0')).filter(|v| *v > 0.0).unwrap_or(1233.0 / 2048.0);
@@ -120,7 +142,7 @@ fn interpretation(bar_width: u32) -> Interpretation {
 
 impl Interpretation {
     /// Height of the text and its gap to the bars, in whole dots.
-    fn area(&self, gap: f32, above: bool) -> u32 {
+    pub(crate) fn area(&self, gap: f32, above: bool) -> u32 {
         let below = if above { 0.0 } else { self.descent };
         (gap + self.digit_height + below).ceil() as u32
     }
@@ -128,7 +150,7 @@ impl Interpretation {
 
 #[allow(clippy::too_many_arguments)]
 fn render_code128(
-    ctx: &mut Ctx, origin: (u32, u32, bool), data: &str, orientation: Orientation, height: u32,
+    ctx: &mut Ctx, origin: Origin, data: &str, orientation: Orientation, height: u32,
     module_width: u32, print_line: bool, line_above: bool, mode: Code128Mode,
 ) {
     let code = code128::encode(data, mode);
@@ -235,26 +257,34 @@ fn encode_linear(kind: LinearKind, data: &str) -> Option<LinearSymbol> {
 
 /// All 1D symbologies except Code 128, placed by their bars (`bars_placement`); the
 /// interpretation line (DejaVu Sans Mono at the Code 128 proportions) goes below, or above
-/// when requested. EAN/UPC guard bars extend halfway into the digits.
+/// when requested. EAN/UPC digits below the bars follow `png_renderer::guarded_line`.
 #[allow(clippy::too_many_arguments)]
 fn render_linear(
-    ctx: &mut Ctx, origin: (u32, u32, bool), kind: LinearKind, data: &str, orientation: Orientation, height: u32,
+    ctx: &mut Ctx, origin: Origin, kind: LinearKind, data: &str, orientation: Orientation, height: u32,
     module_width: u32, ratio: f32, print_line: bool, line_above: bool,
 ) {
     let Some(symbol) = encode_linear(kind, data) else { return };
     let module = module_width.max(1);
     let width = symbol.width_dots(module, ratio);
 
-    let ip = interpretation(module);
     // The UPC/EAN add-on keeps its digits close above the bars.
     let add_on = matches!(kind, LinearKind::UpcEanExtension);
-    let text_gap = if add_on { (2 * module) as f32 } else { line_gap(module, line_above, symbol.has_guards) };
     let show_text = print_line && !symbol.text.is_empty();
+    let guarded = (show_text && symbol.has_guards && !line_above && !add_on).then(|| guarded_line(&symbol, module));
+    let ip = match &guarded {
+        Some(line) => interpretation_upright(line.digit_height),
+        None => interpretation(module),
+    };
+    let text_gap = match &guarded {
+        Some(line) => line.gap,
+        None if add_on => (2 * module) as f32,
+        None => line_gap(module, line_above, symbol.has_guards),
+    };
     let text_area = if show_text { ip.area(text_gap, line_above && !add_on) } else { 0 };
     let guard_ext = match (symbol.has_guards && show_text, line_above) {
         (false, _) => 0,
         (true, true) => GUARD_EXTENSION_ABOVE,
-        (true, false) => (text_gap + ip.digit_height / 2.0).round() as u32,
+        (true, false) => GUARD_EXTENSION_BELOW,
     };
     let bars_y = if line_above { text_area } else { 0 };
 
@@ -276,7 +306,13 @@ fn render_linear(
         ctx.content.save_state();
         ctx.content.transform(matrix);
         ctx.content.set_fill_gray(ctx.ink);
-        if line_above && symbol.has_guards {
+        if let Some(line) = &guarded {
+            for &(c, x) in &line.digits {
+                let digit = c.encode_utf8(&mut [0; 4]).to_string();
+                let x = x - ip.char_advance / 2.0;
+                text::show_text(ctx, FontId::DejaVuMono, &digit, x, baseline, ip.size_x, ip.size_y);
+            }
+        } else if line_above && symbol.has_guards {
             // Above the bars EAN/UPC digits are one line centred over the symbol.
             let text: String = symbol.text.iter().map(|seg| seg.text.as_str()).collect();
             let text_x = (width as f32 - ip.char_advance * text.chars().count() as f32) / 2.0;
@@ -294,7 +330,7 @@ fn render_linear(
 }
 
 /// ^BQ, module for module as the PNG renderer draws it (`png_renderer::qr`).
-fn render_qr_code(ctx: &mut Ctx, x: u32, y: u32, data: &str, magnification: u32, orientation: Orientation, bottom: bool) {
+fn render_qr_code(ctx: &mut Ctx, (x, y, bottom, right): Origin, data: &str, magnification: u32, orientation: Orientation) {
     let Some(code) = qr::encode(data) else { return };
     let size = code.size;
     let module = magnification.max(1) as f32;
@@ -309,7 +345,7 @@ fn render_qr_code(ctx: &mut Ctx, x: u32, y: u32, data: &str, magnification: u32,
         }
     }
 
-    let (left, top) = qr::top_left(x, y, size, magnification.max(1), orientation, bottom);
+    let (left, top) = qr::top_left(x, y, size, magnification.max(1), orientation, bottom, right);
     let matrix = [1.0, 0.0, 0.0, 1.0, left as f32, top as f32];
     fill_rects(ctx, matrix, &rects);
 }
@@ -352,7 +388,7 @@ mod tests {
 
     fn code128(data: &str, orientation: Orientation, line: bool) -> DrawInstruction {
         DrawInstruction::DrawBarcode {
-            x: 100, y: 50, bottom: false, data: data.into(), orientation, height: 80, module_width: 2,
+            x: 100, y: 50, bottom: false, right: false, data: data.into(), orientation, height: 80, module_width: 2,
             wide_bar_ratio: 3.0, print_interpretation_line: line,
             print_interpretation_line_above: false, check_digit: false, mode: Code128Mode::Auto,
         }
@@ -429,7 +465,7 @@ mod tests {
         let c = content_of(code128("12345678", Orientation::Rotated180, false));
         assert!(c.contains(&format!("-1 0 0 -1 {} {} cm", 100 + w, 50 + h)));
         let rotated270 = |bottom| DrawInstruction::DrawBarcode {
-            x: 500, y: 600, bottom, data: "12345678".into(), orientation: Orientation::Rotated270,
+            x: 500, y: 600, bottom, right: false, data: "12345678".into(), orientation: Orientation::Rotated270,
             height: 80, module_width: 2, wide_bar_ratio: 3.0, print_interpretation_line: false,
             print_interpretation_line_above: false, check_digit: false, mode: Code128Mode::Auto,
         };
@@ -446,7 +482,7 @@ mod tests {
 
     fn linear(kind: LinearKind, data: &str, line: bool) -> DrawInstruction {
         DrawInstruction::DrawLinear {
-            x: 10, y: 20, bottom: false, kind, data: data.into(), orientation: Orientation::Normal, height: 50,
+            x: 10, y: 20, bottom: false, right: false, kind, data: data.into(), orientation: Orientation::Normal, height: 50,
             module_width: 1, wide_bar_ratio: 3.0, print_interpretation_line: line,
             print_interpretation_line_above: false,
         }
@@ -468,7 +504,8 @@ mod tests {
         // 3 guard patterns of 2/2/2 bars plus 12 digits of 2 bars each.
         assert_eq!(count_op(&c, "re"), 30);
         assert!(c.lines().any(|l| l.ends_with(" re") && !l.ends_with(" 50 re")), "guards are taller");
-        assert_eq!(count_op(&c, "Tj"), 3);
+        // One text run per digit (Labelary's layout, `png_renderer::guarded_line`).
+        assert_eq!(count_op(&c, "Tj"), 13);
     }
 
     #[test]
@@ -483,6 +520,7 @@ mod tests {
             model: zpl_parser::command::QrModel::Model2, magnification: 4,
             error_correction: zpl_parser::command::QrErrorCorrection::Standard, mask: None,
             bottom: false,
+            right: false,
         });
         assert!(c.contains("1 0 0 1 30 50 cm"));
         // Top-left finder pattern: first row starts with a 7-module dark run.

@@ -447,10 +447,14 @@ impl TextFont {
     }
 }
 
+/// Symbol origin: `(x, y, bottom, right)`, ^FT and right justification (z=1) flags as in
+/// `DrawInstruction::DrawBarcode`.
+pub(crate) type Origin = (u32, u32, bool, bool);
+
 /// Space between the bars and an interpretation line (dots, matches Labelary): below them a
 /// fixed 6 (EAN/UPC: twice the module, their guard bars reaching into the digits), above
 /// them 8 plus twice the module.
-fn line_gap(module: u32, above: bool, guards: bool) -> f32 {
+pub(crate) fn line_gap(module: u32, above: bool, guards: bool) -> f32 {
     match (above, guards) {
         (true, _) => (8 + 2 * module) as f32,
         (false, true) => (2 * module) as f32,
@@ -458,30 +462,88 @@ fn line_gap(module: u32, above: bool, guards: bool) -> f32 {
     }
 }
 
-/// How far EAN/UPC guard bars reach below the others when the digits are printed above.
+/// How far EAN/UPC guard bars reach below the others, digits printed above or below them.
 const GUARD_EXTENSION_ABOVE: u32 = 13;
+pub const GUARD_EXTENSION_BELOW: u32 = 13;
+
+/// EAN/UPC digits below the bars, laid out as Labelary prints them (in OCR-B; measured).
+pub struct GuardedLine {
+    /// Digit height in dots: 7 per module up to 3 modules, then 21, from 8 modules 42.
+    pub digit_height: f32,
+    /// From the bottom of the bars to the top of the digits.
+    pub gap: f32,
+    /// Each digit with the x of its centre, in dots from the bars' left edge.
+    pub digits: Vec<(char, f32)>,
+}
+
+/// [`GuardedLine`] of `symbol` with `module` dot modules. A group's first and last digit
+/// centres are `7 * module` per digit apart less a squeeze that shrinks as the module grows
+/// (`4 * (h / 4.2 - module)`, `h` the digit height); groups right of the centre guard sit
+/// `h / 5` left of centre, the digit before the bars ends `5 * module` left of them and
+/// the one after them starts `h / 3` right.
+pub fn guarded_line(symbol: &LinearSymbol, module: u32) -> GuardedLine {
+    let m = module.max(1) as f32;
+    let h = match module {
+        0..=3 => 7.0 * m,
+        4..=7 => 21.0,
+        _ => 42.0,
+    };
+    let squeeze = 4.0 * (h / 4.2 - m);
+    let width = symbol.width_dots(module.max(1), 0.0) as f32;
+    let mut digits = Vec::new();
+    for seg in &symbol.text {
+        let (start, end) = (seg.start * m, seg.end * m);
+        let n = seg.text.chars().count();
+        let (mid, pitch) = if end <= 0.0 {
+            (-(5.0 * m + 0.62 * h), 0.0)
+        } else if start >= width {
+            (width + 0.63 * h, 0.0)
+        } else {
+            let shift = if start > width / 2.0 { h / 5.0 } else { 0.0 };
+            ((start + end) / 2.0 - shift, (7.0 * m * (n as f32 - 1.0) - squeeze) / (n as f32 - 1.0).max(1.0))
+        };
+        for (k, c) in seg.text.chars().enumerate() {
+            digits.push((c, mid + (k as f32 - (n as f32 - 1.0) / 2.0) * pitch));
+        }
+    }
+    GuardedLine { digit_height: h, gap: 2.0 + h / 7.0, digits }
+}
 
 /// Interpretation line font for 1D barcodes: monospaced; pitch and digit height scale with
 /// the module width up to 10 dots (matches Labelary).
-struct Interpretation {
+pub(crate) struct Interpretation {
     font: FontRef<'static>,
     scale: PxScale,
     char_advance: f32,
-    digit_height: f32,
+    pub(crate) digit_height: f32,
     ascent: f32,
     /// Negative, as ab_glyph reports it.
     descent: f32,
 }
 
 impl Interpretation {
-    fn new(bar_width: u32) -> Self {
+    pub(crate) fn new(bar_width: u32) -> Self {
+        let bar_width = bar_width.min(10);
+        Self::sized(bar_width as f32 * 143.0 / 24.0, (bar_width * 7) as f32)
+    }
+
+    /// The font unstretched, its digits `digit_height` dots tall.
+    pub(crate) fn upright(digit_height: f32) -> Self {
+        use ab_glyph::Font;
+
+        let font = FontRef::try_from_slice(include_bytes!("../fonts/DejaVuSansMono.ttf")).expect("Error loading font");
+        let zero = font.glyph_id('0');
+        let zero_height = font.outline(zero).map(|o| (o.bounds.max.y - o.bounds.min.y).abs()).unwrap_or(1493.0);
+        Self::sized(digit_height * font.h_advance_unscaled(zero) / zero_height, digit_height)
+    }
+
+    /// The same font stretched to `char_advance` dots per character and `digit_height`
+    /// dots tall digits.
+    pub(crate) fn sized(char_advance: f32, digit_height: f32) -> Self {
         use ab_glyph::{Font, ScaleFont};
 
         let font_data: &'static [u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
         let font = FontRef::try_from_slice(font_data).expect("Error loading font");
-        let bar_width = bar_width.min(10);
-        let char_advance = bar_width as f32 * 143.0 / 24.0;
-        let digit_height = (bar_width * 7) as f32;
         let zero = font.glyph_id('0');
         let zero_height_unscaled = font
             .outline(zero)
@@ -497,17 +559,17 @@ impl Interpretation {
     }
 
     /// Height of the text and its gap to the bars, in whole dots.
-    fn area(&self, gap: f32, above: bool) -> u32 {
+    pub(crate) fn area(&self, gap: f32, above: bool) -> u32 {
         let below = if above { 0.0 } else { -self.descent };
         (gap + self.digit_height + below).ceil() as u32
     }
 
-    fn text_width(&self, text: &str) -> f32 {
+    pub(crate) fn text_width(&self, text: &str) -> f32 {
         self.char_advance * text.chars().count() as f32
     }
 
     /// Draws `text` one character per pitch, starting at `x` with its baseline at `baseline`.
-    fn draw(&self, image: &mut RgbImage, text: &str, x: f32, baseline: f32) {
+    pub(crate) fn draw(&self, image: &mut RgbImage, text: &str, x: f32, baseline: f32) {
         let text_y = baseline - self.ascent;
         for (i, ch) in text.chars().enumerate() {
             let ch_x = x + i as f32 * self.char_advance;
@@ -793,57 +855,58 @@ impl PngRenderer {
                 self.render_text(image, *x, *y, &text, &font, placement, block.as_ref(), flow, layout);
             }
             DrawInstruction::DrawBarcode {
-                x, y, bottom, data, orientation, height, module_width,
+                x, y, bottom, right, data, orientation, height, module_width,
                 print_interpretation_line, print_interpretation_line_above, mode, ..
             } => {
                 self.render_code128(
-                    image, *x, *y, *bottom, data, *orientation, *height, *module_width,
+                    image, (*x, *y, *bottom, *right), data, *orientation, *height, *module_width,
                     *print_interpretation_line, *print_interpretation_line_above, *mode,
                 );
             }
             DrawInstruction::DrawLinear {
-                x, y, bottom, kind, data, orientation, height, module_width, wide_bar_ratio,
+                x, y, bottom, right, kind, data, orientation, height, module_width, wide_bar_ratio,
                 print_interpretation_line, print_interpretation_line_above,
             } => {
                 self.render_linear(
-                    image, *x, *y, *bottom, *kind, data, *orientation, *height, *module_width, *wide_bar_ratio,
+                    image, (*x, *y, *bottom, *right), *kind, data, *orientation, *height, *module_width, *wide_bar_ratio,
                     *print_interpretation_line, *print_interpretation_line_above,
                 );
             }
-            DrawInstruction::DrawQrCode { x, y, data, magnification, orientation, bottom, .. } => {
-                self.render_qr_code(image, *x, *y, data, *magnification, *orientation, *bottom);
+            DrawInstruction::DrawQrCode { x, y, data, magnification, orientation, bottom, right, .. } => {
+                self.render_qr_code(image, (*x, *y, *bottom, *right), data, *magnification, *orientation);
             }
             DrawInstruction::DrawDataMatrix {
                 x, y, data, orientation, module_height, symbol_height, columns, rows, escape, rectangular, bottom,
+                right,
             } => {
                 if let Ok(m) = matrix::datamatrix(&symbol_bytes(data), *rows, *columns, *rectangular, *escape) {
                     // Without an explicit module size the ^BY height is the approximate symbol height.
                     let module = module_height.unwrap_or(symbol_height / m.height.max(1)).max(1);
-                    self.render_matrix(image, &m, *x, *y, *orientation, module, module, *bottom);
+                    self.render_matrix(image, &m, (*x, *y, *bottom, *right), *orientation, module, module);
                 }
             }
             DrawInstruction::DrawPdf417 {
                 x, y, data, orientation, row_height, module_width, symbol_height, security, columns, rows,
-                truncated, bottom,
+                truncated, bottom, right,
             } => {
                 if let Ok(m) = matrix::pdf417(&symbol_bytes(data), *security, *columns, *rows, *truncated) {
                     let module = (*module_width).max(1);
                     // Row height in dots, or the ^BY height shared by all rows.
                     let row = row_height.unwrap_or(symbol_height / m.height.max(1)).max(1);
-                    self.render_matrix(image, &m, *x, *y, *orientation, module, row, *bottom);
+                    self.render_matrix(image, &m, (*x, *y, *bottom, *right), *orientation, module, row);
                 }
             }
-            DrawInstruction::DrawAztec { x, y, data, orientation, magnification, ecc, bottom } => {
+            DrawInstruction::DrawAztec { x, y, data, orientation, magnification, ecc, bottom, right } => {
                 if let Ok(m) = matrix::aztec(&symbol_bytes(data), *ecc) {
                     let module = (*magnification).max(1);
-                    self.render_matrix(image, &m, *x, *y, *orientation, module, module, *bottom);
+                    self.render_matrix(image, &m, (*x, *y, *bottom, *right), *orientation, module, module);
                 }
             }
-            DrawInstruction::DrawBox { x, y, width, height, thickness, color, .. } => {
+            DrawInstruction::DrawBox { x, y, width, height, thickness, color, rounding } => {
                 if self.debug {
                     self.draw_origin_cross(image, *x, *y, Rgb([0, 255, 0]));
                 }
-                self.render_box(image, *x, *y, *width, *height, *thickness, color);
+                self.render_box(image, *x, *y, *width, *height, *thickness, color, *rounding);
             }
             DrawInstruction::DrawCircle { x, y, diameter, thickness, color } => {
                 self.render_ellipse(image, *x, *y, *diameter, *diameter, *thickness, color);
@@ -1133,16 +1196,14 @@ impl PngRenderer {
 
     /// Places the unrotated image of a symbol whose bars are the `bars_w` x `bars_h` box at
     /// (`bars_x`, `bars_y`): ^FO puts the rotated bars' top-left on (`x`, `y`), ^FT (`bottom`)
-    /// the bars' bottom-left corner, rotated with the symbol. The interpretation line follows
-    /// the bars wherever it lands. 2D symbols are all bars.
-    #[allow(clippy::too_many_arguments)]
+    /// the bars' bottom-left corner, rotated with the symbol. Right-justified (`right`, z=1)
+    /// the rotated bars end at `x`, and start no further left than the page edge (Labelary).
+    /// The interpretation line follows the bars wherever it lands. 2D symbols are all bars.
     fn place_bars(
         &self,
         image: &mut RgbImage,
         temp: &RgbImage,
-        x: u32,
-        y: u32,
-        bottom: bool,
+        (x, y, bottom, right): Origin,
         orientation: Orientation,
         (bars_x, bars_y, bars_w, bars_h): (u32, u32, u32, u32),
     ) {
@@ -1155,6 +1216,11 @@ impl PngRenderer {
             (true, Orientation::Normal) => (x, y - bh),
             (true, Orientation::Rotated180) => (x - bw, y),
             (true, Orientation::Rotated270) => (x - bh, y - bw),
+        };
+        let left = match orientation {
+            _ if !right => left,
+            Orientation::Normal | Orientation::Rotated180 => (left - bw).max(0),
+            Orientation::Rotated90 | Orientation::Rotated270 => (left - bh).max(0),
         };
         match orientation {
             Orientation::Normal => self.overlay_at(image, temp, left - bx, top - by),
@@ -1174,7 +1240,7 @@ impl PngRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render_code128(&self, image: &mut RgbImage, x: u32, y: u32, bottom: bool, data: &str, orientation: Orientation, height: u32, module_width: u32, print_interpretation_line: bool, print_interpretation_line_above: bool, mode: Code128Mode) {
+    fn render_code128(&self, image: &mut RgbImage, at: Origin, data: &str, orientation: Orientation, height: u32, module_width: u32, print_interpretation_line: bool, print_interpretation_line_above: bool, mode: Code128Mode) {
         let code = code128::encode(data, mode);
         let bar_width = module_width.max(1);
         let widths = code.widths();
@@ -1234,19 +1300,17 @@ impl PngRenderer {
             ip.draw(&mut temp_image, &code.text, text_x, baseline);
         }
 
-        self.place_bars(image, &temp_image, x, y, bottom, orientation, (pad, bars_y, barcode_width, height));
+        self.place_bars(image, &temp_image, at, orientation, (pad, bars_y, barcode_width, height));
     }
 
     /// All 1D symbologies except Code 128, placed by their bars (see `place_bars`); the
     /// interpretation line goes below, or above when requested. EAN/UPC guard bars extend
-    /// halfway into the digits.
+    /// into the digits (see `guarded_line`).
     #[allow(clippy::too_many_arguments)]
     fn render_linear(
         &self,
         image: &mut RgbImage,
-        x: u32,
-        y: u32,
-        bottom: bool,
+        at: Origin,
         kind: LinearKind,
         data: &str,
         orientation: Orientation,
@@ -1260,16 +1324,25 @@ impl PngRenderer {
         let module = module_width.max(1);
         let width = symbol.width_dots(module, ratio);
 
-        let ip = Interpretation::new(module);
         // The UPC/EAN add-on keeps its digits close above the bars.
         let add_on = matches!(kind, LinearKind::UpcEanExtension);
-        let text_gap = if add_on { (2 * module) as f32 } else { line_gap(module, line_above, symbol.has_guards) };
         let show_text = print_line && !symbol.text.is_empty();
+        // EAN/UPC digits below the bars: Labelary's own layout, one segment per digit.
+        let guarded = (show_text && symbol.has_guards && !line_above && !add_on).then(|| guarded_line(&symbol, module));
+        let ip = match &guarded {
+            Some(line) => Interpretation::upright(line.digit_height),
+            None => Interpretation::new(module),
+        };
+        let text_gap = match &guarded {
+            Some(line) => line.gap,
+            None if add_on => (2 * module) as f32,
+            None => line_gap(module, line_above, symbol.has_guards),
+        };
         let text_area = if show_text { ip.area(text_gap, line_above && !add_on) } else { 0 };
         let guard_ext = match (symbol.has_guards && show_text, line_above) {
             (false, _) => 0,
             (true, true) => GUARD_EXTENSION_ABOVE,
-            (true, false) => (text_gap + ip.digit_height / 2.0).round() as u32,
+            (true, false) => GUARD_EXTENSION_BELOW,
         };
         let bars_y = if line_above { text_area } else { 0 };
 
@@ -1278,7 +1351,10 @@ impl PngRenderer {
         let mut segments: Vec<(f32, std::borrow::Cow<str>)> = Vec::new();
         let (mut left, mut right) = (0.0f32, width as f32);
         if show_text {
-            if line_above && symbol.has_guards {
+            if let Some(line) = &guarded {
+                let half = ip.text_width("0") / 2.0;
+                segments.extend(line.digits.iter().map(|&(c, x)| (x - half, c.to_string().into())));
+            } else if line_above && symbol.has_guards {
                 let text: String = symbol.text.iter().map(|seg| seg.text.as_str()).collect();
                 segments.push(((width as f32 - ip.text_width(&text)) / 2.0, text.into()));
             } else {
@@ -1321,7 +1397,7 @@ impl PngRenderer {
             }
         }
 
-        self.place_bars(image, &temp, x, y, bottom, orientation, (pad_l, bars_y, width, height));
+        self.place_bars(image, &temp, at, orientation, (pad_l, bars_y, width, height));
     }
 
     /// 2D symbol with `module_w` x `module_h` dot modules. Like the bars of a 1D symbol (and
@@ -1332,12 +1408,10 @@ impl PngRenderer {
         &self,
         image: &mut RgbImage,
         m: &Matrix,
-        x: u32,
-        y: u32,
+        at: Origin,
         orientation: Orientation,
         module_w: u32,
         module_h: u32,
-        bottom: bool,
     ) {
         let (w, h) = (m.width * module_w, m.height * module_h);
         if w == 0 || h == 0 {
@@ -1355,16 +1429,15 @@ impl PngRenderer {
                 }
             }
         }
-        self.place_bars(image, &temp, x, y, bottom, orientation, (0, 0, w, h));
+        self.place_bars(image, &temp, at, orientation, (0, 0, w, h));
     }
 
     /// ^BQ: always upright; the orientation only moves it (see [`qr::top_left`]).
-    #[allow(clippy::too_many_arguments)]
-    fn render_qr_code(&self, image: &mut RgbImage, x: u32, y: u32, data: &str, magnification: u32, orientation: Orientation, bottom: bool) {
+    fn render_qr_code(&self, image: &mut RgbImage, (x, y, bottom, right): Origin, data: &str, magnification: u32, orientation: Orientation) {
         let Some(code) = qr::encode(data) else { return };
         let module = magnification.max(1);
         let side = code.size * module;
-        let (x, y) = qr::top_left(x, y, code.size, module, orientation, bottom);
+        let (x, y) = qr::top_left(x, y, code.size, module, orientation, bottom, right);
         self.note_drawn(x as i64, y as i64, side, side);
         for row in 0..code.size {
             for col in 0..code.size {
@@ -1382,9 +1455,14 @@ impl PngRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render_box(&self, image: &mut RgbImage, x: u32, y: u32, width: u32, height: u32, thickness: u32, color: &LineColor) {
+    fn render_box(&self, image: &mut RgbImage, x: u32, y: u32, width: u32, height: u32, thickness: u32, color: &LineColor, rounding: u32) {
+        // ZPL: width and height are never smaller than the border thickness.
+        let (width, height) = (width.max(thickness), height.max(thickness));
         self.note_drawn(x as i64, y as i64, width, height);
         let rgb_color = self.line_color_to_rgb(color);
+        if rounding > 0 && thickness > 0 {
+            return self.render_rounded_box(image, x, y, width, height, thickness, rgb_color, rounding);
+        }
 
         for t in 0..thickness {
             let new_width = width.saturating_sub(2 * t);
@@ -1397,6 +1475,43 @@ impl PngRenderer {
             let rect = imageproc::rect::Rect::at(x as i32 + t as i32, y as i32 + t as i32)
                 .of_size(new_width, new_height);
             drawing::draw_hollow_rect_mut(image, rect, rgb_color);
+        }
+    }
+
+    /// ^GB with corner rounding 1-8: corner radius `rounding / 8` of half the shorter side;
+    /// the inside is the same shape inset by the thickness (concentric corners). Filled row
+    /// by row, a dot inked when its centre is inside the outline.
+    #[allow(clippy::too_many_arguments)]
+    fn render_rounded_box(&self, image: &mut RgbImage, x: u32, y: u32, width: u32, height: u32, thickness: u32, color: Rgb<u8>, rounding: u32) {
+        let radius = rounding.min(8) as f64 / 8.0 * width.min(height) as f64 / 2.0;
+        // Dots left out at each end of row `row` of a `len`-row rounded rect.
+        let inset = |r: f64, row: u32, len: u32| -> u32 {
+            let from_edge = row.min(len - 1 - row) as f64 + 0.5;
+            if from_edge >= r {
+                return 0;
+            }
+            let dy = r - from_edge;
+            (r - (r * r - dy * dy).sqrt() - 0.5).ceil().max(0.0) as u32
+        };
+        let (inner_w, inner_h) = (width.saturating_sub(2 * thickness), height.saturating_sub(2 * thickness));
+        let inner_r = (radius - thickness as f64).max(0.0);
+        for row in 0..height {
+            let py = y + row;
+            if py >= image.height() {
+                break;
+            }
+            let outer = inset(radius, row, height);
+            let span = (x + outer)..(x + width - outer).min(image.width());
+            let hole = match row.checked_sub(thickness) {
+                Some(r) if r < inner_h && inner_w > 0 => {
+                    let i = inset(inner_r, r, inner_h);
+                    (x + thickness + i)..(x + thickness + inner_w - i)
+                }
+                _ => 0..0,
+            };
+            for px in span.filter(|px| !hole.contains(px)) {
+                image.put_pixel(px, py, color);
+            }
         }
     }
 
@@ -1659,7 +1774,7 @@ mod tests {
     #[test]
     fn linear_ean13_draws_bars() {
         let ean = DrawInstruction::DrawLinear {
-            x: 20, y: 0, bottom: false, kind: LinearKind::Ean13, data: "590123412345".into(),
+            x: 20, y: 0, bottom: false, right: false, kind: LinearKind::Ean13, data: "590123412345".into(),
             orientation: Orientation::Normal, height: 50, module_width: 2, wide_bar_ratio: 3.0,
             print_interpretation_line: true, print_interpretation_line_above: false,
         };

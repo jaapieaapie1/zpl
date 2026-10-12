@@ -48,11 +48,13 @@ pub enum DrawInstruction {
     },
     /// Code 128 (^BC). With ^FO, (`x`, `y`) is the top-left of the rotated bars; with ^FT
     /// (`bottom`) it is the bars' bottom-left corner in the unrotated symbol, rotated with it.
-    /// The interpretation line sits outside the bars.
+    /// The interpretation line sits outside the bars. `right` (^FO / ^FT z=1): the rotated
+    /// bars end at `x` instead of starting there; the same holds for every symbol below.
     DrawBarcode {
         x: u32,
         y: u32,
         bottom: bool,
+        right: bool,
         data: String,
         orientation: Orientation,
         height: u32,
@@ -68,6 +70,7 @@ pub enum DrawInstruction {
         x: u32,
         y: u32,
         bottom: bool,
+        right: bool,
         kind: LinearKind,
         data: String,
         orientation: Orientation,
@@ -88,6 +91,7 @@ pub enum DrawInstruction {
         mask: Option<u32>,
         /// Placed with ^FT: `y` is the bottom edge of the symbol.
         bottom: bool,
+        right: bool,
     },
     DrawDataMatrix {
         x: u32,
@@ -102,6 +106,7 @@ pub enum DrawInstruction {
         escape: Option<char>,
         rectangular: bool,
         bottom: bool,
+        right: bool,
     },
     DrawPdf417 {
         x: u32,
@@ -118,6 +123,7 @@ pub enum DrawInstruction {
         rows: u32,
         truncated: bool,
         bottom: bool,
+        right: bool,
     },
     DrawAztec {
         x: u32,
@@ -127,6 +133,7 @@ pub enum DrawInstruction {
         magnification: u32,
         ecc: u32,
         bottom: bool,
+        right: bool,
     },
     DrawBox {
         x: u32,
@@ -171,13 +178,14 @@ pub enum DrawInstruction {
         magnification_y: u32,
     },
     /// Symbols drawn from `zpl-symbols` encoders that have no dedicated variant. `bottom`: the
-    /// origin came from ^FT, so `y` is the symbol's bottom edge.
+    /// origin came from ^FT, so `y` is the symbol's bottom edge; `right`: `x` is its right edge.
     DrawSymbol {
         x: u32,
         y: u32,
         data: String,
         orientation: Orientation,
         bottom: bool,
+        right: bool,
         spec: SymbolSpec,
     },
     /// ^FR / ^LR: the inner element inverts whatever is underneath instead of painting black.
@@ -1242,6 +1250,7 @@ impl StateManager {
 
         let (x, y) = self.origin();
         let bottom = self.field_typeset;
+        let right = self.field_justification == Justification::Right;
         // Reverse is per field; graphics already emitted use the live `self.field`.
         let saved_reverse = std::mem::replace(&mut self.field.reverse, field.reverse);
 
@@ -1293,6 +1302,7 @@ impl StateManager {
                 x,
                 y,
                 bottom,
+                right,
                 data,
                 orientation,
                 height,
@@ -1308,6 +1318,7 @@ impl StateManager {
                     x,
                     y,
                     bottom,
+                    right,
                     kind,
                     data,
                     orientation,
@@ -1329,6 +1340,7 @@ impl StateManager {
                     error_correction,
                     mask,
                     bottom,
+                    right,
                 }
             }
             FieldMode::DataMatrix { orientation, module_height, columns, rows, escape, rectangular } => {
@@ -1344,6 +1356,7 @@ impl StateManager {
                     escape,
                     rectangular,
                     bottom,
+                    right,
                 }
             }
             FieldMode::Pdf417 { orientation, row_height, security, columns, rows, truncated } => {
@@ -1360,12 +1373,15 @@ impl StateManager {
                     rows,
                     truncated,
                     bottom,
+                    right,
                 }
             }
             FieldMode::Aztec { orientation, magnification, ecc } => {
-                DrawInstruction::DrawAztec { x, y, data, orientation, magnification, ecc, bottom }
+                DrawInstruction::DrawAztec { x, y, data, orientation, magnification, ecc, bottom, right }
             }
-            FieldMode::Symbol { orientation, spec } => DrawInstruction::DrawSymbol { x, y, data, orientation, bottom, spec },
+            FieldMode::Symbol { orientation, spec } => {
+                DrawInstruction::DrawSymbol { x, y, data, orientation, bottom, right, spec }
+            }
         };
 
         self.emit(out, instruction);
@@ -1547,6 +1563,15 @@ mod tests {
             DrawInstruction::DrawBarcode { x: 600, y: 200, bottom: true, orientation: Orientation::Rotated270, .. }
         ));
         assert!(matches!(ins[1], DrawInstruction::DrawLinear { x: 600, y: 200, bottom: false, .. }));
+    }
+
+    #[test]
+    fn right_justified_symbols_carry_the_flag() {
+        // z=1: the renderers end the symbol at x; the next field is left justified again.
+        let ins = run("^XA^FO400,20,1^BCN,60^FD1^FS^FT400,200,1^BXN,5,200^FDA^FS^FO400,300^BQN,2,4^FDQA,1^FS^XZ");
+        assert!(matches!(ins[0], DrawInstruction::DrawBarcode { x: 400, right: true, bottom: false, .. }));
+        assert!(matches!(ins[1], DrawInstruction::DrawDataMatrix { x: 400, right: true, bottom: true, .. }));
+        assert!(matches!(ins[2], DrawInstruction::DrawQrCode { right: false, .. }));
     }
 
     #[test]

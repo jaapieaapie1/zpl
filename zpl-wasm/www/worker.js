@@ -1,4 +1,5 @@
-// Renders labels off the main thread. Messages in: { id, kind: "rgba" | "pdf", zpl, debug, page }.
+// Renders labels off the main thread. Messages in: { id, kind: "rgba" | "pdf", zpl, debug, page,
+// dpmm } (dpmm: printer resolution in dots/mm, 6, 8, 12 or 24).
 // Messages out: { id, kind, ok, ...result } or { id, crashed } after a Rust panic, which
 // leaves the wasm instance unusable; the page then starts a fresh worker. "rgba" results
 // carry `elements`, laid out as described at Frame.takeElements in zpl-wasm/src/lib.rs, and
@@ -13,15 +14,15 @@ function localClock() {
   return Math.floor(now.getTime() / 1000) - now.getTimezoneOffset() * 60;
 }
 
-self.onmessage = async ({ data: { id, kind, zpl, debug, page } }) => {
+self.onmessage = async ({ data: { id, kind, zpl, debug, page, dpmm } }) => {
   await ready;
   const start = performance.now();
   try {
     if (kind === "pdf") {
-      const bytes = renderPdf(zpl, localClock());
+      const bytes = renderPdf(zpl, localClock(), dpmm);
       self.postMessage({ id, kind, ok: true, bytes, ms: performance.now() - start }, [bytes.buffer]);
     } else {
-      const frame = renderRgba(zpl, localClock(), debug, page);
+      const frame = renderRgba(zpl, localClock(), debug, page, dpmm);
       const { width, height, pageCount } = frame;
       const shown = frame.page;
       const pixels = frame.takePixels();

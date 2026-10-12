@@ -4,6 +4,8 @@
 //!   to `pdf`. Responds with the rendered file (`application/pdf` or `image/png`). Every
 //!   label (^XA...^XZ, times its ^PQ copies) is a page: a PDF holds them all, a PNG shows
 //!   page `?page=N` (1-based, default 1). The `X-Page-Count` header gives the page count.
+//!   `?dpmm=6|8|12|24` sets the printer resolution in dots per millimetre (default 8): it
+//!   sizes ^MU units, the default 4 x 6 inch label, the PDF page and the PNG in dots.
 //! - Add `timings` (`?timings` or `?format=png&timings=1`) to get a `Server-Timing` header
 //!   with the duration of each stage, which browser devtools display as well.
 //! - `GET /health` returns `ok`.
@@ -25,7 +27,7 @@ use pdf_renderer::PdfRenderer;
 use png_renderer::PngRenderer;
 use tower_http::services::ServeDir;
 use zpl_parser::Parser;
-use zpl_state_manager::StateManager;
+use zpl_state_manager::{StateManager, DEFAULT_DPMM, DPMM_VALUES};
 
 /// Largest accepted ZPL body. Labels with big ^GF graphics run to a few megabytes.
 pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -81,9 +83,9 @@ pub enum RenderError {
     NoSuchPage { page: usize, page_count: usize },
 }
 
-/// Parses, lays out and renders `zpl`, timing each stage. Synchronous and CPU-bound.
-/// A PDF holds every page; a PNG shows `page` (1-based).
-pub fn render_label(zpl: &str, format: Format, page: usize) -> Result<Rendered, RenderError> {
+/// Parses, lays out and renders `zpl` for a `dpmm` dots/mm printer, timing each stage.
+/// Synchronous and CPU-bound. A PDF holds every page; a PNG shows `page` (1-based).
+pub fn render_label(zpl: &str, format: Format, page: usize, dpmm: u32) -> Result<Rendered, RenderError> {
     let mut timings = Vec::new();
     let mut last = Instant::now();
     let mut mark = |stage: &'static str| {
@@ -92,10 +94,12 @@ pub fn render_label(zpl: &str, format: Format, page: usize) -> Result<Rendered, 
         last = now;
     };
 
-    let commands = Parser::new(zpl).parse().map_err(|e| RenderError::Parse(format!("{e:?}")))?;
+    let commands = Parser::with_dpmm(zpl, dpmm).parse().map_err(|e| RenderError::Parse(format!("{e:?}")))?;
     mark("parse");
 
-    let pages = StateManager::new().process_pages(commands);
+    let mut state = StateManager::new();
+    state.set_dpmm(dpmm);
+    let pages = state.process_pages(commands);
     let page_count = pages.len();
     mark("state");
 
@@ -110,7 +114,7 @@ pub fn render_label(zpl: &str, format: Format, page: usize) -> Result<Rendered, 
             let Some(page) = page.checked_sub(1).and_then(|i| pages.get(i)) else {
                 return Err(RenderError::NoSuchPage { page, page_count });
             };
-            let image = PngRenderer::new(page.setup.width, page.setup.height).render(&page.instructions);
+            let image = PngRenderer::for_page(&page.setup, false).render(&page.instructions);
             mark("render");
             let bytes = png_renderer::encode_png(&image).map_err(|e| RenderError::Encode(e.to_string()))?;
             mark("encode");
@@ -128,7 +132,7 @@ pub fn warm_up() {
                          ^FO50,120^BCN,60,Y,N,N^FD12345^FS\
                          ^FO50,250^BQN,2,4^FDQA,warm up^FS^XZ";
     for format in [Format::Pdf, Format::Png] {
-        let _ = render_label(LABEL, format, 1);
+        let _ = render_label(LABEL, format, 1, DEFAULT_DPMM);
     }
 }
 
@@ -155,6 +159,11 @@ async fn render(Query(params): Query<HashMap<String, String>>, body: Body) -> Re
         Some(Ok(page)) if page >= 1 => page,
         Some(_) => return error(StatusCode::BAD_REQUEST, "page must be a page number, starting at 1"),
     };
+    let dpmm = match params.get("dpmm").map(|d| d.parse::<u32>()) {
+        None => DEFAULT_DPMM,
+        Some(Ok(dpmm)) if DPMM_VALUES.contains(&dpmm) => dpmm,
+        Some(_) => return error(StatusCode::BAD_REQUEST, "dpmm must be 6, 8, 12 or 24 (dots per millimetre)"),
+    };
     let timings_enabled = params.get("timings").is_some_and(|v| !matches!(v.as_str(), "0" | "false"));
 
     let body = match to_bytes(body, MAX_BODY_BYTES).await {
@@ -172,7 +181,7 @@ async fn render(Query(params): Query<HashMap<String, String>>, body: Body) -> Re
     let queued = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
         let queue = queued.elapsed();
-        render_label(&zpl, format, page).map(|rendered| (queue, rendered))
+        render_label(&zpl, format, page, dpmm).map(|rendered| (queue, rendered))
     })
     .await;
 
@@ -320,6 +329,28 @@ mod tests {
         for bad in ["3", "0", "x"] {
             let response = post(&format!("/render?format=png&page={bad}"), two).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "page={bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dpmm_parameter() {
+        let width = |png: &[u8]| u32::from_be_bytes(png[16..20].try_into().unwrap());
+        let label = "^XA^FO10,10^GB50,50,5^FS^XZ";
+
+        // The default label is 4 x 6 inches at the requested resolution.
+        for (dpmm, dots) in [("", 812), ("&dpmm=6", 608), ("&dpmm=8", 812), ("&dpmm=12", 1200), ("&dpmm=24", 2400)] {
+            let response = post(&format!("/render?format=png{dpmm}"), label).await;
+            assert_eq!(response.status(), StatusCode::OK, "{dpmm}");
+            assert_eq!(width(&body_bytes(response).await), dots, "{dpmm}");
+        }
+
+        let response = post("/render?dpmm=12", label).await;
+        let pdf = body_bytes(response).await;
+        assert!(String::from_utf8_lossy(&pdf).contains("/MediaBox [0 0 288 432]"));
+
+        for bad in ["400", "0", "7", "x", ""] {
+            let response = post(&format!("/render?dpmm={bad}"), label).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "dpmm={bad}");
         }
     }
 

@@ -1,10 +1,12 @@
 //! WebAssembly bindings for rendering ZPL in the browser (the `/playground` editor).
 //!
-//! - `renderRgba(zpl, clock, debug, page)` renders page `page` (0-based) to RGBA pixels for
-//!   a `<canvas>`, plus its elements: where each one is drawn and which source text
-//!   produced it. Every label (^XA...^XZ, times its ^PQ copies) is a page.
-//! - `renderPdf(zpl, clock)` renders all pages to PDF file bytes.
+//! - `renderRgba(zpl, clock, debug, page, dpmm)` renders page `page` (0-based) to RGBA
+//!   pixels for a `<canvas>`, plus its elements: where each one is drawn and which source
+//!   text produced it. Every label (^XA...^XZ, times its ^PQ copies) is a page.
+//! - `renderPdf(zpl, clock, dpmm)` renders all pages to PDF file bytes.
 //!
+//! `dpmm` is the printer resolution in dots per millimetre: 6, 8, 12 or 24 (anything else
+//! means 8). Pixels and element positions are printer dots.
 //! `clock` is the printer clock for ^FC fields, in seconds since the Unix epoch in local
 //! time; the browser has no system clock reachable from `wasm32-unknown-unknown`.
 //! Source positions are in UTF-16 code units, so they index straight into a JavaScript
@@ -15,7 +17,7 @@ use png_renderer::PngRenderer;
 use wasm_bindgen::prelude::*;
 use zpl_parser::error::ParseError;
 use zpl_parser::Parser;
-use zpl_state_manager::{Page, StateManager};
+use zpl_state_manager::{Page, StateManager, DEFAULT_DPMM, DPMM_VALUES};
 
 /// Values per element in [`Frame::elements`].
 const ELEMENT_STRIDE: usize = 8;
@@ -158,22 +160,29 @@ fn field_text_start(zpl: &str, data: zpl_parser::Span) -> usize {
     (data.start + prefix + 2).min(data.end)
 }
 
-fn state(clock: f64) -> StateManager {
+fn state(clock: f64, dpmm: u32) -> StateManager {
     let mut state = StateManager::new();
     state.set_clock_unix(clock as i64);
+    state.set_dpmm(dpmm);
     state
+}
+
+/// `dpmm` if Zebra makes printheads of that resolution, else the default 8 dots/mm.
+fn resolution(dpmm: u32) -> u32 {
+    if DPMM_VALUES.contains(&dpmm) { dpmm } else { DEFAULT_DPMM }
 }
 
 /// Renders page `page` (0-based, clamped to the last) of `zpl` to RGBA pixels and its
 /// element map. `debug` outlines every field.
 #[wasm_bindgen(js_name = renderRgba)]
-pub fn render_rgba(zpl: &str, clock: f64, debug: bool, page: u32) -> Result<Frame, ParseFailure> {
-    let (commands, spans) = Parser::new(zpl).parse_with_spans().map_err(|e| ParseFailure::new(zpl, e))?;
-    let mut pages = state(clock).process_pages_mapped(commands, &spans);
+pub fn render_rgba(zpl: &str, clock: f64, debug: bool, page: u32, dpmm: u32) -> Result<Frame, ParseFailure> {
+    let dpmm = resolution(dpmm);
+    let (commands, spans) = Parser::with_dpmm(zpl, dpmm).parse_with_spans().map_err(|e| ParseFailure::new(zpl, e))?;
+    let mut pages = state(clock, dpmm).process_pages_mapped(commands, &spans);
     let page_count = pages.len();
     let index = (page as usize).min(page_count - 1);
     let (Page { instructions, setup }, sources) = pages.swap_remove(index);
-    let renderer = PngRenderer::with_debug(setup.width, setup.height, debug);
+    let renderer = PngRenderer::for_page(&setup, debug);
     let (image, bounds) = renderer.render_with_bounds(&instructions);
 
     let offsets = Utf16Offsets::new(zpl);
@@ -204,9 +213,10 @@ pub fn render_rgba(zpl: &str, clock: f64, debug: bool, page: u32) -> Result<Fram
 
 /// Renders `zpl` to a PDF file with a page per label.
 #[wasm_bindgen(js_name = renderPdf)]
-pub fn render_pdf(zpl: &str, clock: f64) -> Result<Vec<u8>, ParseFailure> {
-    let commands = Parser::new(zpl).parse().map_err(|e| ParseFailure::new(zpl, e))?;
-    let pages = state(clock).process_pages(commands);
+pub fn render_pdf(zpl: &str, clock: f64, dpmm: u32) -> Result<Vec<u8>, ParseFailure> {
+    let dpmm = resolution(dpmm);
+    let commands = Parser::with_dpmm(zpl, dpmm).parse().map_err(|e| ParseFailure::new(zpl, e))?;
+    let pages = state(clock, dpmm).process_pages(commands);
     let pages: Vec<_> = pages.iter().map(|p| (p.setup, p.instructions.as_slice())).collect();
     Ok(PdfRenderer::for_page(&pages[0].0).render_pages(&pages))
 }
@@ -229,7 +239,7 @@ mod tests {
 
     #[test]
     fn renders_rgba() {
-        let frame = render_rgba("^XA^PW100^LL50^FO10,10^A0N,20,20^FDhi^FS^XZ", 0.0, false, 0).ok().unwrap();
+        let frame = render_rgba("^XA^PW100^LL50^FO10,10^A0N,20,20^FDhi^FS^XZ", 0.0, false, 0, 8).ok().unwrap();
         assert_eq!((frame.width, frame.height), (100, 50));
         assert_eq!(frame.pixels.len(), 100 * 50 * 4);
         assert!(frame.pixels.chunks_exact(4).any(|p| p[0] == 0));
@@ -238,7 +248,7 @@ mod tests {
     #[test]
     fn maps_elements_to_source() {
         let zpl = "^XA^PW300^LL200\n^FO10,10^GB50,40,2^FS\n^FO100,20^A0N,30,30^FDé ok^FS\n^XZ";
-        let frame = render_rgba(zpl, 0.0, false, 0).ok().unwrap();
+        let frame = render_rgba(zpl, 0.0, false, 0, 8).ok().unwrap();
         let e = &frame.elements;
         assert_eq!(e.len(), 2 * ELEMENT_STRIDE);
         assert_eq!(&e[..ELEMENT_STRIDE], &[10, 10, 50, 40, 16, 37, NONE, NONE]);
@@ -253,36 +263,56 @@ mod tests {
     #[test]
     fn data_range_is_the_field_text() {
         let text = |zpl: &str| {
-            let e = render_rgba(zpl, 0.0, false, 0).ok().unwrap().elements;
+            let e = render_rgba(zpl, 0.0, false, 0, 8).ok().unwrap().elements;
             zpl.get(e[6] as usize..e[7] as usize).map(str::to_string)
         };
         assert_eq!(text("^XA^FO10,10^A0N,30,30^FDabc^FS^XZ").as_deref(), Some("abc"));
         assert_eq!(text("^XA^CC~~FO10,10~A0N,30,30~FDabc~FS~XZ").as_deref(), Some("abc"));
         // An empty ^FD draws nothing, so there is no element to click.
-        assert!(render_rgba("^XA^FO10,10^FD^FS^XZ", 0.0, false, 0).ok().unwrap().elements.is_empty());
+        assert!(render_rgba("^XA^FO10,10^FD^FS^XZ", 0.0, false, 0, 8).ok().unwrap().elements.is_empty());
     }
 
     #[test]
     fn renders_pages() {
         let zpl = "^XA^PW100^LL50^FO1,1^GB5,5,5^FS^XZ\n^XA^PQ2^PW200^FO10,10^SN1^FS^FO1,1^GB5,5,5^FS^XZ";
-        let frame = render_rgba(zpl, 0.0, false, 0).ok().unwrap();
+        let frame = render_rgba(zpl, 0.0, false, 0, 8).ok().unwrap();
         assert_eq!((frame.page, frame.page_count, frame.width), (0, 3, 100));
         assert_eq!(frame.elements.len(), ELEMENT_STRIDE);
 
-        let frame = render_rgba(zpl, 0.0, false, 2).ok().unwrap();
+        let frame = render_rgba(zpl, 0.0, false, 2, 8).ok().unwrap();
         assert_eq!((frame.page, frame.width, frame.elements.len()), (2, 200, 2 * ELEMENT_STRIDE));
         // Copies map to the source of the label they repeat.
         assert_eq!(&zpl[frame.elements[4] as usize..frame.elements[5] as usize], "^FO10,10^SN1^FS");
 
         // Past the end shows the last page.
-        assert_eq!(render_rgba(zpl, 0.0, false, 9).ok().unwrap().page, 2);
+        assert_eq!(render_rgba(zpl, 0.0, false, 9, 8).ok().unwrap().page, 2);
 
-        let pdf = render_pdf(zpl, 0.0).ok().unwrap();
+        let pdf = render_pdf(zpl, 0.0, 8).ok().unwrap();
         assert!(String::from_utf8_lossy(&pdf).contains("/Count 3"));
     }
 
     #[test]
+    fn dpmm_sizes_the_default_label() {
+        let size = |dpmm| {
+            let frame = render_rgba("^XA^FO10,10^GB20,20,20^FS^XZ", 0.0, false, 0, dpmm).ok().unwrap();
+            (frame.width, frame.height)
+        };
+        assert_eq!(size(6), (608, 912));
+        assert_eq!(size(12), (1200, 1800));
+        assert_eq!(size(400), (812, 1218));
+        let pdf = render_pdf("^XA^FO10,10^GB20,20,20^FS^XZ", 0.0, 24).ok().unwrap();
+        assert!(String::from_utf8_lossy(&pdf).contains("/MediaBox [0 0 288 432]"));
+    }
+
+    #[test]
+    fn half_density_scales_elements() {
+        let frame = render_rgba("^XA^JMB^PW100^LL50^FO10,10^GB20,10,10^FS^XZ", 0.0, false, 0, 8).ok().unwrap();
+        assert_eq!((frame.width, frame.height), (200, 100));
+        assert_eq!(&frame.elements[..4], &[20, 20, 40, 20]);
+    }
+
+    #[test]
     fn renders_pdf() {
-        assert!(render_pdf("^XA^FO10,10^A0N,20,20^FDhi^FS^XZ", 0.0).ok().unwrap().starts_with(b"%PDF"));
+        assert!(render_pdf("^XA^FO10,10^A0N,20,20^FDhi^FS^XZ", 0.0, 8).ok().unwrap().starts_with(b"%PDF"));
     }
 }

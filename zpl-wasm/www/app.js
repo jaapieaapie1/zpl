@@ -47,6 +47,7 @@ const SAMPLE = `^XA
 ^XZ`;
 
 const STORAGE_KEY = "zpl-playground:source";
+const DPMM_KEY = "zpl-playground:dpmm";
 const STAGE_PADDING = 24; // #preview-pane padding, px
 
 const editor = document.getElementById("zpl");
@@ -60,6 +61,7 @@ const status = document.getElementById("status");
 const size = document.getElementById("size");
 const cursor = document.getElementById("cursor");
 const debug = document.getElementById("debug");
+const dpmm = document.getElementById("dpmm");
 const zoom = document.getElementById("zoom");
 const pager = document.getElementById("pager");
 const pageLabel = document.getElementById("page-label");
@@ -74,6 +76,9 @@ function save(key, value) {
 }
 
 editor.value = load(STORAGE_KEY, SAMPLE);
+// Printer resolution in dots/mm; an unknown stored value leaves the default (8) selected.
+dpmm.value = load(DPMM_KEY, dpmm.value);
+if (!dpmm.value) dpmm.value = "8";
 
 // --- Worker lifecycle -------------------------------------------------------------
 
@@ -112,14 +117,14 @@ function requestPreview() {
   dirty = false;
   inflight = nextId++;
   pane.classList.add("stale");
-  worker.postMessage({ id: inflight, kind: "rgba", zpl: editor.value, debug: debug.checked, page });
+  worker.postMessage({ id: inflight, kind: "rgba", zpl: editor.value, debug: debug.checked, page, dpmm: Number(dpmm.value) });
 }
 
 function requestPdf() {
   const id = nextId++;
   return new Promise((resolve) => {
     pdfRequests.set(id, resolve);
-    worker.postMessage({ id, kind: "pdf", zpl: editor.value });
+    worker.postMessage({ id, kind: "pdf", zpl: editor.value, dpmm: Number(dpmm.value) });
   });
 }
 
@@ -400,6 +405,10 @@ document.addEventListener("keydown", (e) => {
 });
 
 debug.addEventListener("change", requestPreview);
+dpmm.addEventListener("change", () => {
+  save(DPMM_KEY, dpmm.value);
+  requestPreview();
+});
 zoom.addEventListener("change", applyZoom);
 
 function download(blob, name) {

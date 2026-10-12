@@ -5,7 +5,7 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use zpl_parser::Parser;
-use zpl_state_manager::StateManager;
+use zpl_state_manager::{StateManager, DEFAULT_DPMM, DPMM_VALUES};
 
 /// Wall time of each pipeline stage, printed with `--timings`.
 struct Timings {
@@ -67,10 +67,20 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let debug = args.iter().any(|arg| arg == "--debug" || arg == "-d");
     let timings_enabled = args.iter().any(|arg| arg == "--timings" || arg == "-t");
+    // --dpmm N: printer resolution in dots per millimetre (6, 8, 12 or 24; default 8).
+    let dpmm_at = args.iter().position(|arg| arg == "--dpmm");
+    let dpmm = match dpmm_at.map(|i| args.get(i + 1).map(String::as_str).unwrap_or("")) {
+        None => DEFAULT_DPMM,
+        Some(value) => match value.parse::<u32>() {
+            Ok(dpmm) if DPMM_VALUES.contains(&dpmm) => dpmm,
+            _ => fail("--dpmm must be 6, 8, 12 or 24", value),
+        },
+    };
     let output_file = args
         .iter()
-        .find(|arg| !arg.starts_with('-'))
-        .map(|s| s.as_str())
+        .enumerate()
+        .find(|&(i, arg)| !arg.starts_with('-') && dpmm_at.is_none_or(|at| i != at + 1))
+        .map(|(_, s)| s.as_str())
         .unwrap_or("output.png");
     let is_pdf = output_file.to_ascii_lowercase().ends_with(".pdf");
 
@@ -82,12 +92,14 @@ fn main() {
     let input = String::from_utf8(bytes).unwrap_or_else(|e| e.into_bytes().into_iter().map(char::from).collect());
     timings.mark("read stdin");
 
-    let commands = Parser::new(&input)
+    let commands = Parser::with_dpmm(&input, dpmm)
         .parse()
         .unwrap_or_else(|e| fail("Parse error", e));
     timings.mark("parse");
 
-    let pages = StateManager::new().process_pages(commands);
+    let mut state = StateManager::new();
+    state.set_dpmm(dpmm);
+    let pages = state.process_pages(commands);
     let instruction_count: usize = pages.iter().map(|p| p.instructions.len()).sum();
     timings.mark("state");
 
@@ -103,13 +115,7 @@ fn main() {
             .iter()
             .enumerate()
             .map(|(i, page)| {
-                let (width, height) = (page.setup.width, page.setup.height);
-                let renderer = if debug {
-                    PngRenderer::with_debug(width, height, true)
-                } else {
-                    PngRenderer::new(width, height)
-                };
-                let image = renderer.render(&page.instructions);
+                let image = PngRenderer::for_page(&page.setup, debug).render(&page.instructions);
                 timings.mark("render");
                 let path = page_path(output_file, i + 1);
                 let bytes = png_renderer::encode_image(&image, &path)

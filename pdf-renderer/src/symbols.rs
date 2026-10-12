@@ -27,7 +27,7 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
             }
         }
         SymbolSpec::MicroPdf417 { module_width, row_height, mode } => {
-            if let Ok(symbol) = micropdf::micro_pdf417(data.as_bytes(), mode) {
+            if let Ok(symbol) = micropdf::micro_pdf417(&png_renderer::symbol_bytes(data), mode) {
                 let heights = Heights { module: module_width, separator: None, bars: Bars::PerRow(row_height) };
                 draw_stacked(ctx, &symbol, at, &heights);
             }

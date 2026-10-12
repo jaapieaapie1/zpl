@@ -21,6 +21,9 @@ pub use layout::DEJAVU_SANS_BOLD;
 /// Font files, shared with pdf-renderer so the binary holds one copy of each.
 pub static TRIUMVIRATE: &[u8] = include_bytes!("../fonts/ATTriumvirate-BoldCd.otf");
 pub static DEJAVU_SANS_MONO: &[u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
+/// Bitmap fonts E (OCR-B) and H (OCR-A); see fonts/LICENSE_OCR.
+pub static OCR_B: &[u8] = include_bytes!("../fonts/OCRB.otf");
+pub static OCR_A: &[u8] = include_bytes!("../fonts/OCRA.ttf");
 
 const WHITE: Rgb<u8> = Rgb([255, 255, 255]);
 const BLACK: Rgb<u8> = Rgb([0, 0, 0]);
@@ -84,45 +87,156 @@ struct TextFont {
     block_pitch: f32,
 }
 
-/// Bitmap font matrices on a `dpmm` printhead (H, W, intercharacter gap, baseline,
-/// uppercase only); see docs/commands/other/FONTS.md and pdf-renderer's text.rs. Only E and
-/// H differ between resolutions; their gap and baseline scale from the 8 dots/mm values.
-fn bitmap_cell(font: FontName, dpmm: u32) -> Option<(u32, u32, u32, u32, bool)> {
-    let scaled = |(h, w): (u32, u32), (h8, w8, gap8, base8): (u32, u32, u32, u32), uppercase| {
-        let gap = ((gap8 * w) as f32 / w8 as f32).round() as u32;
-        let base = ((base8 * h) as f32 / h8 as f32).round() as u32;
-        (h, w, gap, base, uppercase)
+/// One of Zebra's bitmap fonts A–H as Labelary draws it: an outline font ([`bitmap_face`])
+/// at a fixed size, one character per cell. Dots, at magnification 1.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BitmapCell {
+    /// Matrix (H x W) the magnifications are multiples of (docs/commands/other/FONTS.md).
+    pub height: u32,
+    pub width: u32,
+    /// Distance from one character's cell to the next: the width plus the intercharacter gap.
+    pub pitch: f32,
+    /// Baseline, down from the top of the cell.
+    pub baseline: u32,
+    /// Em size of the outline font, both ways.
+    pub em: f32,
+    /// Uppercase-only character set (B prints lowercase as capitals, H leaves it blank).
+    pub uppercase: bool,
+}
+
+/// Cap height of DejaVu Sans Mono and OCR-A, in em.
+const DEJAVU_CAP_EM: f32 = 1493.0 / 2048.0;
+const OCR_A_CAP_EM: f32 = 0.74;
+
+/// Bitmap font `font` on a `dpmm` printhead; `None` for the scalable fonts. DejaVu Sans Mono
+/// and OCR-A capitals reach from the baseline to the top of the cell, OCR-B's em is the
+/// matrix height. Only E and H change with the resolution, and not quite as the Zebra
+/// tables say: their pitch and baseline are Labelary's (compat/cases/font_eh_*).
+pub fn bitmap_cell(font: FontName, dpmm: u32) -> Option<BitmapCell> {
+    let cell = |height, width, pitch, baseline, em, uppercase| BitmapCell { height, width, pitch, baseline, em, uppercase };
+    let dejavu = |height, width, gap, baseline, uppercase| {
+        cell(height, width, (width + gap) as f32, baseline, baseline as f32 / DEJAVU_CAP_EM, uppercase)
     };
+    let ocr_a = |height, width, pitch, baseline| cell(height, width, pitch, baseline, baseline as f32 / OCR_A_CAP_EM, true);
     Some(match font {
-        FontName::FontA => (9, 5, 1, 7, false),
-        FontName::FontB => (11, 7, 2, 11, true),
-        FontName::FontC | FontName::FontD => (18, 10, 2, 14, false),
-        FontName::FontE => {
-            let size = match dpmm {
-                0..=6 => (21, 10),
-                7..=8 => (28, 15),
-                _ => (42, 20),
-            };
-            scaled(size, (28, 15, 5, 23), false)
-        }
-        FontName::FontF => (26, 13, 3, 21, false),
-        FontName::FontG => (60, 40, 8, 48, false),
-        FontName::FontH => {
-            let size = match dpmm {
-                0..=6 => (17, 11),
-                7..=8 => (21, 13),
-                _ => (34, 22),
-            };
-            scaled(size, (21, 13, 6, 21), true)
-        }
+        FontName::FontA => dejavu(9, 5, 1, 7, false),
+        FontName::FontB => dejavu(11, 7, 2, 11, true),
+        FontName::FontC | FontName::FontD => dejavu(18, 10, 2, 14, false),
+        FontName::FontE => match dpmm {
+            0..=6 => cell(21, 10, 15.0, 16, 21.0, false),
+            7..=8 => cell(28, 15, 20.0, 23, 28.0, false),
+            _ => cell(42, 20, 26.0, 33, 42.0, false),
+        },
+        FontName::FontF => dejavu(26, 13, 3, 21, false),
+        FontName::FontG => dejavu(60, 40, 8, 48, false),
+        FontName::FontH => match dpmm {
+            0..=6 => ocr_a(17, 11, 15.4, 17),
+            7..=8 => ocr_a(21, 13, 19.0, 21),
+            _ => ocr_a(34, 22, 28.0, 30),
+        },
         _ => return None,
     })
 }
 
-/// ^GS symbol matrix (dots, every resolution) and the size its outlines are drawn at, in
-/// cells (Labelary's ® fills 5/8 of the cell).
-const SYMBOL_CELL: u32 = 24;
-const SYMBOL_EM: f32 = 1.42;
+/// Bytes a 2D symbol encodes for its field data, as Labelary does: characters up to U+00FF
+/// as that one byte (^FH escapes arrive as such, see the state manager), others as UTF-8.
+pub fn symbol_bytes(data: &str) -> std::borrow::Cow<'_, [u8]> {
+    if data.is_ascii() {
+        return std::borrow::Cow::Borrowed(data.as_bytes());
+    }
+    let mut out = Vec::with_capacity(data.len());
+    for c in data.chars() {
+        match u8::try_from(c) {
+            Ok(b) => out.push(b),
+            Err(_) => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+        }
+    }
+    out.into()
+}
+
+/// Whether Labelary prints `c` in bitmap font `font` (compat/cases/ci28_bitmap_*); other
+/// characters are blank. OCR-A (H) has ASCII only, OCR-B (E) ASCII and a few national
+/// characters, the others the Latin-1, Windows-1252 and code page 850 repertoire.
+pub fn bitmap_prints(font: FontName, c: char) -> bool {
+    match font {
+        _ if c.is_ascii() => true,
+        FontName::FontH => false,
+        FontName::FontE => "ÄÖÜäöüßÆØæø§¤".contains(c),
+        _ => {
+            matches!(c, '\u{a0}'..='\u{ff}' | '\u{2500}'..='\u{25a0}')
+                || "ŒœŠšŽžŸƒˆ˜–—‘’‚“”„†‡•…‰‹›€™ı‗".contains(c)
+        }
+    }
+}
+
+/// ^GS symbol matrix (dots, every resolution).
+pub const SYMBOL_CELL: u32 = 24;
+
+/// Ink box (W x H dots, magnification 1) Labelary draws ^GS symbol `c` in, at the top left
+/// of the cell: ® and © 15 x 15, ™ 19 x 10, the UL and CSA marks (circled L and c here)
+/// the cell's height.
+pub fn symbol_ink(c: char) -> (u32, u32) {
+    match c {
+        '\u{00AE}' | '\u{00A9}' => (15, 15),
+        '\u{2122}' => (19, 10),
+        '\u{24D2}' => (22, 24),
+        _ => (24, 24),
+    }
+}
+
+/// Font and glyph a ^GS symbol is drawn with: Triumvirate's ® and ©, DejaVu Sans Bold's ™
+/// (closer to Labelary's), and for the UL and CSA marks (no font here has them, nor the
+/// circled letters standing in for them) DejaVu Sans Bold's large circle.
+pub fn symbol_glyph(c: char) -> (&'static [u8], char) {
+    match c {
+        '\u{00AE}' | '\u{00A9}' => (TRIUMVIRATE, c),
+        '\u{2122}' => (DEJAVU_SANS_BOLD, c),
+        _ => (DEJAVU_SANS_BOLD, '\u{25EF}'),
+    }
+}
+
+/// Outline font Labelary draws bitmap font `font` with: OCR-B for E, OCR-A for H, DejaVu
+/// Sans Mono for the others.
+pub fn bitmap_face(font: FontName) -> &'static [u8] {
+    match font {
+        FontName::FontE => OCR_B,
+        FontName::FontH => OCR_A,
+        _ => DEJAVU_SANS_MONO,
+    }
+}
+
+/// Text in a built-in font as Labelary prints it: soft hyphens not at all, and hyphens and
+/// en dashes as the wide minus sign of a font that has one (Triumvirate, DejaVu Sans Mono).
+pub fn dashes(text: &str, minus: bool) -> std::borrow::Cow<'_, str> {
+    if !text.contains(['-', '\u{2013}', '\u{ad}']) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    text.chars()
+        .filter(|&c| c != '\u{ad}')
+        .map(|c| if minus && matches!(c, '-' | '\u{2013}') { '\u{2212}' } else { c })
+        .collect()
+}
+
+/// ^FB text with its soft hyphens (`\-`) as plain dashes; `\\` (a backslash) is kept for
+/// the line breaking to unescape.
+pub fn soft_hyphens(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("\\-") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek()) {
+            ('\\', Some('-')) => {}
+            ('\\', Some('\\')) => {
+                out.push(c);
+                out.extend(chars.next());
+            }
+            _ => out.push(c),
+        }
+    }
+    out.into()
+}
 
 /// Smallest font 0 size (dots); docs/commands/zpl/A.md.
 const MIN_SCALABLE: u32 = 10;
@@ -134,7 +248,8 @@ const FIXED_EM_W: f32 = 0.945;
 /// Fonts P–V: fixed-size font 0 (H x W).
 fn fixed_scalable(font: FontName) -> Option<(u32, u32)> {
     Some(match font {
-        FontName::FontP => (20, 18),
+        // The tables say 20 x 18; Labelary draws P as if 17 wide (compat/cases/font_p).
+        FontName::FontP => (20, 17),
         FontName::FontQ => (28, 24),
         FontName::FontR => (35, 31),
         FontName::FontS => (40, 35),
@@ -179,36 +294,31 @@ fn custom_font(data: &Arc<Vec<u8>>) -> Option<FontArc> {
 impl TextFont {
     fn new(name: FontName, custom: Option<&Arc<Vec<u8>>>, height: u32, width: u32, dpmm: u32) -> Self {
         use ab_glyph::Font;
-
-        let mono: &'static [u8] = DEJAVU_SANS_MONO;
-
-        if let (None, Some((h, w, gap, base, uppercase))) = (custom, bitmap_cell(name, dpmm)) {
-            let font = FontArc::try_from_slice(mono).expect("Error loading font");
-            let (mh, mw) = magnification(height, width, h, w);
+        if let (None, Some(cell)) = (custom, bitmap_cell(name, dpmm)) {
+            let data = bitmap_face(name);
+            let font = FontArc::try_from_slice(data).expect("Error loading font");
+            let (mh, mw) = magnification(height, width, cell.height, cell.width);
             let upem = font.units_per_em().unwrap_or(2048.0);
             // Outline bounds may be y-down; 'H' sits on the baseline, so its extent is the cap height.
             let cap_unscaled =
                 font.outline(font.glyph_id('H')).map_or(upem * 0.73, |o| (o.bounds.max.y - o.bounds.min.y).abs());
-            let (ink_min, ink_w) = font
-                .outline(font.glyph_id('M'))
-                .map_or((0.0, upem * 0.5), |o| (o.bounds.min.x, o.bounds.max.x - o.bounds.min.x));
-            // Cap height = character height above the baseline; 'M' fills the cell width.
-            let cap = (base * mh) as f32;
-            let em_y = cap * upem / cap_unscaled;
-            let em_x = (w * mw) as f32 * upem / ink_w;
+            let (em_y, em_x) = (cell.em * mh as f32, cell.em * mw as f32);
             let px_per_em = font.height_unscaled() / upem;
             let scale = PxScale { x: em_x * px_per_em, y: em_y * px_per_em };
-            let y_offset = ((font.ascent_unscaled() - cap_unscaled) / upem * em_y).round() as i32;
+            let baseline = (cell.baseline * mh) as f32;
+            let y_offset = (font.ascent_unscaled() / upem * em_y - baseline).round() as i32;
+            // Every glyph's advance is centred on the matrix width.
+            let advance = font.h_advance_unscaled(font.glyph_id('M')) / upem * em_x;
             return Self {
                 font,
-                data: layout::FontData::Static(mono),
+                data: layout::FontData::Static(data),
                 cap_em: cap_unscaled / upem,
                 scale,
                 y_offset,
-                cap: cap.round() as i32,
-                line_h: h * mh,
-                cell: Some((((w + gap) * mw) as f32, -ink_min / upem * em_x)),
-                uppercase,
+                cap: baseline.round() as i32,
+                line_h: cell.height * mh,
+                cell: Some((cell.pitch * mw as f32, ((cell.width * mw) as f32 - advance) / 2.0)),
+                uppercase: cell.uppercase,
                 block_pitch: match name {
                     FontName::FontA => 1.074,
                     FontName::FontE => 1.0,
@@ -234,10 +344,6 @@ impl TextFont {
             }
             None => (FontArc::try_from_slice(TRIUMVIRATE).expect("Error loading font"), 0.75),
         };
-        if name == FontName::Symbol {
-            return Self::symbol(height, width);
-        }
-
         let fixed = fixed_scalable(name).filter(|_| custom.is_none());
         let (height, width) = match fixed {
             Some((h, w)) => {
@@ -273,24 +379,41 @@ impl TextFont {
         Self { font, data, cap_em, scale, y_offset, cap, line_h, cell: None, uppercase: false, block_pitch: 1.26 }
     }
 
-    /// ^GS: font 0 outlines in the magnified 24 x 24 symbol cell, drawn at Labelary's size
-    /// (a little larger than the cell's em) with the cell as the line height.
-    fn symbol(height: u32, width: u32) -> Self {
+    /// ^GS `symbol` in the magnified 24 x 24 cell, the cell as the line height: its outline
+    /// stretched over [`symbol_ink`] at the top left of the cell, drawn as a one-character cell.
+    fn symbol(height: u32, width: u32, symbol: char) -> Self {
         use ab_glyph::Font;
-        let font = FontArc::try_from_slice(TRIUMVIRATE).expect("Error loading font");
+        let (data, glyph) = symbol_glyph(symbol);
+        let font = FontArc::try_from_slice(data).expect("Error loading font");
         let (mh, mw) = magnification(height, width, SYMBOL_CELL, SYMBOL_CELL);
         let (cell_h, cell_w) = (SYMBOL_CELL * mh, SYMBOL_CELL * mw);
-        let (em_h, em_w) = (cell_h as f32 * SYMBOL_EM, cell_w as f32 * SYMBOL_EM);
-        let units_per_em = font.units_per_em().unwrap_or(1000.0);
-        let px_per_em = font.height_unscaled() / units_per_em;
-        let cap_em = 0.75;
-        let y_offset = (font.ascent_unscaled() / units_per_em * em_h - em_h * cap_em).round() as i32;
-        // ^FT puts the bottom of the cell, not the outlines' baseline, on the origin.
-        let cap = cell_h as i32;
+        let upem = font.units_per_em().unwrap_or(1000.0);
+        let px_per_em = font.height_unscaled() / upem;
+        // Outline bounds may be y-down: the top is the larger y either way.
+        let ink = font.outline(font.glyph_id(glyph)).map(|o| o.bounds);
+        let (x_min, y_max, ink_w, ink_h) = ink.map_or((0.0, upem * 0.75, upem, upem), |b| {
+            (b.min.x, b.max.y.max(b.min.y), b.width(), (b.max.y - b.min.y).abs())
+        });
+        let (w, h) = symbol_ink(symbol);
+        let (em_w, em_h) = ((w * mw) as f32 * upem / ink_w, (h * mh) as f32 * upem / ink_h);
         let scale = PxScale { x: em_w * px_per_em, y: em_h * px_per_em };
-        let data = layout::FontData::Static(TRIUMVIRATE);
-        let line_h = cell_h;
-        Self { font, data, cap_em, scale, y_offset, cap, line_h, cell: None, uppercase: false, block_pitch: 1.26 }
+        let y_offset = ((font.ascent_unscaled() - y_max) / upem * em_h).round() as i32;
+        // ^FT puts the bottom of the cell on the origin.
+        let cap = cell_h as i32;
+        let cell = Some((cell_w as f32, -x_min / upem * em_w));
+        let data = layout::FontData::Static(data);
+        Self { font, data, cap_em: 0.75, scale, y_offset, cap, line_h: cell_h, cell, uppercase: false, block_pitch: 1.26 }
+    }
+
+    fn has_glyph(&self, c: char) -> bool {
+        use ab_glyph::Font;
+        self.font.glyph_id(c).0 != 0
+    }
+
+    /// Whether `text` has a character this font has no glyph for (Triumvirate covers ASCII).
+    fn lacks_glyph(&self, text: &str) -> bool {
+        use ab_glyph::Font;
+        !text.is_ascii() && text.chars().any(|c| self.font.glyph_id(c).0 == 0)
     }
 
     /// Distance between ^TB lines in dots.
@@ -632,7 +755,10 @@ impl PngRenderer {
                     self.draw_origin_cross(image, *x, *y, Rgb([255, 0, 0]));
                 }
                 let name = *font;
-                let font = TextFont::new(name, custom_font.as_ref(), *height, *width, self.dpmm);
+                let font = match text.chars().next() {
+                    Some(symbol) if name == FontName::Symbol => TextFont::symbol(*height, *width, symbol),
+                    _ => TextFont::new(name, custom_font.as_ref(), *height, *width, self.dpmm),
+                };
                 // Control characters (from ^FH escapes such as _0D) print nothing.
                 let text: String = text.chars().filter(|&c| c >= ' ' && c != '\x7f').collect();
                 // Uppercase-only fonts: B capitalises, OCR-A (H) leaves lowercase blank (Labelary).
@@ -640,6 +766,27 @@ impl PngRenderer {
                     (false, _) => text,
                     (true, FontName::FontH) => text.chars().map(|c| if c.is_lowercase() { ' ' } else { c }).collect(),
                     (true, _) => text.to_uppercase(),
+                };
+                // Bitmap fonts leave the characters they lack blank.
+                let text = match font.cell {
+                    Some(_) if custom_font.is_none() && name != FontName::Symbol && !text.is_ascii() => text
+                        .chars()
+                        .map(|c| if bitmap_prints(name, c) && font.has_glyph(c) { c } else { ' ' })
+                        .collect(),
+                    _ => text,
+                };
+                // ^FB: `\-` is a soft hyphen, which Labelary prints as a dash.
+                let text = match block {
+                    Some(b) if b.clip_height.is_none() => soft_hyphens(&text).into_owned(),
+                    _ => text,
+                };
+                let text = match name {
+                    FontName::Symbol => text.chars().map(|c| symbol_glyph(c).1).collect(),
+                    _ => text,
+                };
+                let text = match (custom_font, name) {
+                    (None, n) if n != FontName::Symbol => dashes(&text, font.has_glyph('\u{2212}')).into_owned(),
+                    _ => text,
                 };
                 let placement = Placement { orientation: *orientation, justification: *justification, anchor: *anchor };
                 let flow = (*direction, *char_gap);
@@ -669,7 +816,7 @@ impl PngRenderer {
             DrawInstruction::DrawDataMatrix {
                 x, y, data, orientation, module_height, symbol_height, columns, rows, escape, rectangular, bottom,
             } => {
-                if let Ok(m) = matrix::datamatrix(data.as_bytes(), *rows, *columns, *rectangular, *escape) {
+                if let Ok(m) = matrix::datamatrix(&symbol_bytes(data), *rows, *columns, *rectangular, *escape) {
                     // Without an explicit module size the ^BY height is the approximate symbol height.
                     let module = module_height.unwrap_or(symbol_height / m.height.max(1)).max(1);
                     self.render_matrix(image, &m, *x, *y, *orientation, module, module, *bottom);
@@ -679,7 +826,7 @@ impl PngRenderer {
                 x, y, data, orientation, row_height, module_width, symbol_height, security, columns, rows,
                 truncated, bottom,
             } => {
-                if let Ok(m) = matrix::pdf417(data.as_bytes(), *security, *columns, *rows, *truncated) {
+                if let Ok(m) = matrix::pdf417(&symbol_bytes(data), *security, *columns, *rows, *truncated) {
                     let module = (*module_width).max(1);
                     // Row height in dots, or the ^BY height shared by all rows.
                     let row = row_height.unwrap_or(symbol_height / m.height.max(1)).max(1);
@@ -687,7 +834,7 @@ impl PngRenderer {
                 }
             }
             DrawInstruction::DrawAztec { x, y, data, orientation, magnification, ecc, bottom } => {
-                if let Ok(m) = matrix::aztec(data.as_bytes(), *ecc) {
+                if let Ok(m) = matrix::aztec(&symbol_bytes(data), *ecc) {
                     let module = (*magnification).max(1);
                     self.render_matrix(image, &m, *x, *y, *orientation, module, module, *bottom);
                 }
@@ -754,7 +901,9 @@ impl PngRenderer {
         // ^PA bidi/shaping: scalable fonts are laid out as glyph runs (with a fallback font
         // for Hebrew/Arabic); bitmap fonts keep their cells and are only reordered.
         let advanced = layout::active(text_layout, text);
-        let runs = advanced && font.cell.is_none();
+        // Characters the font lacks (Triumvirate has no Cyrillic, little Greek) are drawn
+        // from the fallback font, which takes the glyph-run path ^PA text takes.
+        let runs = font.cell.is_none() && (advanced || font.lacks_glyph(text));
         let primary = runs.then(|| layout::LayoutFont { font: font.font.clone(), data: font.data.clone(), scale: font.scale });
         let measure = |s: &str| match &primary {
             Some(p) => layout::layout_line(p, font.cap_em, text_layout, s).width,
@@ -765,8 +914,9 @@ impl PngRenderer {
         // The unrotated text box: as wide as the text (or the ^FB block), one line height per
         // row, with the top of the capitals at the top of each row.
         let mut rows: Vec<(i32, i32, String)> = Vec::new();
-        // ^FPR: how far the text is moved back along its direction, so that its first
-        // character (drawn last, on the right) starts at the origin as Labelary does.
+        // ^FPR: how far the text is moved back along its direction. Labelary ends the line
+        // (its first character, drawn last on the right) an 'M' minus the gap after the
+        // origin, so a bitmap font's first cell starts at the origin.
         let mut back = 0.0;
         // ^FB: the block is as tall as its maximum number of lines; rows left empty below
         // the text still count when placing it (rotated, or by ^FT).
@@ -788,7 +938,6 @@ impl PngRenderer {
                 // ^FPH / ^FPR with a gap between the characters, drawn one by one.
                 let gap = char_gap as f32;
                 let mut pen = 0.0f32;
-                let mut first = 0.0;
                 let chars: Vec<char> = match direction {
                     FieldDirection::Reverse => text.chars().rev().collect(),
                     _ => text.chars().collect(),
@@ -798,12 +947,12 @@ impl PngRenderer {
                     if i > 0 {
                         pen += gap;
                     }
+                    let advance = measure(&c);
                     rows.push((pen.round() as i32, 0, c));
-                    first = measure(&rows[i].2);
-                    pen += first;
+                    pen += advance;
                 }
                 if direction == FieldDirection::Reverse {
-                    back = pen - first;
+                    back = pen - (measure("M") - gap);
                 }
                 (pen.ceil() as u32, height, 0)
             }
@@ -917,12 +1066,12 @@ impl PngRenderer {
             TextAnchor::Top => (x as i64, y as i64),
             TextAnchor::Baseline => (x as i64 - px, y as i64 - py),
         };
+        // Labelary moves ^FPR text back only where that is left or up on the page.
         let back = back.round() as i64;
         match orientation {
             Orientation::Normal => x -= back,
             Orientation::Rotated90 => y -= back,
-            Orientation::Rotated180 => x += back,
-            Orientation::Rotated270 => y += back,
+            Orientation::Rotated180 | Orientation::Rotated270 => {}
         }
         // ^FO / ^FT right justification moves the rotated box left on the page; auto is
         // left for left-to-right text (Labelary).
@@ -1579,10 +1728,10 @@ mod tests {
 
     #[test]
     fn bitmap_fonts_e_and_h_follow_resolution() {
-        assert_eq!(bitmap_cell(FontName::FontE, 6).unwrap().0, 21);
-        assert_eq!(bitmap_cell(FontName::FontE, 8).unwrap().0, 28);
-        assert_eq!(bitmap_cell(FontName::FontE, 24).unwrap().0, 42);
-        assert_eq!(bitmap_cell(FontName::FontH, 12).unwrap().1, 22);
+        assert_eq!(bitmap_cell(FontName::FontE, 6).unwrap().height, 21);
+        assert_eq!(bitmap_cell(FontName::FontE, 8).unwrap().height, 28);
+        assert_eq!(bitmap_cell(FontName::FontE, 24).unwrap().height, 42);
+        assert_eq!(bitmap_cell(FontName::FontH, 12).unwrap().width, 22);
         assert_eq!(bitmap_cell(FontName::FontA, 24), bitmap_cell(FontName::FontA, 8));
     }
 

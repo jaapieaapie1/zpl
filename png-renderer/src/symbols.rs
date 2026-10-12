@@ -29,7 +29,7 @@ impl PngRenderer {
                 })
             }
             SymbolSpec::MicroPdf417 { module_width, row_height, mode } => {
-                micropdf::micro_pdf417(data.as_bytes(), mode).ok().map(|symbol| {
+                micropdf::micro_pdf417(&crate::symbol_bytes(data), mode).ok().map(|symbol| {
                     let heights = Heights { module: module_width, separator: None, bars: Bars::PerRow(row_height) };
                     stacked_frame(&symbol, &heights, None)
                 })

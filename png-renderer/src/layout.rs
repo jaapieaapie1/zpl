@@ -21,8 +21,9 @@ use zpl_parser::command::TextLayout;
 /// Shared with pdf-renderer so the font is embedded in the binary once.
 pub static DEJAVU_SANS_BOLD: &[u8] = include_bytes!("../../pdf-renderer/fonts/DejaVuSans-Bold.ttf");
 
-/// Horizontal squeeze of fallback glyphs next to the condensed Triumvirate (as in the PDF).
-const FALLBACK_CONDENSE: f32 = 0.8;
+/// Horizontal squeeze of fallback glyphs next to the condensed Triumvirate (as in the PDF):
+/// Labelary's Greek and Cyrillic advance about 0.7 as far as DejaVu Sans Bold's.
+const FALLBACK_CONDENSE: f32 = 0.7;
 
 /// Whether `layout` changes how `text` is laid out (otherwise the classic path draws it).
 pub(crate) fn active(layout: &TextLayout, text: &str) -> bool {

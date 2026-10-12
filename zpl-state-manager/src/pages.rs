@@ -24,21 +24,20 @@ pub(crate) enum Serial {
 }
 
 impl Serial {
-    /// The data `step` serial numbers after `base`; step 0 is `base` itself.
+    /// The data `step` serial numbers after `base`; step 0 is `base` itself, but for the
+    /// leading zeros ^SN without them blanks.
     pub(crate) fn value(&self, base: &str, step: u64) -> String {
-        if step == 0 {
-            return base.to_string();
-        }
         match self {
             Serial::Number { increment, leading_zeros } => number(base, *increment, *leading_zeros, step),
+            Serial::Mask { .. } if step == 0 => base.to_string(),
             Serial::Mask { mask, increment } => masked(base, mask, increment, step),
         }
     }
 }
 
-/// ^SN. With leading zeros the number keeps its width and wraps around like a counter;
-/// without, it grows freely (up to 12 digits) and is printed unpadded. Counting below zero
-/// wraps around either way.
+/// ^SN. The number keeps its width and wraps around like a counter. Without leading zeros
+/// a value that stays in range is padded with spaces instead (Labelary: `007` prints as
+/// `  7` and counts on as `  8`, `1000` down as ` 999`, but `99` up as `00`).
 fn number(base: &str, increment: i64, leading_zeros: bool, step: u64) -> String {
     let bytes = base.as_bytes();
     let Some(last) = bytes.iter().rposition(u8::is_ascii_digit) else { return base.to_string() };
@@ -50,12 +49,11 @@ fn number(base: &str, increment: i64, leading_zeros: bool, step: u64) -> String 
     let width = end - start;
     let value: i128 = base[start..end].parse().unwrap_or(0);
     let next = value + increment as i128 * step as i128;
-    let digits = if leading_zeros {
-        format!("{:0width$}", next.rem_euclid(10i128.pow(width as u32)))
-    } else if next < 0 {
-        next.rem_euclid(10i128.pow(width as u32)).to_string()
+    let modulus = 10i128.pow(width as u32);
+    let digits = if leading_zeros || !(0..modulus).contains(&next) {
+        format!("{:0width$}", next.rem_euclid(modulus))
     } else {
-        (next % 10i128.pow(12)).to_string()
+        format!("{next:>width$}")
     };
     format!("{}{digits}{}", &base[..start], &base[end..])
 }
@@ -86,7 +84,8 @@ fn mask_radix(mask: char) -> u32 {
 /// ^SF. Each masked position gains its increment digit times `step`, plus the carry from
 /// the right; % positions are skipped and the carry passes over them, so `BL09-9` under
 /// `AADD%D` with increment `1%1` becomes `BL11-0`. A carry out of the leftmost masked
-/// position is dropped. Characters invalid for their position count as zero.
+/// position is dropped. Characters invalid for their position are kept and stop the carry
+/// (Labelary: `ZZ99` under `DDDD` plus one is `ZZ00`).
 fn masked(base: &str, mask: &str, increment: &str, step: u64) -> String {
     let mut data: Vec<char> = base.chars().collect();
     let mut increment = increment.chars().rev();
@@ -98,7 +97,11 @@ fn masked(base: &str, mask: &str, increment: &str, step: u64) -> String {
         }
         let c = data[pos];
         let radix = mask_radix(m) as u128;
-        let total = mask_digit(m, c).unwrap_or(0) as u128 + inc as u128 * step as u128 + carry;
+        let Some(value) = mask_digit(m, c) else {
+            carry = 0;
+            continue;
+        };
+        let total = value as u128 + inc as u128 * step as u128 + carry;
         let digit = (total % radix) as u32;
         let out = if m == 'A' {
             char::from(b'A' + digit as u8)
@@ -211,12 +214,14 @@ mod tests {
         let n = |base: &str, inc: i64, zeros: bool, step: u64| Serial::Number { increment: inc, leading_zeros: zeros }.value(base, step);
         assert_eq!(n("A007", 1, true, 0), "A007");
         assert_eq!(n("A007", 1, true, 3), "A010");
-        assert_eq!(n("A007", 1, false, 0), "A007");
-        assert_eq!(n("A007", 1, false, 3), "A10");
-        assert_eq!(n("Box 99 of", 1, false, 1), "Box 100 of");
+        assert_eq!(n("A007", 1, false, 0), "A  7");
+        assert_eq!(n("A007", 1, false, 3), "A 10");
+        assert_eq!(n("1000", -1, false, 1), " 999");
+        assert_eq!(n("Box 99 of", 1, false, 1), "Box 00 of");
         assert_eq!(n("999", 1, true, 1), "000");
         assert_eq!(n("010", -5, true, 3), "995");
-        assert_eq!(n("10", -3, false, 2), "4");
+        assert_eq!(n("10", -3, false, 2), " 4");
+        assert_eq!(n("10", -6, false, 2), "98");
         assert_eq!(n("1", -3, false, 1), "8");
         assert_eq!(n("12X", 10, false, 2), "32X");
         assert_eq!(n("none", 1, false, 5), "none");
@@ -239,5 +244,8 @@ mod tests {
         // B is one for letters; the mask only covers the end of the data.
         assert_eq!(m("xxZ", "A", "B", 1), "xxA");
         assert_eq!(m("12", "DD", "5", 4), "32");
+        // Invalid characters are kept and stop the carry.
+        assert_eq!(m("ZZ99", "DDDD", "1", 1), "ZZ00");
+        assert_eq!(m("ZZ09", "DDDD", "10", 1), "ZZ19");
     }
 }

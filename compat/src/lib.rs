@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use image::{Rgb, RgbImage};
 use png_renderer::PngRenderer;
 use zpl_parser::Parser;
-use zpl_state_manager::{PageSetup, StateManager};
+use zpl_state_manager::{nominal_dpi, PageSetup, StateManager};
 
 /// A mismatched dot within this many dots (horizontally, vertically or diagonally) of a dot
 /// of the same colour in the other image is a rounding or anti-aliasing shift, not an error.
@@ -84,13 +84,23 @@ impl Case {
     /// Labelary, the label is as tall as the media whatever its ^LL, and keeps its ^PW width
     /// (see [`png_renderer::place_on_media`]).
     pub fn render(&self, width: u32, height: u32) -> Result<Vec<Bitmap>, String> {
-        let commands = Parser::new(&self.zpl).parse().map_err(|e| format!("parse error: {e:?}"))?;
-        let pages = StateManager::new().process_pages(commands);
+        let commands = Parser::with_dpmm(&self.zpl, self.dpmm).parse().map_err(|e| format!("parse error: {e:?}"))?;
+        let mut state = StateManager::new();
+        state.set_dpmm(self.dpmm);
+        let pages = state.process_pages(commands);
         Ok(pages
             .iter()
             .map(|page| {
                 let (num, den) = page.setup.scale;
-                let setup = PageSetup { height: (height as u64 * den as u64 / num as u64) as u32, ..page.setup };
+                // Without ^PW Labelary's page is as wide as the media, which at 12 and 24 dots/mm
+                // is a little wider than the 4 inches at the nominal 300 / 600 dpi.
+                let default_width = 4 * nominal_dpi(self.dpmm) * den / num;
+                let page_width = if page.setup.width == default_width { width * den / num } else { page.setup.width };
+                let setup = PageSetup {
+                    width: page_width,
+                    height: (height as u64 * den as u64 / num as u64) as u32,
+                    ..page.setup
+                };
                 let image = PngRenderer::for_page(&setup, false).render(&page.instructions);
                 Bitmap::from_rgb(&png_renderer::place_on_media(image, width, height))
             })

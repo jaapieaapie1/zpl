@@ -1,0 +1,8 @@
+^XA
+^FX compat: 4x2^FS
+^FO20,20^A0N,40,40^FDci0 a-b 1-2^FS
+^CI28
+^FO20,80^A0N,40,40^FDci28 a-b a–b a­b^FS
+^FO20,140^APN^FDP a-b^FS
+^FO20,180^ADN,36,20^FDD a-b^FS
+^XZ

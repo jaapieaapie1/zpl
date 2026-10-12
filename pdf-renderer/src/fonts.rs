@@ -28,7 +28,14 @@ pub enum FontId {
     /// DejaVuSans-Bold.ttf — per-character fallback for glyphs the other fonts lack
     /// (Greek, Cyrillic, symbols such as ™ ® €, ...).
     DejaVuSansBold,
+    /// OCRB.otf (CFF) — bitmap font E.
+    OcrB,
+    /// OCRA.ttf — bitmap font H.
+    OcrA,
 }
+
+/// Number of [`FontId`]s, for the per-font caches.
+pub(crate) const BUILTIN_FONTS: usize = 5;
 
 
 impl FontId {
@@ -41,12 +48,14 @@ impl FontId {
             FontId::DejaVuMono => png_renderer::DEJAVU_SANS_MONO,
             // pdf-renderer/fonts/DejaVuSans-Bold.ttf
             FontId::DejaVuSansBold => png_renderer::DEJAVU_SANS_BOLD,
+            FontId::OcrB => png_renderer::OCR_B,
+            FontId::OcrA => png_renderer::OCR_A,
         }
     }
 
     /// Parsed font face (parsed once, cached for the process lifetime).
     pub(crate) fn face(self) -> &'static Face<'static> {
-        static FACES: [OnceLock<Face<'static>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+        static FACES: [OnceLock<Face<'static>>; BUILTIN_FONTS] = [const { OnceLock::new() }; BUILTIN_FONTS];
         FACES[self as usize].get_or_init(|| Face::parse(self.data(), 0).expect("embedded font must parse"))
     }
 
@@ -56,6 +65,8 @@ impl FontId {
             FontId::Triumvirate => Name(b"F0"),
             FontId::DejaVuMono => Name(b"F1"),
             FontId::DejaVuSansBold => Name(b"F2"),
+            FontId::OcrB => Name(b"F3"),
+            FontId::OcrA => Name(b"F4"),
         }
     }
 
@@ -65,12 +76,14 @@ impl FontId {
             FontId::Triumvirate => "ATTriumvirate-BoldCd",
             FontId::DejaVuMono => "DejaVuSansMono",
             FontId::DejaVuSansBold => "DejaVuSans-Bold",
+            FontId::OcrB => "OCRB",
+            FontId::OcrA => "OCRA",
         }
     }
 
     /// Shaping face over the same bytes as [`FontId::data`] (built once, cached).
     pub(crate) fn shaper(self) -> &'static rustybuzz::Face<'static> {
-        static SHAPERS: [OnceLock<rustybuzz::Face<'static>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+        static SHAPERS: [OnceLock<rustybuzz::Face<'static>>; BUILTIN_FONTS] = [const { OnceLock::new() }; BUILTIN_FONTS];
         SHAPERS[self as usize].get_or_init(|| rustybuzz::Face::from_face(self.face().clone()))
     }
 

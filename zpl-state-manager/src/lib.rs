@@ -507,6 +507,11 @@ fn stored_name(name: &str) -> String {
 /// Decodes ^FH escapes (`<indicator>` + two hex digits). Each run of consecutive escaped
 /// bytes is decoded with the ^CI character set; literal text is kept as is.
 fn decode_hex_escapes(data: &str, indicator: char, encoding: Encoding) -> String {
+    hex_escapes(data, indicator, |run| charset::decode(run, encoding))
+}
+
+/// Replaces each run of consecutive ^FH escapes by `decode` of its bytes.
+fn hex_escapes(data: &str, indicator: char, decode: impl Fn(&[u8]) -> String) -> String {
     let hex = |c: Option<char>| c.and_then(|c| c.to_digit(16));
     let mut out = String::with_capacity(data.len());
     let mut run = Vec::new();
@@ -521,16 +526,27 @@ fn decode_hex_escapes(data: &str, indicator: char, encoding: Encoding) -> String
             }
         }
         if !run.is_empty() {
-            out.push_str(&charset::decode(&run, encoding));
+            out.push_str(&decode(&run));
             run.clear();
         }
         out.push(c);
         rest = &rest[c.len_utf8()..];
     }
     if !run.is_empty() {
-        out.push_str(&charset::decode(&run, encoding));
+        out.push_str(&decode(&run));
     }
     out
+}
+
+/// ^FH escapes in a 2D symbol's data, as Labelary encodes them: each escaped byte is a
+/// character U+0000-U+00FF, which the renderers encode as that byte again (see
+/// png-renderer's `symbol_bytes`), so `_E9` is the byte E9 under ^CI0. Under ^CI28 the
+/// escapes are UTF-8, decoded to characters and invalid sequences dropped.
+fn symbol_hex_escapes(data: &str, indicator: char, encoding: Encoding) -> String {
+    match encoding {
+        Encoding::Utf8 => hex_escapes(data, indicator, |run| String::from_utf8_lossy(run).replace('\u{FFFD}', "")),
+        _ => hex_escapes(data, indicator, |run| run.iter().map(|&b| char::from(b)).collect()),
+    }
 }
 
 /// Expands ^FE references to ^FN data: `#n#` inserts field n, `#n,f,x,y#` / `#n,b,x,y#` inserts
@@ -891,7 +907,14 @@ impl StateManager {
             Command::FieldNumber { number } => self.field.number = Some(number),
 
             Command::FielData { data } => {
+                // 2D symbols encode bytes, not text: their escapes stay raw bytes (see
+                // `symbol_hex_escapes`).
+                let bytes = matches!(
+                    self.field.mode,
+                    FieldMode::DataMatrix { .. } | FieldMode::Pdf417 { .. } | FieldMode::Aztec { .. } | FieldMode::Symbol { .. }
+                );
                 let mut data = match self.field.hex_indicator {
+                    Some(ind) if bytes => symbol_hex_escapes(&data, ind, self.character_encoding),
                     Some(ind) => decode_hex_escapes(&data, ind, self.character_encoding),
                     None => data,
                 };
@@ -1203,12 +1226,19 @@ impl StateManager {
             self.format_values.insert(n, data.clone());
         }
 
-        if let (Some(serial), Some(log)) = (field.serial, &mut self.page_log) {
-            // ^GS data picks symbols rather than printing; it isn't serialized.
-            if !matches!(field.mode, FieldMode::GraphicSymbol { .. }) {
-                log.serial(out.len(), data.clone(), serial);
+        // ^GS data picks symbols rather than printing; it isn't serialized.
+        let serial = field.serial.filter(|_| !matches!(field.mode, FieldMode::GraphicSymbol { .. }));
+        // The first label prints serial number 0 (^SN without leading zeros blanks them).
+        let data = match serial {
+            Some(serial) => {
+                let first = serial.value(&data, 0);
+                if let Some(log) = &mut self.page_log {
+                    log.serial(out.len(), data, serial);
+                }
+                first
             }
-        }
+            None => data,
+        };
 
         let (x, y) = self.origin();
         let bottom = self.field_typeset;
@@ -1411,6 +1441,10 @@ mod tests {
         assert_eq!(decode_hex_escapes("_E9", '_', Encoding::Cp1252), "é");
         assert_eq!(decode_hex_escapes("_82", '_', Encoding::Usa1), "é");
         assert_eq!(decode_hex_escapes("#41", '#', Encoding::Usa1), "A");
+        // 2D symbols keep the bytes (Labelary): E9 stays E9 under ^CI0, invalid UTF-8 is dropped.
+        assert_eq!(symbol_hex_escapes("A_E9B", '_', Encoding::Usa1), "A\u{e9}B");
+        assert_eq!(symbol_hex_escapes("A_E9B", '_', Encoding::Utf8), "AB");
+        assert_eq!(symbol_hex_escapes("A_C3_A9B", '_', Encoding::Utf8), "AéB");
         let ins = run("^XA^FO1,1^FH^FDx_41^FS^FO1,1^FDx_41^FS^XZ");
         assert_eq!(texts(&run("^XA^CI28^FO1,1^FH^FD_C3_A9^FS^CI27^FO1,1^FH^FD_E9^FS^XZ")), ["é", "é"]);
         assert_eq!(texts(&ins), ["xA", "x_41"]);
@@ -1676,8 +1710,8 @@ mod tests {
         let all: Vec<_> = pages.iter().map(data).collect();
         assert_eq!(
             all,
-            // 10 - 15 wraps around to 95.
-            [["A008", "static", "10"], ["A009", "static", "5"], ["A010", "static", "0"], ["A011", "static", "95"]]
+            // Two digits wide, padded with spaces; 10 - 15 wraps around to 95.
+            [["A008", "static", "10"], ["A009", "static", " 5"], ["A010", "static", " 0"], ["A011", "static", "95"]]
         );
         assert!(matches!(&pages[1].instructions[2], DrawInstruction::Reverse(inner) if matches!(**inner, DrawInstruction::DrawBarcode { .. })));
     }

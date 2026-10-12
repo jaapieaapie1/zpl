@@ -1,0 +1,14 @@
+OCRA.ttf (font H): OCR-A by John Sauter, 2004, traced from the OCR-A METAFONT sources
+(Tor Lillqvist, Richard B. Wales) after ANSI X3.17-1977. Taken from Debian's
+fonts-ocr-a 1.0-12 (http://sourceforge.net/projects/ocr-a-font), whose copyright file
+reads:
+
+    This software is released into the public domain.
+
+OCRB.otf (font E): ocrb10.otf from CTAN's ocr-b-outline package (Z. Wagner, 2010),
+traced from the OCR-B METAFONT sources by Norbert Schwarz, Ruhr-Universitaet Bochum.
+Its README reads:
+
+    The license of the outline fonts is the same as for the original fonts,
+    i.e. you may freely use, modify, and/or distribute any of these files,
+    without limitation.

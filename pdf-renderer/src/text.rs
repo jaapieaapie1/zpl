@@ -17,74 +17,32 @@ use zpl_state_manager::{DrawInstruction, TextAnchor, TextBlock};
 /// cap height is taken as 0.75 em.
 const CAP_HEIGHT_EM: f32 = 0.75;
 
-/// Horizontal squeeze for DejaVu Sans Bold fallback glyphs next to the condensed Triumvirate.
-const FALLBACK_CONDENSE: f32 = 0.8;
+/// Horizontal squeeze for DejaVu Sans Bold fallback glyphs next to the condensed Triumvirate:
+/// Labelary's Greek and Cyrillic advance about 0.7 as far as DejaVu Sans Bold's.
+const FALLBACK_CONDENSE: f32 = 0.7;
 
-/// Monospaced outline font that stands in for the bitmap fonts A–H. The regular face is
-/// the one barcode interpretation lines embed anyway (a third embedded font costs ~60 µs a
-/// label); it is emboldened by stroking the outlines, see [`BITMAP_STROKE_EM`].
-const BITMAP_FONT: FontId = FontId::DejaVuMono;
+/// Outline fonts Labelary draws the bitmap fonts with (see png-renderer's `bitmap_cell`):
+/// DejaVu Sans Mono, the regular face barcode interpretation lines embed anyway (a further
+/// embedded font costs ~60 µs a label), OCR-B for E and OCR-A for H. They are emboldened by
+/// stroking the outlines, see [`BITMAP_STROKE_EM`].
+fn bitmap_font(font: FontName) -> FontId {
+    match font {
+        FontName::FontE => FontId::OcrB,
+        FontName::FontH => FontId::OcrA,
+        _ => FontId::DejaVuMono,
+    }
+}
 
 /// Outline stroke width for bitmap-font glyphs, in em of the cap height: brings DejaVu Sans
 /// Mono's stems close to the weight of Zebra's bitmap fonts.
 const BITMAP_STROKE_EM: f32 = 0.055;
 
-/// One of Zebra's bitmapped fonts A–H at magnification 1, in dots ("Intercharacter Gap and
-/// Baseline Parameters" / "Font Matrices" in docs/commands/other/FONTS.md).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BitmapCell {
-    pub height: u32,
-    pub width: u32,
-    /// Intercharacter gap after every character.
-    pub gap: u32,
-    /// Baseline, measured down from the top of the cell.
-    pub baseline: u32,
-    /// Uppercase-only character set (fonts B and H have no lowercase or descenders).
-    pub uppercase: bool,
-}
-
-/// Matrix of bitmap font `font` on a `dpmm` dots/mm printhead; `None` for scalable fonts.
-pub(crate) fn bitmap_cell(font: FontName, dpmm: u32) -> Option<BitmapCell> {
-    let cell = |height, width, gap, baseline, uppercase| BitmapCell { height, width, gap, baseline, uppercase };
-    // Only E (OCR-B) and H (OCR-A) differ between resolutions; gap and baseline are given
-    // for 8 dots/mm and scaled with the matrix elsewhere.
-    let scaled = |h: u32, w: u32, (h8, w8, gap8, base8): (u32, u32, u32, u32), uppercase| {
-        let gap = ((gap8 * w) as f32 / w8 as f32).round() as u32;
-        let base = ((base8 * h) as f32 / h8 as f32).round() as u32;
-        cell(h, w, gap, base, uppercase)
-    };
-    Some(match font {
-        FontName::FontA => cell(9, 5, 1, 7, false),
-        FontName::FontB => cell(11, 7, 2, 11, true),
-        FontName::FontC | FontName::FontD => cell(18, 10, 2, 14, false),
-        FontName::FontE => {
-            let (h, w) = match dpmm {
-                0..=6 => (21, 10),
-                7..=8 => (28, 15),
-                _ => (42, 20),
-            };
-            scaled(h, w, (28, 15, 5, 23), false)
-        }
-        FontName::FontF => cell(26, 13, 3, 21, false),
-        FontName::FontG => cell(60, 40, 8, 48, false),
-        FontName::FontH => {
-            let (h, w) = match dpmm {
-                0..=6 => (17, 11),
-                7..=8 => (21, 13),
-                _ => (34, 22),
-            };
-            scaled(h, w, (21, 13, 6, 21), true)
-        }
-        _ => return None,
-    })
-}
+/// Bitmap font cells, shared with the PNG renderer.
+pub(crate) use png_renderer::bitmap_cell;
 
 /// ^TB line pitch of font 0 in line heights (Labelary); the bitmap fonts' is a little over one.
 const TEXT_BLOCK_PITCH: f32 = 1.26;
 
-/// ^GS symbol matrix (dots) and the size its outlines are drawn at, in cells (Labelary).
-const SYMBOL_CELL: u32 = 24;
-const SYMBOL_EM: f32 = 1.42;
 
 /// Smallest font 0 size (dots); docs/commands/zpl/A.md.
 const MIN_SCALABLE: u32 = 10;
@@ -95,7 +53,8 @@ const FIXED_EM: (f32, f32) = (0.82, 0.945);
 /// Fonts P–V: fixed-size renditions of the scalable font 0 (H x W in dots at magnification 1).
 fn fixed_scalable(font: FontName) -> Option<(u32, u32)> {
     Some(match font {
-        FontName::FontP => (20, 18),
+        // The tables say 20 x 18; Labelary draws P as if 17 wide (compat/cases/font_p).
+        FontName::FontP => (20, 17),
         FontName::FontQ => (28, 24),
         FontName::FontR => (35, 31),
         FontName::FontS => (40, 35),
@@ -154,26 +113,26 @@ struct Field {
     /// ^PA default glyph: characters no font has print as the field font's .notdef glyph
     /// (usually a box) instead of a space.
     notdef: bool,
+    /// ^FT: how far the baseline lies above the origin (a ^GS cell's bottom is the origin).
+    rise: f32,
 }
 
 /// Cached per-face metrics of a built-in font, in em units.
 struct BuiltinMetrics {
     cap: f32,
     advance_m: f32,
-    ink_m: (f32, f32),
 }
 
 fn builtin_metrics(id: FontId) -> &'static BuiltinMetrics {
-    static CACHE: [OnceLock<BuiltinMetrics>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    static CACHE: [OnceLock<BuiltinMetrics>; crate::fonts::BUILTIN_FONTS] =
+        [const { OnceLock::new() }; crate::fonts::BUILTIN_FONTS];
     CACHE[id as usize].get_or_init(|| {
         let face = id.face();
         let upem = face.units_per_em() as f32;
         let m = face.glyph_index('M').unwrap_or(GlyphId(0));
-        let bbox = face.glyph_bounding_box(m);
         BuiltinMetrics {
             cap: cap_height(face),
             advance_m: face.glyph_hor_advance(m).unwrap_or(0) as f32 / upem,
-            ink_m: bbox.map_or((0.0, 0.6), |b| (b.x_min as f32 / upem, (b.x_max - b.x_min) as f32 / upem)),
         }
     })
 }
@@ -387,6 +346,32 @@ impl Field {
     }
 }
 
+/// ^GS `symbol` in the magnified 24 x 24 cell, the cell as the line height (as png-renderer
+/// draws it): the outline stretched over Labelary's ink box at the top left of the cell.
+fn symbol_field(mut field: Field, symbol: char, height: u32, width: u32) -> Field {
+    use png_renderer::{symbol_ink, SYMBOL_CELL};
+    let (data, glyph) = png_renderer::symbol_glyph(symbol);
+    let id = if std::ptr::eq(data, png_renderer::TRIUMVIRATE) { FontId::Triumvirate } else { FontId::DejaVuSansBold };
+    let face = id.face();
+    let upem = face.units_per_em() as f32;
+    let (mh, mw) = magnification(height, width, SYMBOL_CELL, SYMBOL_CELL);
+    let (cell_h, cell_w) = ((SYMBOL_CELL * mh) as f32, (SYMBOL_CELL * mw) as f32);
+    let bbox = face.glyph_index(glyph).and_then(|g| face.glyph_bounding_box(g));
+    let (x_min, y_max, ink_w, ink_h) = bbox.map_or((0.0, 0.75, 1.0, 1.0), |b| {
+        let em = |v: i16| v as f32 / upem;
+        (em(b.x_min), em(b.y_max), em(b.x_max) - em(b.x_min), em(b.y_max) - em(b.y_min))
+    });
+    let (w, h) = symbol_ink(symbol);
+    field.font = id.into();
+    field.size_x = (w * mw) as f32 / ink_w;
+    field.size_y = (h * mh) as f32 / ink_h;
+    field.line_h = cell_h;
+    field.ascent = y_max * field.size_y;
+    field.rise = cell_h - field.ascent;
+    field.bitmap = Some(Bitmap { pitch: cell_w, offset: -x_min * field.size_x, cell_w });
+    field
+}
+
 /// Builds the layout of a DrawText field.
 #[allow(clippy::too_many_arguments)]
 fn field_for(
@@ -400,6 +385,7 @@ fn field_for(
     gap: f32,
     orientation: Orientation,
     anchor: TextAnchor,
+    symbol: char,
 ) -> Field {
     let scalable = |font: FontKey, cap: f32, size_y: f32, size_x: f32| Field {
         font,
@@ -416,6 +402,7 @@ fn field_for(
         anchor,
         justification: Justification::Left,
         notdef: false,
+        rise: 0.0,
     };
     // Scalable fonts: a size given alone sets both.
     let em_height = if height == 0 { width } else { height };
@@ -430,16 +417,17 @@ fn field_for(
 
     if let Some(cell) = bitmap_cell(font, ctx.dpmm) {
         let (mh, mw) = magnification(height, width, cell.height, cell.width);
-        let m = builtin_metrics(BITMAP_FONT);
-        // Cap height of the stroked outline = character height above the baseline; the
-        // widest glyph ('M') fills the cell width; the intercharacter gap follows.
-        let cap = (cell.baseline * mh) as f32;
+        let id = bitmap_font(font);
+        let m = builtin_metrics(id);
+        // The font at the cell's em size, shrunk so that the stroked outlines keep its cap
+        // height; every glyph's advance is centred on the matrix width.
+        let cap = m.cap * cell.em * mh as f32;
         let stroke = BITMAP_STROKE_EM * cap;
-        let size_y = (cap - stroke) / m.cap;
-        let ink_w = (cell.width * mw) as f32;
-        let size_x = (ink_w - stroke) / m.ink_m.1;
+        let shrink = (cap - stroke) / cap;
+        let (size_x, size_y) = (cell.em * mw as f32 * shrink, cell.em * mh as f32 * shrink);
+        let cell_w = (cell.width * mw) as f32;
         return Field {
-            font: BITMAP_FONT.into(),
+            font: id.into(),
             x,
             y,
             size_x,
@@ -448,26 +436,21 @@ fn field_for(
             line_h: (cell.height * mh) as f32,
             ascent: (cell.baseline * mh) as f32,
             bitmap: Some(Bitmap {
-                pitch: ((cell.width + cell.gap) * mw) as f32,
-                offset: stroke / 2.0 - m.ink_m.0 * size_x,
-                cell_w: ink_w,
+                pitch: cell.pitch * mw as f32,
+                offset: (cell_w - m.advance_m * size_x) / 2.0,
+                cell_w,
             }),
             stroke,
             orientation,
             anchor,
             justification: Justification::Left,
             notdef: false,
+            rise: 0.0,
         };
     }
 
     if font == FontName::Symbol {
-        // ^GS: font 0 outlines a little larger than the magnified 24 x 24 cell, which is
-        // the line height (as png-renderer draws them).
-        let (mh, mw) = magnification(height, width, SYMBOL_CELL, SYMBOL_CELL);
-        let (cell_h, cell_w) = ((SYMBOL_CELL * mh) as f32, (SYMBOL_CELL * mw) as f32);
-        let mut field = scalable(FontId::Triumvirate.into(), CAP_HEIGHT_EM, cell_h * SYMBOL_EM, cell_w * SYMBOL_EM);
-        field.line_h = cell_h;
-        return field;
+        return symbol_field(scalable(FontId::Triumvirate.into(), CAP_HEIGHT_EM, 0.0, 0.0), symbol, height, width);
     }
 
     let (size_y, size_x) = match fixed_scalable(font) {
@@ -525,6 +508,7 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
         *char_gap as f32,
         *orientation,
         *anchor,
+        text.chars().next().unwrap_or(' '),
     );
     // Control characters (from ^FH escapes such as _0D) print nothing.
     let text: Cow<str> = if text.chars().any(|c| c < ' ' || c == '\x7f') {
@@ -543,6 +527,31 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
         }
         _ => text,
     };
+    // Bitmap fonts leave the characters they lack blank (see png-renderer's `bitmap_prints`).
+    let text: Cow<str> = match (field.bitmap, field.font) {
+        (Some(_), FontKey::Builtin(id)) if *font != FontName::Symbol && !text.is_ascii() => {
+            let prints = |c: char| png_renderer::bitmap_prints(*font, c) && id.face().glyph_index(c).is_some();
+            Cow::Owned(text.chars().map(|c| if prints(c) { c } else { ' ' }).collect())
+        }
+        _ => text,
+    };
+    // ^GS: the glyph each symbol is drawn with.
+    let mut text = text;
+    if *font == FontName::Symbol {
+        text = Cow::Owned(text.chars().map(|c| png_renderer::symbol_glyph(c).1).collect());
+    }
+    // ^FB soft hyphens print as dashes (Labelary).
+    if block.as_ref().is_some_and(|b| b.clip_height.is_none())
+        && let Cow::Owned(plain) = png_renderer::soft_hyphens(&text)
+    {
+        text = Cow::Owned(plain);
+    }
+    // Dashes as Labelary prints them in the built-in fonts (see png-renderer's `dashes`).
+    if let (FontKey::Builtin(id), false) = (field.font, *font == FontName::Symbol)
+        && let Cow::Owned(mapped) = png_renderer::dashes(&text, id.face().glyph_index('\u{2212}').is_some())
+    {
+        text = Cow::Owned(mapped);
+    }
     let text: &str = &text;
     field.notdef = layout.default_glyph;
     field.justification = *justification;
@@ -588,11 +597,16 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
         (FieldDirection::Vertical, _) => render_vertical(ctx, &field, text),
         (_, Some(block)) => render_block(ctx, &field, text, block, reverse, Mode::Classic, layout, block_pitch),
         (FieldDirection::Reverse, None) => {
-            // Drawn backwards from the origin: the first character (last on the line)
-            // starts there, as Labelary places it.
-            let first = text.chars().next().map_or(0.0, |c| field.char_width(&ctx.fonts, c));
+            // Drawn backwards from the origin: Labelary ends the line (the first character)
+            // an 'M' minus the ^FP gap after it, so a bitmap font's first cell starts there.
+            // Labelary only moves it back where that is left or up on the page.
             let reversed = Shown::Text(text.chars().rev().collect());
-            let back = field.width_of(&ctx.fonts, &reversed) - first;
+            let back = match orientation {
+                Orientation::Normal | Orientation::Rotated90 => {
+                    field.width_of(&ctx.fonts, &reversed) - (field.char_width(&ctx.fonts, 'M') - field.gap)
+                }
+                Orientation::Rotated180 | Orientation::Rotated270 => 0.0,
+            };
             render_line(ctx, &field, &reversed, back);
         }
         (FieldDirection::Horizontal, None) => render_line(ctx, &field, &Shown::Plain(text), 0.0),
@@ -632,7 +646,7 @@ fn render_line(ctx: &mut Ctx, field: &Field, text: &Shown, back: f32) {
     let matrix = field.placed(advance, field.line_h);
     let baseline = match field.anchor {
         TextAnchor::Top => field.ascent,
-        TextAnchor::Baseline => 0.0,
+        TextAnchor::Baseline => -field.rise,
     };
     field.in_frame(ctx, matrix, |ctx, ox, oy| field.show_line(ctx, text, ox - back, oy + baseline));
 }
@@ -645,7 +659,7 @@ fn render_vertical(ctx: &mut Ctx, field: &Field, text: &str) {
     let widest = text.chars().map(|c| field.char_width(&ctx.fonts, c)).fold(0.0, f32::max);
     let first = match field.anchor {
         TextAnchor::Top => field.ascent,
-        TextAnchor::Baseline => 0.0,
+        TextAnchor::Baseline => -field.rise,
     };
     let matrix = field.frame(widest, step * count as f32);
     field.in_frame(ctx, matrix, |ctx, ox, oy| {
@@ -846,7 +860,7 @@ fn render_block(
     let baseline_of = |row: usize| match field.anchor {
         TextAnchor::Top => row as f32 * line_height + ascent,
         // ^FT: the origin is the baseline of the block's last line.
-        TextAnchor::Baseline => -((nominal - 1 - row) as f32 * line_height),
+        TextAnchor::Baseline => -((nominal - 1 - row) as f32 * line_height) - field.rise,
     };
     let box_h = block.clip_height.map_or(nominal as f32 * line_height, |h| h as f32);
     let matrix = field.placed(box_w, box_h);
@@ -1438,9 +1452,9 @@ mod tests {
         };
         assert_eq!(glyphs(&reversed), glyphs(&ba));
         assert_ne!(glyphs(&reversed), glyphs(&pair(field("AB", |_| {}))));
-        // The first character starts at the origin; the rest runs back from it.
+        // The line ends an 'M' after the origin; the rest runs back from there.
         let tm = text_matrices(&content(&field("AB", |o| o.direction = FieldDirection::Reverse)));
-        assert!(approx(tm[0][4], 50.0 - (em("BA") - em("A"))), "{tm:?}");
+        assert!(approx(tm[0][4], 50.0 - (em("BA") - em("M"))), "{tm:?}");
     }
 
     fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -1520,12 +1534,12 @@ mod tests {
     #[test]
     fn bitmap_matrices_follow_the_docs() {
         let a = bitmap_cell(FontName::FontA, 8).unwrap();
-        assert_eq!((a.height, a.width, a.gap, a.baseline, a.uppercase), (9, 5, 1, 7, false));
+        assert_eq!((a.height, a.width, a.pitch, a.baseline, a.uppercase), (9, 5, 6.0, 7, false));
         let e = bitmap_cell(FontName::FontE, 8).unwrap();
-        assert_eq!((e.height, e.width, e.gap, e.baseline), (28, 15, 5, 23));
+        assert_eq!((e.height, e.width, e.pitch, e.baseline, e.em), (28, 15, 20.0, 23, 28.0));
         assert_eq!(bitmap_cell(FontName::FontE, 12).unwrap().height, 42);
         let h = bitmap_cell(FontName::FontH, 8).unwrap();
-        assert_eq!((h.height, h.width, h.gap, h.baseline, h.uppercase), (21, 13, 6, 21, true));
+        assert_eq!((h.height, h.width, h.pitch, h.baseline, h.uppercase), (21, 13, 19.0, 21, true));
         assert!(bitmap_cell(FontName::Font0, 8).is_none());
         assert!(bitmap_cell(FontName::FontP, 8).is_none());
     }
@@ -1555,17 +1569,17 @@ mod tests {
         assert!(c.contains("/F1 1 Tf") && c.contains("2 Tr"), "{c}");
         let tm = text_matrices(&c);
         assert_eq!(tm.len(), 1);
-        let m = builtin_metrics(BITMAP_FONT);
-        // Cap height of the stroked outline == 21 dots; 'M' ink == 15 dots wide.
+        let m = builtin_metrics(FontId::DejaVuMono);
+        // Cap height of the stroked outline == 21 dots; evenly scaled.
         let stroke = BITMAP_STROKE_EM * 21.0;
         assert!(approx(-tm[0][3] * m.cap + stroke, 21.0), "{tm:?}");
-        assert!(approx(tm[0][0] * m.ink_m.1 + stroke, 15.0), "{tm:?}");
+        assert!(approx(tm[0][0], -tm[0][3]), "{tm:?}");
         assert!(approx(tm[0][5], 60.0 + 21.0), "{tm:?}");
         // Every character advances exactly one pitch.
         let tc = char_spacings(&c)[0];
         assert!(approx((m.advance_m + tc) * tm[0][0], 18.0), "{tc}");
         let mut ctx = Ctx::new();
-        let field = field_for(&mut ctx, FontName::FontA, None, 30, 0, 0.0, 0.0, 0.0, Orientation::Normal, TextAnchor::Top);
+        let field = field_for(&mut ctx, FontName::FontA, None, 30, 0, 0.0, 0.0, 0.0, Orientation::Normal, TextAnchor::Top, ' ');
         assert!(approx(field.measure(&ctx.fonts, "Ab1"), 54.0));
         assert!(approx(field.line_h, 27.0) && approx(field.ascent, 21.0));
     }
@@ -1579,7 +1593,7 @@ mod tests {
         }
         let c = content(&ins);
         let tm = text_matrices(&c);
-        let m = builtin_metrics(BITMAP_FONT);
+        let m = builtin_metrics(FontId::DejaVuMono);
         let tc = char_spacings(&c)[0];
         assert!(approx((m.advance_m + tc) * tm[0][0], 15.0), "{c}");
         assert!(approx(tm[0][5], 60.0 + 14.0));
@@ -1605,7 +1619,7 @@ mod tests {
     #[test]
     fn fonts_p_to_v_are_fixed_size_font_zero() {
         let tm = text_matrices(&content(&with_font("Hi", FontName::FontP, 0, 0)));
-        assert!(approx(tm[0][0], 18.0 * 0.945) && approx(tm[0][3], -20.0 * 0.82), "{tm:?}");
+        assert!(approx(tm[0][0], 17.0 * 0.945) && approx(tm[0][3], -20.0 * 0.82), "{tm:?}");
         let tm = text_matrices(&content(&with_font("Hi", FontName::FontQ, 56, 56)));
         assert!(approx(tm[0][0], 48.0 * 0.945) && approx(tm[0][3], -56.0 * 0.82), "{tm:?}");
     }
@@ -1636,6 +1650,7 @@ mod tests {
             anchor: TextAnchor::Top,
             justification: Justification::Left,
             notdef: false,
+            rise: 0.0,
         };
         let zhe = field.char_width(&fonts, 'Ж');
         assert!(approx(tm[2][4], 50.0 + a + zhe), "{tm:?}");
@@ -1645,17 +1660,14 @@ mod tests {
     }
 
     #[test]
-    fn bitmap_fallback_glyph_keeps_the_pitch() {
-        // A glyph only DejaVu Sans Bold has.
-        let ch = ['\u{2133}', '\u{2766}', '\u{1F0A1}', '\u{2622}']
-            .into_iter()
-            .find(|&c| BITMAP_FONT.face().glyph_index(c).is_none() && FontId::DejaVuSansBold.face().glyph_index(c).is_some());
-        let ch = ch.expect("a glyph only DejaVu Sans Bold has");
-        let text: String = ['A', ch, 'B'].iter().collect();
-        let tm = text_matrices(&content(&with_font(&text, FontName::FontD, 18, 10)));
-        assert_eq!(tm.len(), 3, "{tm:?}");
-        // 'B' sits two pitches after 'A'.
-        assert!(approx(tm[2][4] - tm[0][4], 24.0), "{tm:?}");
+    fn bitmap_font_leaves_missing_glyphs_blank() {
+        // Labelary prints nothing for characters outside the font's repertoire (Ж in D, é in
+        // H), keeping the pitch.
+        let c = content(&with_font("AЖB", FontName::FontD, 18, 10));
+        assert!(!c.contains("DejaVuSans-Bold") && !c.contains("/F2"), "{c}");
+        let tm = text_matrices(&c);
+        assert_eq!(tm.len(), 1, "{tm:?}");
+        assert!(approx(char_spacings(&c)[0], char_spacings(&content(&with_font("ABC", FontName::FontD, 18, 10)))[0]));
     }
 
     #[test]
@@ -1715,7 +1727,7 @@ mod tests {
 
     /// A Font0 field (40 dots) as `render` builds it, with ^PA default glyph `notdef`.
     fn font0_field(ctx: &mut Ctx, notdef: bool) -> Field {
-        let mut f = field_for(ctx, FontName::Font0, None, 40, 0, 0.0, 0.0, 0.0, Orientation::Normal, TextAnchor::Top);
+        let mut f = field_for(ctx, FontName::Font0, None, 40, 0, 0.0, 0.0, 0.0, Orientation::Normal, TextAnchor::Top, ' ');
         f.notdef = notdef;
         f
     }

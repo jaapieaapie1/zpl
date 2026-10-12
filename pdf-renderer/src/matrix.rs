@@ -11,7 +11,7 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
         DrawInstruction::DrawDataMatrix {
             x, y, data, orientation, module_height, symbol_height, columns, rows, escape, rectangular, bottom,
         } => {
-            let Ok(m) = matrix::datamatrix(data.as_bytes(), *rows, *columns, *rectangular, *escape) else { return };
+            let Ok(m) = matrix::datamatrix(&png_renderer::symbol_bytes(data), *rows, *columns, *rectangular, *escape) else { return };
             // Without an explicit module size the ^BY height is the approximate symbol height.
             let module = module_height.unwrap_or(symbol_height / m.height.max(1)).max(1);
             draw(ctx, &m, *x, *y, *orientation, module, module, *bottom);
@@ -19,14 +19,14 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
         DrawInstruction::DrawPdf417 {
             x, y, data, orientation, row_height, module_width, symbol_height, security, columns, rows, truncated, bottom,
         } => {
-            let Ok(m) = matrix::pdf417(data.as_bytes(), *security, *columns, *rows, *truncated) else { return };
+            let Ok(m) = matrix::pdf417(&png_renderer::symbol_bytes(data), *security, *columns, *rows, *truncated) else { return };
             let module = (*module_width).max(1);
             // Row height in dots, or the ^BY height shared by all rows.
             let row = row_height.unwrap_or(symbol_height / m.height.max(1)).max(1);
             draw(ctx, &m, *x, *y, *orientation, module, row, *bottom);
         }
         DrawInstruction::DrawAztec { x, y, data, orientation, magnification, ecc, bottom } => {
-            let Ok(m) = matrix::aztec(data.as_bytes(), *ecc) else { return };
+            let Ok(m) = matrix::aztec(&png_renderer::symbol_bytes(data), *ecc) else { return };
             let module = (*magnification).max(1);
             draw(ctx, &m, *x, *y, *orientation, module, module, *bottom);
         }

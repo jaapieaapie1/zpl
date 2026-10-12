@@ -3,6 +3,10 @@ name = "zpl-state-manager"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# StateManager::process_mapped, for editors (the wasm playground); off for the API.
+source-map = ["zpl-parser/source-map"]
+
 [dependencies]
 zpl-parser = { path = "../zpl-parser" }
 encoding_rs = "0.8"

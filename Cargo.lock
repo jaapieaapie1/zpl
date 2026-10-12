@@ -2215,7 +2215,6 @@ dependencies = [
  "wasm-bindgen",
  "zpl-parser",
  "zpl-state-manager",
- "zpl-tokenizer",
 ]
 
 [[package]]

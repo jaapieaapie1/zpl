@@ -37,6 +37,27 @@ impl<'a> Parser<'a> {
         Ok(commands)
     }
 
+    /// Like [`Parser::parse`], plus the source span of each command: byte offsets into the
+    /// input, without surrounding whitespace.
+    #[cfg(feature = "source-map")]
+    pub fn parse_with_spans(mut self) -> Result<(Vec<Command>, Vec<Span>), ParseError> {
+        let mut commands = Vec::new();
+        let mut spans = Vec::new();
+
+        loop {
+            let start = self.tokenizer.position();
+            let Some(command) = self.parse_next()? else { break };
+            let end = self.tokenizer.position();
+            let text = &self.tokenizer.input()[start..end];
+            let start = start + (text.len() - text.trim_start().len());
+            let end = start + text.trim().len();
+            commands.push(command);
+            spans.push(Span { start, end });
+        }
+
+        Ok((commands, spans))
+    }
+
     #[inline]
     fn next_token(&mut self) -> Option<Token<'a>> {
         if let Some(token) = self.peeked.take() {

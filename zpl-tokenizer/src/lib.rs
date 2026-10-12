@@ -51,6 +51,17 @@ impl<'a> Tokenizer<'a> {
         Self { input, position: 0, caret: '^', tilde: '~', delimiter: ',' }
     }
 
+    /// Byte offset of the next unread character.
+    #[cfg(feature = "source-map")]
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    #[cfg(feature = "source-map")]
+    pub fn input(&self) -> &'a str {
+        self.input
+    }
+
     #[inline]
     fn peek(&self) -> Option<char> {
         self.input[self.position..].chars().next()

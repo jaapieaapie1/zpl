@@ -3,6 +3,10 @@ name = "zpl-parser"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Parser::parse_with_spans, for editors (the wasm playground); off for the API.
+source-map = ["zpl-tokenizer/source-map"]
+
 [dependencies]
 zpl-tokenizer = { path = "../zpl-tokenizer" }
 base64 = "0.22"

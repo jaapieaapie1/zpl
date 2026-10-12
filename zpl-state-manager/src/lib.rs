@@ -1,5 +1,10 @@
 mod charset;
 mod clock;
+#[cfg(feature = "source-map")]
+mod source_map;
+
+#[cfg(feature = "source-map")]
+pub use source_map::Source;
 
 use std::collections::HashMap;
 use std::sync::Arc;

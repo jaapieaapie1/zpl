@@ -1,6 +1,7 @@
 // Renders labels off the main thread. Messages in: { id, kind: "rgba" | "pdf", zpl, debug }.
 // Messages out: { id, kind, ok, ...result } or { id, crashed } after a Rust panic, which
-// leaves the wasm instance unusable; the page then starts a fresh worker.
+// leaves the wasm instance unusable; the page then starts a fresh worker. "rgba" results
+// carry `elements`, laid out as described at Frame.takeElements in zpl-wasm/src/lib.rs.
 import init, { renderRgba, renderPdf } from "./pkg/zpl_wasm.js";
 
 const ready = init();
@@ -22,8 +23,10 @@ self.onmessage = async ({ data: { id, kind, zpl, debug } }) => {
       const frame = renderRgba(zpl, localClock(), debug);
       const { width, height } = frame;
       const pixels = frame.takePixels();
+      const elements = frame.takeElements();
       frame.free();
-      self.postMessage({ id, kind, ok: true, width, height, pixels, ms: performance.now() - start }, [pixels.buffer]);
+      const ms = performance.now() - start;
+      self.postMessage({ id, kind, ok: true, width, height, pixels, elements, ms }, [pixels.buffer, elements.buffer]);
     }
   } catch (e) {
     if (e && typeof e.message === "string" && "start" in e) {

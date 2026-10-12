@@ -3,3 +3,5 @@ pub mod error;
 pub mod parser;
 
 pub use parser::Parser;
+#[cfg(feature = "source-map")]
+pub use zpl_tokenizer::Span;

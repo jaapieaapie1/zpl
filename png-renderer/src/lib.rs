@@ -28,6 +28,19 @@ pub struct PngRenderer {
     width: u32,
     height: u32,
     debug: bool,
+    /// Area drawn by the instruction being rendered: [x0, y0, x1, y1), clipped to the page.
+    #[cfg(feature = "source-map")]
+    drawn: std::cell::Cell<Option<[i64; 4]>>,
+}
+
+/// The page area an instruction drew on, in dots.
+#[cfg(feature = "source-map")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bounds {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Text font of a field at its size: the scalable font 0 (Triumvirate), a downloaded
@@ -356,11 +369,17 @@ fn wrap_lines_with(measure: &dyn Fn(&str) -> f32, text: &str, width: u32, indent
 
 impl PngRenderer {
     pub fn new(width: u32, height: u32) -> Self {
-        Self { width, height, debug: false }
+        Self::with_debug(width, height, false)
     }
 
     pub fn with_debug(width: u32, height: u32, debug: bool) -> Self {
-        Self { width, height, debug }
+        Self {
+            width,
+            height,
+            debug,
+            #[cfg(feature = "source-map")]
+            drawn: std::cell::Cell::new(None),
+        }
     }
 
     pub fn render(&self, instructions: &[DrawInstruction]) -> RgbImage {
@@ -371,6 +390,50 @@ impl PngRenderer {
         }
 
         image
+    }
+
+    /// Like [`PngRenderer::render`], plus the area each instruction drew on (`None` when it
+    /// drew nothing on the page).
+    #[cfg(feature = "source-map")]
+    pub fn render_with_bounds(&self, instructions: &[DrawInstruction]) -> (RgbImage, Vec<Option<Bounds>>) {
+        let mut image: RgbImage = ImageBuffer::from_pixel(self.width, self.height, WHITE);
+        let mut bounds = Vec::with_capacity(instructions.len());
+
+        for instruction in instructions {
+            self.drawn.set(None);
+            self.render_instruction(&mut image, instruction);
+            bounds.push(self.drawn.take().map(|[x0, y0, x1, y1]| Bounds {
+                x: x0 as u32,
+                y: y0 as u32,
+                width: (x1 - x0) as u32,
+                height: (y1 - y0) as u32,
+            }));
+        }
+
+        (image, bounds)
+    }
+
+    /// Records that the current instruction drew in the `width` x `height` area at (`x`, `y`).
+    /// Compiles to nothing without the `source-map` feature.
+    #[inline(always)]
+    fn note_drawn(&self, x: i64, y: i64, width: u32, height: u32) {
+        #[cfg(feature = "source-map")]
+        {
+            let x0 = x.max(0);
+            let y0 = y.max(0);
+            let x1 = (x + width as i64).min(self.width as i64);
+            let y1 = (y + height as i64).min(self.height as i64);
+            if x0 >= x1 || y0 >= y1 {
+                return;
+            }
+            let area = match self.drawn.get() {
+                Some([a, b, c, d]) => [a.min(x0), b.min(y0), c.max(x1), d.max(y1)],
+                None => [x0, y0, x1, y1],
+            };
+            self.drawn.set(Some(area));
+        }
+        #[cfg(not(feature = "source-map"))]
+        let _ = (x, y, width, height);
     }
 
     fn render_instruction(&self, image: &mut RgbImage, instruction: &DrawInstruction) {
@@ -463,9 +526,13 @@ impl PngRenderer {
     /// ^FR / ^LR: draw `inner` on a blank page, then invert every target pixel it blackened.
     fn render_reverse(&self, image: &mut RgbImage, inner: &DrawInstruction) {
         // No debug markers on the scratch page: they would be inverted too.
-        let plain = PngRenderer { width: image.width(), height: image.height(), debug: false };
+        let plain = PngRenderer::new(image.width(), image.height());
         let mut scratch: RgbImage = ImageBuffer::from_pixel(image.width(), image.height(), WHITE);
         plain.render_instruction(&mut scratch, inner);
+        #[cfg(feature = "source-map")]
+        if let Some([x0, y0, x1, y1]) = plain.drawn.get() {
+            self.note_drawn(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32);
+        }
         for (target, drawn) in image.pixels_mut().zip(scratch.pixels()) {
             let luma = (drawn[0] as u32 * 299 + drawn[1] as u32 * 587 + drawn[2] as u32 * 114) / 1000;
             if luma < 128 {
@@ -628,6 +695,9 @@ impl PngRenderer {
 
     /// Copies the non-white pixels of `source` onto `target` at (`x`, `y`), clipping at the edges.
     fn overlay_at(&self, target: &mut RgbImage, source: &RgbImage, x: i64, y: i64) {
+        // Ink box of what was copied: text and symbol images carry white padding.
+        #[cfg(feature = "source-map")]
+        let mut ink = [i64::MAX, i64::MAX, i64::MIN, i64::MIN];
         for (src_x, src_y, pixel) in source.enumerate_pixels() {
             let target_x = x + src_x as i64;
             let target_y = y + src_y as i64;
@@ -639,7 +709,15 @@ impl PngRenderer {
                 && (pixel[0] < 250 || pixel[1] < 250 || pixel[2] < 250)
             {
                 target.put_pixel(target_x as u32, target_y as u32, *pixel);
+                #[cfg(feature = "source-map")]
+                {
+                    ink = [ink[0].min(target_x), ink[1].min(target_y), ink[2].max(target_x), ink[3].max(target_y)];
+                }
             }
+        }
+        #[cfg(feature = "source-map")]
+        if ink[0] <= ink[2] {
+            self.note_drawn(ink[0], ink[1], (ink[2] - ink[0] + 1) as u32, (ink[3] - ink[1] + 1) as u32);
         }
     }
 
@@ -880,6 +958,7 @@ impl PngRenderer {
                 y + 10
             };
 
+            self.note_drawn(x as i64, y as i64, qr_image.width(), qr_image.height());
             for (qr_x, qr_y, pixel) in qr_image.enumerate_pixels() {
                 let target_x = x + qr_x;
                 let target_y = y + qr_y;
@@ -893,6 +972,7 @@ impl PngRenderer {
 
     #[allow(clippy::too_many_arguments)]
     fn render_box(&self, image: &mut RgbImage, x: u32, y: u32, width: u32, height: u32, thickness: u32, color: &LineColor) {
+        self.note_drawn(x as i64, y as i64, width, height);
         let rgb_color = self.line_color_to_rgb(color);
 
         for t in 0..thickness {
@@ -916,6 +996,7 @@ impl PngRenderer {
         if width == 0 || height == 0 {
             return;
         }
+        self.note_drawn(x as i64, y as i64, width, height);
         let rgb_color = self.line_color_to_rgb(color);
         let (a, b) = (width as f64 / 2.0, height as f64 / 2.0);
         let (cx, cy) = (x as f64 + a, y as f64 + b);
@@ -941,6 +1022,7 @@ impl PngRenderer {
 
     #[allow(clippy::too_many_arguments)]
     fn render_diagonal_line(&self, image: &mut RgbImage, x: u32, y: u32, width: u32, height: u32, thickness: u32, color: &LineColor, direction: &DiagonalDirection) {
+        self.note_drawn(x as i64, y as i64, width + thickness, height + thickness);
         let rgb_color = self.line_color_to_rgb(color);
 
         let (x1, y1, x2, y2) = match direction {
@@ -1108,6 +1190,26 @@ mod tests {
         assert!(!black(&image, 22, 10));
         // Leading digit sits left of the bars.
         assert!((0..20).any(|x| (50..80).any(|y| black(&image, x, y))));
+    }
+
+    #[cfg(feature = "source-map")]
+    #[test]
+    fn bounds_cover_each_instruction() {
+        use zpl_state_manager::StateManager;
+        let zpl = "^XA^PW400^LL300^FO10,20^GB100,50,3^FS^FO350,250^GB100,100,100^FS\
+                   ^FO50,100^A0N,40,40^FDHi^FS^FO200,10^BQN,2,3^FDQA,x^FS^FO20,200^FR^GB30,30,30^FS^XZ";
+        let mut state = StateManager::new();
+        let instructions = state.process(zpl_parser::Parser::new(zpl).parse().unwrap());
+        let (_, bounds) = PngRenderer::new(400, 300).render_with_bounds(&instructions);
+        assert_eq!(bounds.len(), 5);
+        assert_eq!(bounds[0], Some(Bounds { x: 10, y: 20, width: 100, height: 50 }));
+        // Clipped at the page edge.
+        assert_eq!(bounds[1], Some(Bounds { x: 350, y: 250, width: 50, height: 50 }));
+        let text = bounds[2].unwrap();
+        assert!(text.x >= 40 && text.x <= 60 && text.y >= 90 && text.y <= 110 && text.height >= 20, "{text:?}");
+        let qr = bounds[3].unwrap();
+        assert_eq!((qr.x, qr.y), (200, 20));
+        assert_eq!(bounds[4], Some(Bounds { x: 20, y: 200, width: 30, height: 30 }));
     }
 
     #[test]

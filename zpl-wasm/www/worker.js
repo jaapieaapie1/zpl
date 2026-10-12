@@ -1,7 +1,8 @@
-// Renders labels off the main thread. Messages in: { id, kind: "rgba" | "pdf", zpl, debug }.
+// Renders labels off the main thread. Messages in: { id, kind: "rgba" | "pdf", zpl, debug, page }.
 // Messages out: { id, kind, ok, ...result } or { id, crashed } after a Rust panic, which
 // leaves the wasm instance unusable; the page then starts a fresh worker. "rgba" results
-// carry `elements`, laid out as described at Frame.takeElements in zpl-wasm/src/lib.rs.
+// carry `elements`, laid out as described at Frame.takeElements in zpl-wasm/src/lib.rs, and
+// `page` (0-based, clamped to the last page) and `pageCount`.
 import init, { renderRgba, renderPdf } from "./pkg/zpl_wasm.js";
 
 const ready = init();
@@ -12,7 +13,7 @@ function localClock() {
   return Math.floor(now.getTime() / 1000) - now.getTimezoneOffset() * 60;
 }
 
-self.onmessage = async ({ data: { id, kind, zpl, debug } }) => {
+self.onmessage = async ({ data: { id, kind, zpl, debug, page } }) => {
   await ready;
   const start = performance.now();
   try {
@@ -20,13 +21,17 @@ self.onmessage = async ({ data: { id, kind, zpl, debug } }) => {
       const bytes = renderPdf(zpl, localClock());
       self.postMessage({ id, kind, ok: true, bytes, ms: performance.now() - start }, [bytes.buffer]);
     } else {
-      const frame = renderRgba(zpl, localClock(), debug);
-      const { width, height } = frame;
+      const frame = renderRgba(zpl, localClock(), debug, page);
+      const { width, height, pageCount } = frame;
+      const shown = frame.page;
       const pixels = frame.takePixels();
       const elements = frame.takeElements();
       frame.free();
       const ms = performance.now() - start;
-      self.postMessage({ id, kind, ok: true, width, height, pixels, elements, ms }, [pixels.buffer, elements.buffer]);
+      self.postMessage(
+        { id, kind, ok: true, width, height, pixels, elements, page: shown, pageCount, ms },
+        [pixels.buffer, elements.buffer],
+      );
     }
   } catch (e) {
     if (e && typeof e.message === "string" && "start" in e) {

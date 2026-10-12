@@ -61,6 +61,11 @@
     cursor: pointer;
   }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .4; cursor: default; }
+  #pager { display: flex; align-items: center; gap: 6px; }
+  #pager[hidden] { display: none; }
+  #pager button { padding: 2px 9px; }
+  #page-label { font: 12px/1 var(--mono); color: var(--muted); min-width: 7ch; text-align: center; }
   @media (prefers-color-scheme: dark) { button.primary { color: #0d1530; } }
   main {
     flex: 1;
@@ -153,6 +158,11 @@
     <option value="1">100%</option>
     <option value="2">200%</option>
   </select>
+  <span id="pager" role="group" aria-label="Label" hidden>
+    <button id="prev-page" aria-label="Previous label" title="Previous label">‹</button>
+    <span id="page-label" aria-live="polite"></span>
+    <button id="next-page" aria-label="Next label" title="Next label">›</button>
+  </span>
   <span class="spacer"></span>
   <button id="png">Download PNG</button>
   <button id="pdf" class="primary">Download PDF</button>

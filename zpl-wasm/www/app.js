@@ -2,7 +2,8 @@
 // is rendered; edits made while a render runs collapse into one follow-up render.
 //
 // Clicking an element on the label selects its source in the editor, and moving the
-// editor cursor into a field outlines it on the label.
+// editor cursor into a field outlines it on the label. Input with several labels (or ^PQ
+// copies) shows one page at a time, picked in the header.
 
 const SAMPLE = `^XA
 ^CI28
@@ -60,6 +61,10 @@ const size = document.getElementById("size");
 const cursor = document.getElementById("cursor");
 const debug = document.getElementById("debug");
 const zoom = document.getElementById("zoom");
+const pager = document.getElementById("pager");
+const pageLabel = document.getElementById("page-label");
+const prevPage = document.getElementById("prev-page");
+const nextPage = document.getElementById("next-page");
 
 function load(key, fallback) {
   try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
@@ -107,7 +112,7 @@ function requestPreview() {
   dirty = false;
   inflight = nextId++;
   pane.classList.add("stale");
-  worker.postMessage({ id: inflight, kind: "rgba", zpl: editor.value, debug: debug.checked });
+  worker.postMessage({ id: inflight, kind: "rgba", zpl: editor.value, debug: debug.checked, page });
 }
 
 function requestPdf() {
@@ -130,6 +135,7 @@ function onResult(data) {
   if (data.crashed) {
     restartWorker(data.crashed);
   } else if (data.ok) {
+    setPageCount(data.pageCount);
     draw(data);
     hideProblem();
     status.textContent = `Rendered in ${data.ms.toFixed(1)} ms`;
@@ -140,6 +146,32 @@ function onResult(data) {
   pane.classList.toggle("stale", dirty || !data.ok);
   if (dirty) requestPreview();
 }
+
+// --- Pages ------------------------------------------------------------------------
+
+let page = 0; // 0-based page to show
+let pageCount = 1;
+
+// Keeps the page in range when an edit drops labels. A newer page picked while the render
+// ran is kept; it is rendered next.
+function setPageCount(count) {
+  pageCount = count;
+  page = Math.min(page, count - 1);
+  pager.hidden = count < 2;
+  pageLabel.textContent = `${page + 1} / ${count}`;
+  prevPage.disabled = page === 0;
+  nextPage.disabled = page >= count - 1;
+}
+
+function showPage(next) {
+  if (next < 0 || next >= pageCount || next === page) return;
+  page = next;
+  setPageCount(pageCount);
+  requestPreview();
+}
+
+prevPage.addEventListener("click", () => showPage(page - 1));
+nextPage.addEventListener("click", () => showPage(page + 1));
 
 // --- Drawing ----------------------------------------------------------------------
 
@@ -378,7 +410,8 @@ function download(blob, name) {
 }
 
 document.getElementById("png").addEventListener("click", () => {
-  canvas.toBlob((blob) => blob && download(blob, "label.png"), "image/png");
+  const name = pageCount > 1 ? `label-${page + 1}.png` : "label.png";
+  canvas.toBlob((blob) => blob && download(blob, name), "image/png");
 });
 
 document.getElementById("pdf").addEventListener("click", async () => {

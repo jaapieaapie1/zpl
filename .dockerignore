@@ -11,3 +11,4 @@ docs
 *.pdf
 *.png
 zpl-wasm/www/pkg
+compat/out

@@ -1,5 +1,5 @@
 [workspace]
-members = ["zpl-tokenizer", "zpl-parser", "zpl-state-manager", "zpl-symbols", "png-renderer", "pdf-renderer", "cli", "http-api", "zpl-wasm"]
+members = ["zpl-tokenizer", "zpl-parser", "zpl-state-manager", "zpl-symbols", "png-renderer", "pdf-renderer", "cli", "http-api", "zpl-wasm", "compat"]
 resolver = "2"
 
 [workspace.package]

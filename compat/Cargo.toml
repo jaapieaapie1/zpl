@@ -1,0 +1,15 @@
+[package]
+name = "compat"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "compat"
+path = "src/main.rs"
+
+[dependencies]
+zpl-parser = { path = "../zpl-parser" }
+zpl-state-manager = { path = "../zpl-state-manager" }
+png-renderer = { path = "../png-renderer" }
+image = "0.25"

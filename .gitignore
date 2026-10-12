@@ -1,3 +1,5 @@
 **/target/
 *.png
 CLAUDE.md
+!compat/cases/*.png
+compat/out/

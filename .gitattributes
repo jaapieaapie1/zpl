@@ -1,0 +1,2 @@
+# Corpus labels are sent to Labelary byte for byte (CRLF line breaks, binary ^GFB data).
+compat/cases/*.zpl -text

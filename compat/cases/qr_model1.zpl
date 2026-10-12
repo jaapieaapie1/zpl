@@ -1,0 +1,5 @@
+^XA
+^FX compat: 4x3 labelary-unsupported^FS
+^FO50,50^BQN,1,5^FDQA,MODEL ONE^FS
+^FO400,50^BQN,1,4^FDMA,MODEL 1 MEDIUM^FS
+^XZ

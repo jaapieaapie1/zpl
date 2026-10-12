@@ -1,0 +1,6 @@
+^XA
+^FX compat: 4x3^FS
+^FO50,50^A0N,50,50^FDCopy^FS
+^FO50,150^GB200,100,10^FS
+^PQ2
+^XZ

@@ -1,0 +1,8 @@
+^XA
+^FX compat: 4x3^FS
+^FO50,50^A0N,50,50^FDFirst label^FS
+^XZ
+^XA
+^FO50,50^A0N,50,50^FDSecond label^FS
+^FO50,150^GB300,100,8^FS
+^XZ

@@ -1,0 +1,6 @@
+^XA
+^FX compat: 4x3^FS
+^FO20,20^AAN^FDABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 !@#$%&*()-+=/.,:;?^FS
+^FO20,37^AAN,18,10^FDAbHg12^FS
+^FO20,65^AAN,18,5^FDAbHg12^FS
+^XZ

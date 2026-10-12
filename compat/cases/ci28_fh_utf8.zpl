@@ -1,0 +1,5 @@
+^XA
+^FX compat: 4x3^FS
+^CI28
+^FO20,20^A0N,40,40^FH^FDCaf_C3_A9 _E2_82_AC_C3_9F^FS
+^XZ

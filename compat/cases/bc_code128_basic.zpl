@@ -1,0 +1,7 @@
+^XA
+^FX compat: 4x3^FS
+^BY2
+^FO50,50^BCN,100,Y,N,N^FDCode128 Test^FS
+^BY3
+^FO50,300^BCN,100,Y,N,N^FDCode128 Test^FS
+^XZ

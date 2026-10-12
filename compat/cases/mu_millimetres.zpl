@@ -1,0 +1,7 @@
+^XA
+^FX compat: 4x3^FS
+^MUM
+^FO5,5^GB50,20,1^FS
+^FO10,30^A0N,5,5^FDmm units^FS
+^FO10,45^BY2^BCN,10,Y,N,N^FD123^FS
+^XZ

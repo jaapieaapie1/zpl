@@ -1,0 +1,7 @@
+^XA
+^FX compat: 4x3 labelary-unsupported^FS
+^BY2
+^FO50,50^B4N,20,A,A^FD12345ABCDE^FS
+^BY3
+^FO50,300^B4N,20,A,A^FD12345ABCDE^FS
+^XZ

@@ -108,7 +108,8 @@ pub enum DrawInstruction {
         y: u32,
         data: String,
         orientation: Orientation,
-        /// Row height in multiples of `module_width`; `None` means rows share `symbol_height`.
+        /// Row height in dots (Zebra's manual says multiples of `module_width`, but printers
+        /// and Labelary use dots); `None` means rows share `symbol_height`.
         row_height: Option<u32>,
         module_width: u32,
         symbol_height: u32,
@@ -1070,7 +1071,16 @@ impl StateManager {
             }
 
             Command::QrCode { orientation, model, magnification, error_correction, mask } => {
-                self.field.mode = FieldMode::QrCode { orientation, model, magnification, error_correction, mask };
+                // The magnification becomes the ^BY module width of the barcodes that follow
+                // (checked on Labelary).
+                self.barcode_module_width = magnification;
+                self.field.mode = FieldMode::QrCode {
+                    orientation: orientation.unwrap_or(self.default_orientation),
+                    model,
+                    magnification,
+                    error_correction,
+                    mask,
+                };
             }
 
             Command::DataMatrix { orientation, module_height, columns, rows, escape, rectangular } => {
@@ -1736,5 +1746,11 @@ mod tests {
         // Only the first character picks a symbol (Labelary).
         let ins = run("^XA^FO1,1^GSN,30,30^FDAC^FS^XZ");
         assert_eq!(texts(&ins), ["\u{00AE}"]);
+    }
+
+    #[test]
+    fn qr_magnification_sets_module_width() {
+        let ins = run("^XA^BY2^FO1,1^BQN,2,5^FDQA,X^FS^FO1,200^BCN,50,N^FD12^FS^XZ");
+        assert!(matches!(ins[1], DrawInstruction::DrawBarcode { module_width: 5, .. }));
     }
 }

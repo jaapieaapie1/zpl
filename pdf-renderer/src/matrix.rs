@@ -1,6 +1,6 @@
 //! 2D symbols (DataMatrix, PDF417, Aztec) as runs of filled module rectangles.
 
-use crate::barcodes::{fill_rects, placement, runs};
+use crate::barcodes::{bars_placement, fill_rects, runs};
 use crate::Ctx;
 use zpl_parser::command::Orientation;
 use zpl_state_manager::DrawInstruction;
@@ -21,8 +21,8 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
         } => {
             let Ok(m) = matrix::pdf417(data.as_bytes(), *security, *columns, *rows, *truncated) else { return };
             let module = (*module_width).max(1);
-            // Row height is a multiple of the module width, or the ^BY height shared by all rows.
-            let row = row_height.map(|h| h * module).unwrap_or(symbol_height / m.height.max(1)).max(1);
+            // Row height in dots, or the ^BY height shared by all rows.
+            let row = row_height.unwrap_or(symbol_height / m.height.max(1)).max(1);
             draw(ctx, &m, *x, *y, *orientation, module, row, *bottom);
         }
         DrawInstruction::DrawAztec { x, y, data, orientation, magnification, ecc, bottom } => {
@@ -34,12 +34,11 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
     }
 }
 
-/// Draws `m` with `module_w` x `module_h` dot modules; with `bottom` (^FT) the origin is the
-/// symbol's bottom-left corner.
+/// Draws `m` with `module_w` x `module_h` dot modules, placed like the bars of a 1D symbol:
+/// with `bottom` (^FT) the origin is the unrotated symbol's bottom-left corner.
 #[allow(clippy::too_many_arguments)]
 fn draw(ctx: &mut Ctx, m: &Matrix, x: u32, y: u32, orientation: Orientation, module_w: u32, module_h: u32, bottom: bool) {
     let (w, h) = (m.width * module_w, m.height * module_h);
-    let y = if bottom { y.saturating_sub(h) } else { y };
     let (mw, mh) = (module_w as f32, module_h as f32);
 
     let mut rects = Vec::new();
@@ -51,5 +50,33 @@ fn draw(ctx: &mut Ctx, m: &Matrix, x: u32, y: u32, orientation: Orientation, mod
             rects.push((start as f32 * mw, row as f32 * mh, len as f32 * mw, mh));
         }
     }
-    fill_rects(ctx, placement(orientation, x, y, w, h), &rects);
+    fill_rects(ctx, bars_placement(orientation, (x, y, bottom), [0.0, 0.0, w as f32, h as f32]), &rects);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn content_of(instruction: DrawInstruction) -> String {
+        let mut ctx = Ctx::new();
+        render(&mut ctx, &instruction);
+        String::from_utf8(ctx.content.finish().to_vec()).unwrap()
+    }
+
+    #[test]
+    fn rotated_symbols_are_placed_like_bars() {
+        // ^FO: the rotated symbol's top-left is the origin (84 x 84 dots here).
+        let dm = DrawInstruction::DrawDataMatrix {
+            x: 650, y: 50, data: "ROTATE DM".into(), orientation: Orientation::Rotated270, module_height: Some(6),
+            symbol_height: 10, columns: 0, rows: 0, escape: None, rectangular: false, bottom: false,
+        };
+        assert!(content_of(dm).contains("0 -1 1 0 650 134 cm"));
+        // ^FT: the unrotated bottom-left corner is the origin; a 206 x 24 dot PDF417 read
+        // bottom up ends on it (Labelary: 376,694 to 399,899).
+        let pdf = DrawInstruction::DrawPdf417 {
+            x: 400, y: 900, data: "PDF FT".into(), orientation: Orientation::Rotated270, row_height: Some(4),
+            module_width: 2, symbol_height: 10, security: Some(0), columns: 2, rows: 6, truncated: false, bottom: true,
+        };
+        assert!(content_of(pdf).contains("0 -1 1 0 376 900 cm"));
+    }
 }

@@ -147,7 +147,8 @@ pub fn encode(symbology: Symbology, data: &str) -> Result<LinearSymbol, EncodeEr
         Symbology::Code93 { check_digit } => code93(data, check_digit),
         Symbology::Code11 { check_digits } => code11(data, check_digits),
         Symbology::Interleaved2of5 { check_digit } => interleaved_2of5(data, check_digit),
-        Symbology::Standard2of5 | Symbology::Industrial2of5 => industrial_2of5(data),
+        Symbology::Standard2of5 => two_of_five(data, &[1, 1, 1, 1], &[2, 1, 1]),
+        Symbology::Industrial2of5 => two_of_five(data, &[2, 1, 2, 1, 1, 1], &[2, 1, 1, 1, 2]),
         Symbology::Codabar { check_digit } => {
             let chars: Vec<char> = data.chars().collect();
             let (first, last) = (chars[0], chars[chars.len() - 1]);
@@ -463,15 +464,17 @@ fn interleaved_2of5(data: &str, check_digit: bool) -> Result<LinearSymbol, Encod
     Ok(b.plain(digit_string(&d), true))
 }
 
-/// Industrial / Standard 2 of 5: data in the bars only, every bar followed by a narrow space.
-fn industrial_2of5(data: &str) -> Result<LinearSymbol, EncodeError> {
+/// Bars-only 2 of 5 between `start` and `stop` (bar/space widths, 2 = wide). Industrial 2 of 5
+/// (^BI) starts wide-wide-narrow and stops wide-narrow-wide; Standard 2 of 5 (^BJ) is the IATA
+/// variant Labelary draws, starting narrow-narrow and stopping wide-narrow.
+fn two_of_five(data: &str, start: &[u8], stop: &[u8]) -> Result<LinearSymbol, EncodeError> {
     let d = digits(data)?;
     let mut b = Builder::default();
-    b.widths(&[2, 1, 2, 1, 1, 1], false);
+    b.widths(start, false);
     for &x in &d {
         (0..5).for_each(|i| b.widths(&[wide(TWO_OF_FIVE[x as usize], i), 1], false));
     }
-    b.widths(&[2, 1, 1, 1, 2], false);
+    b.widths(stop, false);
     Ok(b.plain(digit_string(&d), true))
 }
 
@@ -1070,6 +1073,17 @@ mod tests {
         let s = enc(Symbology::Industrial2of5, "12");
         well_formed(&s);
         assert_eq!(s.units(), 8 + 2 * 12 + 7);
+    }
+
+    #[test]
+    fn standard_2of5_uses_iata_start_and_stop() {
+        // Labelary: narrow-narrow start bars, wide-narrow stop bars, narrow spaces throughout.
+        let s = enc(Symbology::Standard2of5, "12");
+        well_formed(&s);
+        assert_eq!(s.units(), 4 + 2 * 12 + 4);
+        let dots: Vec<u32> = s.element_dots(2, 3.0).map(|(_, d)| d).collect();
+        assert_eq!(dots[..4], [2, 2, 2, 2]);
+        assert_eq!(dots[dots.len() - 3..], [6, 2, 2]);
     }
 
     #[test]

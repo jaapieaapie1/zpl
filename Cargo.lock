@@ -1142,8 +1142,6 @@ dependencies = [
  "miniz_oxide",
  "pdf-writer",
  "png-renderer",
- "qr-core",
- "qr-encode",
  "rustybuzz",
  "subsetter",
  "ttf-parser",
@@ -1279,19 +1277,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
 dependencies = [
  "bytemuck",
-]
-
-[[package]]
-name = "qr-core"
-version = "0.1.0"
-source = "git+ssh://git@github.com/jaapieaapie1/qrcode.git?rev=766b33a5c6d8d70ab03e5a5f81bd2ffedf8da083#766b33a5c6d8d70ab03e5a5f81bd2ffedf8da083"
-
-[[package]]
-name = "qr-encode"
-version = "0.1.0"
-source = "git+ssh://git@github.com/jaapieaapie1/qrcode.git?rev=766b33a5c6d8d70ab03e5a5f81bd2ffedf8da083#766b33a5c6d8d70ab03e5a5f81bd2ffedf8da083"
-dependencies = [
- "qr-core",
 ]
 
 [[package]]

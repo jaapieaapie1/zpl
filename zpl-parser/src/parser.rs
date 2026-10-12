@@ -467,9 +467,9 @@ impl<'a> Parser<'a> {
             } else {
                 match compression {
                     CompressionType::Ascii => self.decode_hex_data(&raw, bytes_per_row),
-                    CompressionType::Binary | CompressionType::CompressedBinary => {
-                        raw.as_bytes().to_vec()
-                    }
+                    // One character per byte (the tokenizer took exactly `b` of them).
+                    CompressionType::Binary => raw.chars().map(|c| c as u32 as u8).collect(),
+                    CompressionType::CompressedBinary => raw.as_bytes().to_vec(),
                 }
             }
         } else {
@@ -673,9 +673,9 @@ impl<'a> Parser<'a> {
     fn parse_qr_code(&self, params: &[&str], span: Span) -> Result<Command, ParseError> {
         // ^BQa,b,c,d,e
         let orientation = if params.is_empty() || params[0].is_empty() {
-            Orientation::Normal
+            None
         } else {
-            self.parse_orientation(params[0], span)?
+            Some(self.parse_orientation(params[0], span)?)
         };
 
         let model = if params.len() < 2 || params[1].is_empty() {
@@ -684,8 +684,14 @@ impl<'a> Parser<'a> {
             self.parse_qr_model(params[1], span)?
         };
 
+        // Zebra's default grows with the printhead: 1 at 6 dots/mm, 2 at 8, 3 at 12, 6 at 24.
         let magnification = if params.len() < 3 || params[2].is_empty() {
-            1
+            match self.dpmm {
+                0..=6 => 1,
+                7..=8 => 2,
+                9..=12 => 3,
+                _ => 6,
+            }
         } else {
             self.parse_u32(params[2], span)?
         };
@@ -1076,7 +1082,7 @@ impl<'a> Parser<'a> {
             "N" => Ok(Code128Mode::AutoMode),
             "U" => Ok(Code128Mode::UccCase),
             "A" => Ok(Code128Mode::Auto),
-            "D" => Ok(Code128Mode::Auto),
+            "D" => Ok(Code128Mode::Gs1),
             _ => Err(ParseError::InvalidCode128Mode {
                 value: s.to_string(),
                 span,

@@ -9,7 +9,7 @@
 use crate::text;
 use crate::{Ctx, FontId};
 use crate::matrix;
-use png_renderer::code128;
+use png_renderer::{code128, qr};
 use zpl_parser::command::{Code128Mode, LinearKind, Orientation};
 use zpl_symbols::linear::{self, LinearSymbol, MsiCheck, Symbology};
 use zpl_state_manager::DrawInstruction;
@@ -30,8 +30,8 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
             ctx, (*x, *y, *bottom), *kind, data, *orientation, *height, *module_width, *wide_bar_ratio,
             *print_interpretation_line, *print_interpretation_line_above,
         ),
-        DrawInstruction::DrawQrCode { x, y, data, magnification, mask, bottom, .. } => {
-            render_qr_code(ctx, *x, *y, data, *magnification, *mask, *bottom)
+        DrawInstruction::DrawQrCode { x, y, data, magnification, orientation, bottom, .. } => {
+            render_qr_code(ctx, *x, *y, data, *magnification, *orientation, *bottom)
         }
         DrawInstruction::DrawDataMatrix { .. }
         | DrawInstruction::DrawPdf417 { .. }
@@ -40,26 +40,7 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
     }
 }
 
-/// Transform mapping a local `w` x `h` frame onto the page the way the PNG renderer rotates
-/// its temp image (`imageops::rotate*`) and overlays it at its (saturating) offset.
-pub(crate) fn placement(orientation: Orientation, x: u32, y: u32, w: u32, h: u32) -> [f32; 6] {
-    let (w_f, h_f) = (w as f32, h as f32);
-    match orientation {
-        Orientation::Normal => [1.0, 0.0, 0.0, 1.0, x as f32, y as f32],
-        // rotate90 (clockwise): local (u, v) -> (h - v, u)
-        Orientation::Rotated90 => [0.0, 1.0, -1.0, 0.0, x as f32 + h_f, y as f32],
-        // rotate180: local (u, v) -> (w - u, h - v)
-        Orientation::Rotated180 => [-1.0, 0.0, 0.0, -1.0, x as f32 + w_f, y as f32 + h_f],
-        // rotate270 (counter-clockwise): local (u, v) -> (v, w - u); image is h wide, w tall
-        Orientation::Rotated270 => {
-            let ox = x.saturating_sub(h) as f32;
-            let oy = y.saturating_sub(w) as f32;
-            [0.0, -1.0, 1.0, 0.0, ox, oy + w_f]
-        }
-    }
-}
-
-/// Transform for a 1D symbol whose bars are the local box `bars` (x, y, w, h): ^FO puts the
+/// Transform for a symbol whose bars are the local box `bars` (x, y, w, h): ^FO puts the
 /// rotated bars' top-left on (`x`, `y`), ^FT (`bottom`) the bars' bottom-left corner, rotated
 /// with the symbol; the interpretation line follows the bars (as the PNG renderer's `place_bars`).
 pub(crate) fn bars_placement(orientation: Orientation, (x, y, bottom): (u32, u32, bool), bars: [f32; 4]) -> [f32; 6] {
@@ -158,15 +139,27 @@ fn render_code128(
     let ip = interpretation(bar_width);
     let text_gap = line_gap(bar_width, line_above, false);
     let show_text = print_line && !code.text.is_empty();
+    // Mode D sizes its line in font 0 to the bars, as the PNG renderer does.
+    let gs1 = (show_text && mode == Code128Mode::Gs1)
+        .then(|| code128::Gs1Line::new(&code.text, barcode_width, height, line_above))
+        .flatten();
     let n_chars = code.text.chars().count() as f32;
-    let text_width = if show_text { (ip.char_advance * n_chars).ceil() as u32 } else { 0 };
-    let text_area = if show_text { ip.area(text_gap, line_above) } else { 0 };
+    let text_width = match &gs1 {
+        Some(_) => barcode_width,
+        None if show_text => (ip.char_advance * n_chars).ceil() as u32,
+        None => 0,
+    };
+    let text_area = match &gs1 {
+        Some(line) => line.area,
+        None if show_text => ip.area(text_gap, line_above),
+        None => 0,
+    };
 
     let pad = text_width.saturating_sub(barcode_width) / 2;
-    let (bars_y, baseline) = if line_above {
-        (text_area, ip.digit_height)
-    } else {
-        (0, height as f32 + text_gap + ip.digit_height)
+    let (bars_y, baseline) = match &gs1 {
+        Some(line) => (line.bars_y, line.baseline),
+        None if line_above => (text_area, ip.digit_height),
+        None => (0, height as f32 + text_gap + ip.digit_height),
     };
 
     let mut rects = Vec::new();
@@ -184,11 +177,16 @@ fn render_code128(
     fill_rects(ctx, matrix, &rects);
 
     if show_text {
-        let text_x = pad as f32 + (barcode_width as f32 - text_width as f32) / 2.0;
         ctx.content.save_state();
         ctx.content.transform(matrix);
         ctx.content.set_fill_gray(ctx.ink);
-        text::show_text(ctx, FontId::DejaVuMono, &code.text, text_x, baseline, ip.size_x, ip.size_y);
+        match gs1 {
+            Some(line) => text::show_text(ctx, FontId::Triumvirate, &code.text, line.x, baseline, line.em, line.em),
+            None => {
+                let text_x = pad as f32 + (barcode_width as f32 - text_width as f32) / 2.0;
+                text::show_text(ctx, FontId::DejaVuMono, &code.text, text_x, baseline, ip.size_x, ip.size_y);
+            }
+        }
         ctx.content.restore_state();
     }
 }
@@ -295,30 +293,10 @@ fn render_linear(
     }
 }
 
-/// Parse the `<ec><input mode>,` prefix of QR ^FD data.
-fn parse_qr_data(data: &str) -> (qr_core::EcLevel, &str) {
-    use qr_core::EcLevel;
-    match data.get(..3) {
-        Some(prefix) if prefix.ends_with(',') => {
-            let ec = match &prefix[..1] {
-                "H" => EcLevel::H,
-                "Q" => EcLevel::Q,
-                "L" => EcLevel::L,
-                _ => EcLevel::M,
-            };
-            (ec, &data[3..])
-        }
-        _ => (EcLevel::M, data),
-    }
-}
-
-fn render_qr_code(ctx: &mut Ctx, x: u32, y: u32, data: &str, magnification: u32, mask: Option<u32>, bottom: bool) {
-    let (ec, payload) = parse_qr_data(data);
-    let mut options = qr_encode::Options::new(ec);
-    // ^BQ mask 0-7 forces a mask; anything else lets the encoder pick by ISO penalty score.
-    options.mask = mask.filter(|&m| m <= 7).map(|m| m as u8);
-    let Ok(code) = qr_encode::encode(payload.as_bytes(), options) else { return };
-    let size = code.size();
+/// ^BQ, module for module as the PNG renderer draws it (`png_renderer::qr`).
+fn render_qr_code(ctx: &mut Ctx, x: u32, y: u32, data: &str, magnification: u32, orientation: Orientation, bottom: bool) {
+    let Some(code) = qr::encode(data) else { return };
+    let size = code.size;
     let module = magnification.max(1) as f32;
 
     let mut rects = Vec::new();
@@ -331,9 +309,8 @@ fn render_qr_code(ctx: &mut Ctx, x: u32, y: u32, data: &str, magnification: u32,
         }
     }
 
-    // Zebra printers draw QR codes 10 dots below the field origin; ^FT puts the bottom there.
-    let top = if bottom { y.saturating_sub(size * magnification.max(1)) } else { y + 10 };
-    let matrix = [1.0, 0.0, 0.0, 1.0, x as f32, top as f32];
+    let (left, top) = qr::top_left(x, y, size, magnification.max(1), orientation, bottom);
+    let matrix = [1.0, 0.0, 0.0, 1.0, left as f32, top as f32];
     fill_rects(ctx, matrix, &rects);
 }
 
@@ -428,6 +405,21 @@ mod tests {
     }
 
     #[test]
+    fn code128_mode_d_line_is_font_0_sized_to_the_bars() {
+        let mut instruction = code128("(10)A1", Orientation::Normal, true);
+        if let DrawInstruction::DrawBarcode { mode, .. } = &mut instruction {
+            *mode = Code128Mode::Gs1;
+        }
+        let code = code128::encode("(10)A1", Code128Mode::Gs1);
+        let bw: u32 = code.widths().iter().map(|&w| w as u32 * 2).sum();
+        let line = code128::Gs1Line::new(&code.text, bw, 80, false).unwrap();
+        let c = content_of(instruction);
+        // Bars unpadded at the origin, text at the line's size.
+        assert!(c.contains("1 0 0 1 100 50 cm"));
+        assert!(c.contains(&format!("{} 0 0 -{} ", line.em, line.em)), "{c}");
+    }
+
+    #[test]
     fn rotations_use_expected_matrices() {
         let code = code128::encode("12345678", Code128Mode::Auto);
         let w: u32 = code.widths().iter().map(|&m| m as u32 * 2).sum();
@@ -485,10 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn qr_parses_prefix_and_offsets() {
-        assert_eq!(parse_qr_data("HA,hello"), (qr_core::EcLevel::H, "hello"));
-        assert_eq!(parse_qr_data("hello"), (qr_core::EcLevel::M, "hello"));
-
+    fn qr_offsets_and_merges_runs() {
         let c = content_of(DrawInstruction::DrawQrCode {
             x: 30, y: 40, data: "QA,hello".into(), orientation: Orientation::Normal,
             model: zpl_parser::command::QrModel::Model2, magnification: 4,
@@ -498,9 +487,8 @@ mod tests {
         assert!(c.contains("1 0 0 1 30 50 cm"));
         // Top-left finder pattern: first row starts with a 7-module dark run.
         assert!(c.contains("0 0 28 4 re"));
-        let code = qr_encode::encode(b"hello", qr_encode::Options::new(qr_core::EcLevel::Q)).unwrap();
-        let size = code.size();
-        let dark = (0..size).flat_map(|y| (0..size).map(move |x| (x, y))).filter(|&(x, y)| code.get(x, y)).count();
+        let code = qr::encode("QA,hello").unwrap();
+        let dark = (0..code.size).flat_map(|y| (0..code.size).map(move |x| (x, y))).filter(|&(x, y)| code.get(x, y)).count();
         assert!(count_op(&c, "re") < dark, "runs must be merged");
     }
 

@@ -1,7 +1,7 @@
 //! `DrawSymbol`: stacked symbols (DataBar, composites, MicroPDF417, Codablock, Code 49, TLC39),
 //! postal codes and MaxiCode.
 
-use crate::barcodes::{fill_rects, placement, runs};
+use crate::barcodes::{bars_placement, fill_rects, runs};
 use crate::text;
 use crate::{Ctx, FontId};
 use zpl_parser::command::{Code49Interpretation, Orientation, PostalKind};
@@ -81,15 +81,15 @@ struct Place {
     x: u32,
     y: u32,
     orientation: Orientation,
-    /// ^FT: `y` is the bottom edge.
+    /// ^FT: the origin is the frame's bottom-left corner, rotated with it.
     bottom: bool,
 }
 
 impl Place {
     /// Transform for a local `w` x `h` frame (y down) at this place.
     fn matrix(&self, w: u32, h: u32) -> [f32; 6] {
-        let y = if self.bottom { self.y.saturating_sub(h) } else { self.y };
-        placement(self.orientation, self.x, y, w.max(1), h.max(1))
+        let frame = [0.0, 0.0, w.max(1) as f32, h.max(1) as f32];
+        bars_placement(self.orientation, (self.x, self.y, self.bottom), frame)
     }
 }
 

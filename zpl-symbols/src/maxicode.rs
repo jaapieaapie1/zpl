@@ -27,10 +27,17 @@ pub const COLUMNS: u32 = 30;
 /// Rows of the module grid.
 pub const ROWS: u32 = 33;
 
-/// Nominal symbol width (ISO/IEC 16023), mm.
-const WIDTH_MM: f32 = 28.14;
-/// Nominal symbol height (ISO/IEC 16023), mm.
-const HEIGHT_MM: f32 = 26.91;
+/// Printed symbol width, mm. Zebra printers (and Labelary) print MaxiCode at 25 x 24 mm
+/// (200 x 192 dots at 8 dots/mm), a little under the ISO/IEC 16023 nominal 28.14 x 26.91 mm.
+const WIDTH_MM: f32 = 25.0;
+/// Printed symbol height, mm.
+const HEIGHT_MM: f32 = 24.0;
+/// Hexagon height (vertex to vertex), mm: 6 dots at 8 dots/mm, so neighbouring hexagons
+/// leave a thin light gap.
+const HEX_HEIGHT_MM: f32 = 0.75;
+/// Bullseye: inner radius of the innermost dark ring and the step between ring edges, mm.
+const RING_START_MM: f32 = 0.5;
+const RING_STEP_MM: f32 = 0.6375;
 
 /// A MaxiCode symbol: 33 rows x 30 columns of modules.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,16 +74,15 @@ impl MaxiCode {
 
     /// Physical layout in dots for the given resolution (dots per mm; 8.0 for 203 dpi).
     ///
-    /// The symbol is scaled to the nominal 28.14 mm x 26.91 mm: the horizontal module pitch is
-    /// width / 30 (adjacent hexagons touch), the hexagons are regular with that width, and the
-    /// row pitch spreads the 33 rows over the height. The finder is centred on the module at
-    /// row 16, column 14 and is 9 module pitches across (zint/ISO proportions).
+    /// The symbol is 25 mm x 24 mm, as Zebra prints it: the horizontal module pitch is
+    /// width / 30, the hexagons are regular and 0.75 mm tall, and the row pitch spreads the
+    /// 33 rows over the height. The finder is centred on the module at row 16, column 14; its
+    /// ring edges are 0.6375 mm apart around a 0.5 mm light centre (measured on Labelary).
     pub fn geometry(&self, dots_per_mm: f32) -> Geometry {
         let width = WIDTH_MM * dots_per_mm;
         let height = HEIGHT_MM * dots_per_mm;
         let pitch_x = width / COLUMNS as f32;
-        // Regular pointy-top hexagon whose flat-to-flat width is the column pitch.
-        let hex_radius = pitch_x / 3f32.sqrt();
+        let hex_radius = HEX_HEIGHT_MM * dots_per_mm / 2.0;
         let pitch_y = (height - 2.0 * hex_radius) / (ROWS - 1) as f32;
 
         let dark = self.rows.iter().map(|r| r.count_ones() as usize).sum();
@@ -93,10 +99,8 @@ impl MaxiCode {
         }
 
         let center = (14.5 * pitch_x, hex_radius + 16.0 * pitch_y);
-        // Six concentric diameters d1..d6: d1 = hexagon height, d6 = 9 module pitches.
-        let d1 = 2.0 * hex_radius;
-        let incr = (9.0 * pitch_x - d1) / 5.0;
-        let r = |k: f32| (d1 + incr * k) / 2.0;
+        // Six concentric ring edges, the innermost around the light centre.
+        let r = |k: f32| (RING_START_MM + RING_STEP_MM * k) * dots_per_mm;
         let rings = vec![(r(5.0), r(4.0)), (r(3.0), r(2.0)), (r(1.0), r(0.0))];
 
         Geometry {
@@ -483,14 +487,15 @@ fn encode_text(
                     prior[p][state] = org as u8;
                 }
             };
-            if digits >= 9 {
-                consider(OP_DIGITS); // nothing beats numeric compression
-            } else {
-                for &op_idx in STATE_OPS[state] {
-                    if can_encode(OPS[op_idx as usize].op, ch, num_a) {
-                        consider(op_idx);
-                    }
+            for &op_idx in STATE_OPS[state] {
+                if can_encode(OPS[op_idx as usize].op, ch, num_a) {
+                    consider(op_idx);
                 }
+            }
+            // Numeric compression last: on a tie the earlier run of 9 digits keeps it, so a
+            // 10-digit run compresses its first 9 digits like Zebra (and Labelary) do.
+            if digits >= 9 {
+                consider(OP_DIGITS);
             }
             best_len[p][state] = min;
         }
@@ -874,18 +879,19 @@ mod tests {
             0x095ad873, 0x1c41655b, 0x1bd3939b, 0x05ec3786, 0x1f8c3e5e,
         ],
     );
-    // zint: mode 5, primary ''
+    // zint, mode 5, except that zint numeric-compresses the last 9 digits of
+    // "1234567890123" and Zebra (checked on Labelary) the first 9.
     const MODE5_MIXED: (&str, u8, u8, u8, [u32; 33]) = (
         "1234567890123 Mixed lower UPPER \u{e9}\u{e8}\u{c0}\u{c9} \u{1}\u{2} ;<=>",
         5,
         1,
         1,
         [
-            0x344204c8, 0x117f5af2, 0x19f311d3, 0x1e546ccc, 0x1c410eec, 0x0c418540, 0x1aab8ce3,
-            0x12570ccb, 0x34e72984, 0x0ab8beaa, 0x00190800, 0x05490655, 0x3a9804ea, 0x10140080,
-            0x25780355, 0x1a9000aa, 0x00100140, 0x05700155, 0x2aa000aa, 0x00280180, 0x25440255,
-            0x0a6007e3, 0x21e7f4ee, 0x05facdca, 0x2d812514, 0x1f368757, 0x23a85bad, 0x112a9d9e,
-            0x2f2e2c8f, 0x07b31d93, 0x1996f83c, 0x13bdd07e, 0x3aaa10f7,
+            0x344204cb, 0x017f5af0, 0x09f311d3, 0x0e546ccc, 0x2c410eec, 0x0c418540, 0x1aab8ce3,
+            0x12570ccb, 0x34e72984, 0x1aa84caa, 0x20315800, 0x05710555, 0x2a9807ea, 0x100c0080,
+            0x25400295, 0x1a9001ea, 0x00100140, 0x15700115, 0x1a8800ea, 0x002801c0, 0x154006d5,
+            0x0a76036f, 0x22cb1626, 0x05cafe0e, 0x2eb21606, 0x1d06a755, 0x128b7a8f, 0x0d669596,
+            0x1baea003, 0x0f779d53, 0x1ab5e81c, 0x10bde26f, 0x388910e7,
         ],
     );
     // zint: mode 6, primary ''
@@ -916,18 +922,19 @@ mod tests {
             0x338b6c93, 0x19893878, 0x144abfa6, 0x164548d9, 0x03c56c71,
         ],
     );
-    // zint: mode 4, primary ''
+    // zint, with the 3 digits zint encodes first moved after the runs of 9: Zebra
+    // numeric-compresses from the start of a digit run.
     const MODE4_DIGITS: (&str, u8, u8, u8, [u32; 33]) = (
         "123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678",
         4,
         1,
         1,
         [
-            0x316f1da5, 0x1703f497, 0x1fbe74a3, 0x17d4807b, 0x175cd7de, 0x181ce6d7, 0x2fc918d3,
-            0x0b4f0077, 0x055f3f7e, 0x16403cdd, 0x0ef1cc13, 0x1c6002fb, 0x0408051e, 0x0e340114,
-            0x2fe80059, 0x048000f5, 0x1b100147, 0x0e300103, 0x27580169, 0x1d1c0165, 0x0d2c02a8,
-            0x13f80794, 0x2f0ff70d, 0x06fe45ef, 0x2a40217d, 0x08bd735d, 0x11c9b342, 0x1ab802c4,
-            0x078fcec6, 0x1425cf0a, 0x23ec59ca, 0x12dbca74, 0x2737f0dc,
+            0x3634fb40, 0x101dedf5, 0x2fdfb5e6, 0x118fd9dd, 0x03c7bb13, 0x13d571fb, 0x395e141e,
+            0x15d0ee14, 0x08c0bfd9, 0x09fc4f4f, 0x28495bfc, 0x085c05db, 0x1d080656, 0x1d4c0330,
+            0x22f0037b, 0x1d400188, 0x35d0010d, 0x01d0010e, 0x1ee80150, 0x1b58023d, 0x1d5006b9,
+            0x1c5a01c9, 0x1dcf1640, 0x0beafc7f, 0x383fff24, 0x03296d3c, 0x01c3957c, 0x047427a8,
+            0x2703b785, 0x1a89fd85, 0x21ce79af, 0x1b859825, 0x0299c2dc,
         ],
     );
     // zint: mode 4, primary ''
@@ -1144,15 +1151,16 @@ mod tests {
     fn geometry_scales_from_nominal_size() {
         let m = encode("Hello World", 4, 1, 1).unwrap();
         let g = m.geometry(8.0);
-        assert!((g.width - 225.12).abs() < 1e-3);
-        assert!((g.height - 215.28).abs() < 1e-3);
+        // Labelary's 8 dots/mm MaxiCode is 200 x 192 dots.
+        assert!((g.width - 200.0).abs() < 1e-3);
+        assert!((g.height - 192.0).abs() < 1e-3);
         let dark = (0..ROWS)
             .flat_map(|r| (0..COLUMNS).map(move |c| (c, r)))
             .filter(|&(c, r)| m.get(c, r))
             .count();
         assert_eq!(g.hexagons.len(), dark);
         let pitch = g.width / 30.0;
-        assert!((g.hex_radius * 3f32.sqrt() - pitch).abs() < 1e-4);
+        assert!((g.hex_radius - 3.0).abs() < 1e-4);
         // Hexagons stay inside the symbol box.
         for &(x, y) in &g.hexagons {
             assert!(x - pitch / 2.0 >= -1e-3 && x + pitch / 2.0 <= g.width + 1e-3);
@@ -1175,8 +1183,8 @@ mod tests {
         assert!((g.center.0 - 14.5 * pitch).abs() < 1e-3);
         assert!((g.center.1 - g.height / 2.0).abs() < 1e-3);
         assert_eq!(g.rings.len(), 3);
-        assert!((g.rings[0].0 - 4.5 * pitch).abs() < 1e-3);
-        assert!((g.rings[2].1 - g.hex_radius).abs() < 1e-3);
+        assert!((g.rings[0].0 - 29.5).abs() < 1e-3);
+        assert!((g.rings[2].1 - 4.0).abs() < 1e-3);
         for w in g.rings.windows(2) {
             assert!(w[0].1 > w[1].0);
         }

@@ -13,6 +13,7 @@ use zpl_symbols::matrix::{self, Matrix};
 
 pub mod code128;
 mod layout;
+pub mod qr;
 mod symbols;
 
 pub use layout::DEJAVU_SANS_BOLD;
@@ -662,8 +663,8 @@ impl PngRenderer {
                     *print_interpretation_line, *print_interpretation_line_above,
                 );
             }
-            DrawInstruction::DrawQrCode { x, y, data, magnification, bottom, .. } => {
-                self.render_qr_code(image, *x, *y, data, *magnification, *bottom);
+            DrawInstruction::DrawQrCode { x, y, data, magnification, orientation, bottom, .. } => {
+                self.render_qr_code(image, *x, *y, data, *magnification, *orientation, *bottom);
             }
             DrawInstruction::DrawDataMatrix {
                 x, y, data, orientation, module_height, symbol_height, columns, rows, escape, rectangular, bottom,
@@ -680,8 +681,8 @@ impl PngRenderer {
             } => {
                 if let Ok(m) = matrix::pdf417(data.as_bytes(), *security, *columns, *rows, *truncated) {
                     let module = (*module_width).max(1);
-                    // Row height is a multiple of the module width, or the ^BY height shared by all rows.
-                    let row = row_height.map(|h| h * module).unwrap_or(symbol_height / m.height.max(1)).max(1);
+                    // Row height in dots, or the ^BY height shared by all rows.
+                    let row = row_height.unwrap_or(symbol_height / m.height.max(1)).max(1);
                     self.render_matrix(image, &m, *x, *y, *orientation, module, row, *bottom);
                 }
             }
@@ -981,43 +982,10 @@ impl PngRenderer {
         }
     }
 
-    /// Places an unrotated symbol image whose bars start `pad_l` dots from its left edge (with
-    /// `pad_r` dots of text overhang on the right) at the field origin, rotated like the bars.
-    #[allow(clippy::too_many_arguments)]
-    fn place_symbol(
-        &self,
-        image: &mut RgbImage,
-        temp: &RgbImage,
-        x: u32,
-        y: u32,
-        orientation: Orientation,
-        pad_l: u32,
-        pad_r: u32,
-    ) {
-        let (x, y) = (x as i64, y as i64);
-        match orientation {
-            Orientation::Normal => self.overlay_at(image, temp, x - pad_l as i64, y),
-            Orientation::Rotated90 => {
-                let rotated = image::imageops::rotate90(temp);
-                self.overlay_at(image, &rotated, x, y - pad_l as i64);
-            }
-            Orientation::Rotated180 => {
-                let rotated = image::imageops::rotate180(temp);
-                self.overlay_at(image, &rotated, x - pad_r as i64, y);
-            }
-            Orientation::Rotated270 => {
-                let rotated = image::imageops::rotate270(temp);
-                let adjusted_x = x - rotated.width() as i64;
-                let adjusted_y = y - rotated.height() as i64 + pad_l as i64;
-                self.overlay_at(image, &rotated, adjusted_x, adjusted_y);
-            }
-        }
-    }
-
-    /// Places the unrotated image of a 1D symbol whose bars are the `bars_w` x `bars_h` box at
+    /// Places the unrotated image of a symbol whose bars are the `bars_w` x `bars_h` box at
     /// (`bars_x`, `bars_y`): ^FO puts the rotated bars' top-left on (`x`, `y`), ^FT (`bottom`)
     /// the bars' bottom-left corner, rotated with the symbol. The interpretation line follows
-    /// the bars wherever it lands.
+    /// the bars wherever it lands. 2D symbols are all bars.
     #[allow(clippy::too_many_arguments)]
     fn place_bars(
         &self,
@@ -1067,16 +1035,28 @@ impl PngRenderer {
         let text_gap = line_gap(bar_width, print_interpretation_line_above, false);
 
         let show_text = print_interpretation_line && !code.text.is_empty();
-        let text_width = if show_text { ip.text_width(&code.text).ceil() as u32 } else { 0 };
-        let text_area = if show_text { ip.area(text_gap, print_interpretation_line_above) } else { 0 };
+        // Mode D sizes its line in font 0 to the bars (see `code128::Gs1Line`).
+        let gs1 = (show_text && mode == Code128Mode::Gs1)
+            .then(|| code128::Gs1Line::new(&code.text, barcode_width, height, print_interpretation_line_above))
+            .flatten();
+        let text_width = match &gs1 {
+            Some(_) => barcode_width,
+            None if show_text => ip.text_width(&code.text).ceil() as u32,
+            None => 0,
+        };
+        let text_area = match &gs1 {
+            Some(line) => line.area,
+            None if show_text => ip.area(text_gap, print_interpretation_line_above),
+            None => 0,
+        };
 
         let pad = text_width.saturating_sub(barcode_width) / 2;
         let total_width = barcode_width + 2 * pad;
         let total_height = height + text_area;
-        let (bars_y, baseline) = if print_interpretation_line_above {
-            (text_area, ip.digit_height)
-        } else {
-            (0, height as f32 + text_gap + ip.digit_height)
+        let (bars_y, baseline) = match &gs1 {
+            Some(line) => (line.bars_y, line.baseline),
+            None if print_interpretation_line_above => (text_area, ip.digit_height),
+            None => (0, height as f32 + text_gap + ip.digit_height),
         };
 
         let mut temp_image: RgbImage = ImageBuffer::from_pixel(total_width.max(1), total_height.max(1), WHITE);
@@ -1094,7 +1074,13 @@ impl PngRenderer {
             x_pos += pixel_width;
         }
 
-        if show_text {
+        if let Some(line) = &gs1 {
+            use ab_glyph::{Font, ScaleFont};
+            let font = FontRef::try_from_slice(TRIUMVIRATE).expect("Error loading font");
+            let scale = PxScale::from(line.em * font.height_unscaled() / font.units_per_em().unwrap_or(1000.0));
+            let top = baseline - font.as_scaled(scale).ascent();
+            drawing::draw_text_mut(&mut temp_image, BLACK, line.x.round() as i32, top.round() as i32, scale, &font, &code.text);
+        } else if show_text {
             let text_x = pad as f32 + (barcode_width as f32 - text_width as f32) / 2.0;
             ip.draw(&mut temp_image, &code.text, text_x, baseline);
         }
@@ -1189,8 +1175,9 @@ impl PngRenderer {
         self.place_bars(image, &temp, x, y, bottom, orientation, (pad_l, bars_y, width, height));
     }
 
-    /// 2D symbol with `module_w` x `module_h` dot modules; with `bottom` (^FT) `y` is the
-    /// symbol's bottom edge.
+    /// 2D symbol with `module_w` x `module_h` dot modules. Like the bars of a 1D symbol (and
+    /// as Labelary does), ^FO puts the rotated symbol's top-left on the origin and ^FT
+    /// (`bottom`) the unrotated symbol's bottom-left corner, turned with the symbol.
     #[allow(clippy::too_many_arguments)]
     fn render_matrix(
         &self,
@@ -1207,7 +1194,6 @@ impl PngRenderer {
         if w == 0 || h == 0 {
             return;
         }
-        let y = if bottom { y.saturating_sub(h) } else { y };
         let mut temp: RgbImage = ImageBuffer::from_pixel(w, h, WHITE);
         for row in 0..m.height {
             for col in 0..m.width {
@@ -1220,48 +1206,27 @@ impl PngRenderer {
                 }
             }
         }
-        self.place_symbol(image, &temp, x, y, orientation, 0, 0);
+        self.place_bars(image, &temp, x, y, bottom, orientation, (0, 0, w, h));
     }
 
-    fn render_qr_code(&self, image: &mut RgbImage, x: u32, y: u32, data: &str, magnification: u32, bottom: bool) {
-        use qrcode::{EcLevel, QrCode};
-
-        // ^FD for QR codes starts with "<error correction><input mode>," e.g. "QA,data"
-        let (ec_level, payload) = match data.get(..3) {
-            Some(prefix) if prefix.ends_with(',') => {
-                let ec_level = match &prefix[..1] {
-                    "H" => EcLevel::H,
-                    "Q" => EcLevel::Q,
-                    "L" => EcLevel::L,
-                    _ => EcLevel::M,
-                };
-                (ec_level, &data[3..])
-            }
-            _ => (EcLevel::M, data),
-        };
-
-        let module_size = magnification.max(1);
-
-        if let Ok(code) = QrCode::with_error_correction_level(payload.as_bytes(), ec_level) {
-            let qr_image = code.render::<Rgb<u8>>()
-                .quiet_zone(false)
-                .module_dimensions(module_size, module_size)
-                .build();
-
-            // ^FT: y is the bottom edge. ^FO: Zebra printers draw QR codes 10 dots below the field origin.
-            let y = if bottom {
-                y.saturating_sub(code.width() as u32 * module_size)
-            } else {
-                y + 10
-            };
-
-            self.note_drawn(x as i64, y as i64, qr_image.width(), qr_image.height());
-            for (qr_x, qr_y, pixel) in qr_image.enumerate_pixels() {
-                let target_x = x + qr_x;
-                let target_y = y + qr_y;
-
-                if target_x < image.width() && target_y < image.height() {
-                    image.put_pixel(target_x, target_y, *pixel);
+    /// ^BQ: always upright; the orientation only moves it (see [`qr::top_left`]).
+    #[allow(clippy::too_many_arguments)]
+    fn render_qr_code(&self, image: &mut RgbImage, x: u32, y: u32, data: &str, magnification: u32, orientation: Orientation, bottom: bool) {
+        let Some(code) = qr::encode(data) else { return };
+        let module = magnification.max(1);
+        let side = code.size * module;
+        let (x, y) = qr::top_left(x, y, code.size, module, orientation, bottom);
+        self.note_drawn(x as i64, y as i64, side, side);
+        for row in 0..code.size {
+            for col in 0..code.size {
+                if !code.get(col, row) {
+                    continue;
+                }
+                let (px, py) = (x + col * module, y + row * module);
+                for ty in py..(py + module).min(image.height()) {
+                    for tx in px..(px + module).min(image.width()) {
+                        image.put_pixel(tx, ty, BLACK);
+                    }
                 }
             }
         }
@@ -1741,6 +1706,43 @@ mod tests {
         assert_matches_labelary(&[
             ("^BY2^FO500,150^BCR,80,Y^FD12345678^FS", (480, 150, 579, 395)),
             ("^BY2^FO100,650^BCI,80,Y^FD12345678^FS", (100, 630, 345, 729)),
+        ]);
+    }
+
+    #[test]
+    fn rotated_2d_symbols_match_labelary() {
+        // ^FO: the rotated symbol's top-left on the origin; ^FT: the unrotated bottom-left
+        // corner, turned with the symbol.
+        assert_matches_labelary(&[
+            ("^FO50,350^B0B,5,N,0^FDAZTEC ROTATION^FS", (50, 350, 144, 444)),
+            ("^FT300,500^B0N,5,N,0^FDAZTEC ROTATION^FS", (300, 405, 394, 499)),
+            ("^FT550,500^B0R,5,N,0^FDAZTEC ROTATION^FS", (550, 500, 644, 594)),
+            ("^FT150,800^B0I,5,N,0^FDAZTEC ROTATION^FS", (55, 800, 149, 894)),
+            ("^FT450,800^B0B,5,N,0^FDAZTEC ROTATION^FS", (355, 705, 449, 799)),
+        ]);
+        // QR codes never turn; ^FO R and B only move the 10 dot band, ^FT ends 3 modules up.
+        assert_matches_labelary(&[
+            ("^FO50,50^BQR,2,4^FDQA,ROTATED^FS", (50, 50, 133, 133)),
+            ("^FWB^FO300,400^BQ,2,4^FDQA,FW IGNORED^FS", (310, 400, 393, 483)),
+            ("^FT300,200^BQN,2,2^FDQA,FT MAG2^FS", (300, 152, 341, 193)),
+            ("^FT300,500^BQB,2,4^FDQA,FT B^FS", (300, 404, 383, 487)),
+            ("^FO500,50^BQN,2^FDQA,DEFAULT MAG^FS", (500, 60, 541, 101)),
+        ]);
+        // Placed like 1D bars: ^FO puts the rotated symbol's top-left on the origin, ^FT the
+        // unrotated bottom-left corner, rotated with the symbol.
+        assert_matches_labelary(&[
+            ("^FO650,50^BXB,6,200^FDROTATE DM^FS", (650, 50, 733, 133)),
+            ("^FT400,150^BXN,6,200^FDROTATE DM^FS", (400, 66, 483, 149)),
+            ("^FT550,150^BXR,6,200^FDROTATE DM^FS", (550, 150, 633, 233)),
+            ("^FT700,150^BXI,6,200^FDROTATE DM^FS", (616, 150, 699, 233)),
+            ("^FT700,400^BXB,6,200^FDROTATE DM^FS", (616, 316, 699, 399)),
+            ("^BY2^FT100,450^B7N,4,0,2,6^FDPDF FT^FS", (100, 426, 305, 449)),
+            ("^BY2^FT500,450^B7I,4,0,2,6^FDPDF FT^FS", (294, 450, 499, 473)),
+            ("^BY2^FT100,900^B7R,4,0,2,6^FDPDF FT^FS", (100, 900, 123, 1105)),
+            ("^BY2^FT400,900^B7B,4,0,2,6^FDPDF FT^FS", (376, 694, 399, 899)),
+            // MaxiCode is 200 x 192 dots at 8 dots/mm.
+            ("^FO30,30^BD4^FDABC1234567890123XYZ^FS", (30, 31, 229, 222)),
+            ("^FT550,1180^BD4^FDFT MAXI^FS", (550, 986, 749, 1177)),
         ]);
     }
 

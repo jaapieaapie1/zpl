@@ -114,12 +114,12 @@ const DM_FNC1: u16 = 256;
 
 /// ^BX DataMatrix (ECC 200 only; quality param 0-140 other than 200 -> treat as 200).
 ///
-/// `rows`/`cols`: requested symbol size from ^BX params (0 = automatic smallest fit). If the
-/// requested size is too small, the smallest fitting size that is at least as large is used
-/// (falling back to automatic sizing). An explicit non-square `rows`x`cols` request allows
-/// rectangular symbols even without `rectangular`.
-/// `rectangular`: ^BX aspect ratio 2 — prefer rectangular symbols (falls back to squares when
-/// the data does not fit the largest rectangle).
+/// `rows`/`cols`: requested symbol size from ^BX params (0 = automatic smallest fit). As on
+/// Zebra printers (checked on Labelary) the request is exact: a size that does not exist for
+/// the aspect ratio (e.g. 8 x 8, or 16 x 20 without `rectangular`) or that the data does not
+/// fit prints no symbol. One of the two alone picks the symbol with that many rows (columns).
+/// `rectangular`: ^BX aspect ratio 2 — rectangular symbols (falls back to squares when the
+/// data does not fit the largest rectangle and no size was requested).
 /// `escape`: ^BX escape character. Supported sequences: `<e>1` FNC1 (codeword 232; a leading
 /// FNC1 marks GS1 DataMatrix), `<e><e>` literal escape char, `<e>dNNN` byte with decimal value NNN, `<e>@`..`<e>_` control
 /// characters 0-31. Other sequences are kept literally.
@@ -149,21 +149,19 @@ pub fn datamatrix(
     let needed = if edf_short_tail { len + 1 } else { len };
 
     let fits = |s: &&DmSize| usize::from(s.data) >= needed;
-    let mut size = None;
-    if rows > 0 || cols > 0 {
-        let allow_rect = rectangular || (rows > 0 && cols > 0 && rows != cols);
-        size = DM_SIZES
+    let size = if rows > 0 || cols > 0 {
+        DM_SIZES
             .iter()
-            .filter(|s| s.rows >= rows && s.cols >= cols && (allow_rect || s.rows == s.cols))
-            .filter(fits)
-            .min_by_key(|s| (s.data, s.rows * s.cols));
+            .filter(|s| (s.rows != s.cols) == rectangular)
+            .filter(|s| (rows == 0 || s.rows == rows) && (cols == 0 || s.cols == cols))
+            .find(fits)
+    } else {
+        rectangular
+            .then(|| DM_SIZES[24..].iter().find(fits))
+            .flatten()
+            .or_else(|| DM_SIZES[..24].iter().find(fits))
     }
-    if size.is_none() && rectangular {
-        size = DM_SIZES[24..].iter().find(fits);
-    }
-    let size = size
-        .or_else(|| DM_SIZES[..24].iter().find(fits))
-        .ok_or(EncodeError::TooLong)?;
+    .ok_or(EncodeError::TooLong)?;
 
     // Unlatch from C40/Text/EDIFACT if the symbol is not exactly full, then pad. An EDIFACT
     // unlatch with <= 2 codewords left is implicit (the rest is read as ASCII) and must be omitted.
@@ -752,9 +750,9 @@ const PDF_MAX_CODEWORDS: u32 = 928;
 
 /// ^B7 PDF417.
 ///
-/// `security`: 0-8 error correction level; `None` = automatic (recommended level for the number
-/// of data codewords: <=40 -> 2, <=160 -> 3, <=320 -> 4, else 5, lowered if needed to fit).
-/// `columns`: data columns 1-30 (0 = auto: rows:columns of about 1:2, Zebra's documented default).
+/// `security`: 0-8 error correction level; `None` = 0, Zebra's default (error detection only).
+/// `columns`: data columns 1-30 (0 = auto: height:width of about 1:2 at 3-module rows, Zebra's
+/// documented default).
 /// `rows`: 3-90 (0 = auto). A too small explicit grid grows (rows first, then columns).
 /// `truncated`: compact PDF417 (right row indicator omitted, stop pattern is a single 1-module bar).
 ///
@@ -771,21 +769,8 @@ pub fn pdf417(
     pdf_high_level(data, &mut cws);
     let n_data = cws.len() as u32;
 
-    let level = match security {
-        Some(l) => u32::from(l.min(8)),
-        None => {
-            let mut l = match n_data {
-                0..=40 => 2,
-                41..=160 => 3,
-                161..=320 => 4,
-                _ => 5,
-            };
-            while l > 0 && n_data + (2 << l) > PDF_MAX_CODEWORDS {
-                l -= 1;
-            }
-            l
-        }
-    };
+    // ^B7 security level, default 0 (error detection only).
+    let level = u32::from(security.unwrap_or(0).min(8));
     let n_ecc = 2u32 << level;
     let needed = n_data + n_ecc;
     if needed > PDF_MAX_CODEWORDS {
@@ -862,14 +847,20 @@ fn pdf_dimensions(needed: u32, columns: u32, rows: u32) -> Option<(u32, u32)> {
     } else if rows > 0 {
         needed.div_ceil(req_rows).clamp(1, 30)
     } else {
-        // rows:columns ~ 1:2 => columns = sqrt(2 * needed)
-        ((f64::from(needed) * 2.0).sqrt().round() as u32).clamp(1, 30)
+        // Zebra's 1:2 aspect ratio is height:width with rows at the nominal 3 modules: the
+        // column count whose 3 * rows / (69 + 17 * columns) modules comes closest to 1/2
+        // (fewest columns on a tie). Matches Labelary for 11 to 258 codewords.
+        let aspect = |cols: u32| (3 * needed.div_ceil(cols).max(3)) as f32 / (69 + 17 * cols) as f32;
+        (1..=30)
+            .filter(|&cols| needed.div_ceil(cols) <= 90)
+            .min_by(|&a, &b| (aspect(a) - 0.5).abs().total_cmp(&(aspect(b) - 0.5).abs()))
+            .unwrap_or(30)
     };
     search(pref_cols, req_rows).or_else(|| search(pref_cols, 3))
 }
 
 /// PDF417 high-level encoding (text / byte / numeric compaction), after zxing's
-/// `PDF417HighLevelEncoder` in auto mode.
+/// `PDF417HighLevelEncoder` in auto mode, with Zebra's choice between text and numeric runs.
 fn pdf_high_level(msg: &[u8], out: &mut Vec<u16>) {
     const TEXT: u8 = 0;
     const BYTE: u8 = 1;
@@ -880,7 +871,7 @@ fn pdf_high_level(msg: &[u8], out: &mut Vec<u16>) {
     let mut p = 0;
     while p < len {
         let n = consecutive_digits(msg, p);
-        if n >= 13 {
+        if numeric_run(msg, p, n) {
             out.push(902);
             mode = NUMERIC;
             sub = SUB_ALPHA;
@@ -889,7 +880,9 @@ fn pdf_high_level(msg: &[u8], out: &mut Vec<u16>) {
             continue;
         }
         let t = consecutive_text(msg, p);
-        if t >= 5 || n == len {
+        // Any text run stays text (zxing switches to bytes for runs under 5; Zebra and
+        // Labelary encode e.g. "AB" as one text codeword).
+        if t > 0 {
             if mode != TEXT {
                 out.push(900);
                 mode = TEXT;
@@ -911,6 +904,24 @@ fn pdf_high_level(msg: &[u8], out: &mut Vec<u16>) {
     }
 }
 
+/// Whether the `digits` digits at `start` go into numeric compaction. zxing waits for 13;
+/// Zebra (measured on Labelary) switches as soon as it is no longer than staying in text,
+/// counting half a codeword per text value (the digits plus the latches into and out of
+/// mixed) against 902, the numeric codewords and the 900 back to text. A message of digits
+/// only is always numeric.
+fn numeric_run(msg: &[u8], start: usize, digits: usize) -> bool {
+    if digits == 0 {
+        return false;
+    }
+    if digits >= 13 || digits == msg.len() {
+        return true;
+    }
+    let more = usize::from(start + digits < msg.len());
+    // Base-900 codewords for "1" followed by the digits: about 2.95 digits per codeword.
+    let numeric = 1 + (digits as f32 / 900f32.log10()) as usize + 1 + more;
+    2 * numeric <= 1 + digits + more
+}
+
 fn consecutive_digits(msg: &[u8], start: usize) -> usize {
     msg[start..]
         .iter()
@@ -926,7 +937,7 @@ fn consecutive_text(msg: &[u8], start: usize) -> usize {
     let mut idx = start;
     while idx < msg.len() {
         let digits = consecutive_digits(msg, idx);
-        if digits >= 13 {
+        if idx > start && numeric_run(msg, idx, digits) {
             break;
         }
         if digits > 0 {
@@ -944,7 +955,7 @@ fn consecutive_text(msg: &[u8], start: usize) -> usize {
 fn consecutive_binary(msg: &[u8], start: usize) -> usize {
     let mut idx = start;
     while idx < msg.len() {
-        if consecutive_digits(msg, idx) >= 13 {
+        if numeric_run(msg, idx, consecutive_digits(msg, idx)) {
             break;
         }
         if idx > start && consecutive_text(msg, idx) >= 5 {
@@ -1150,13 +1161,15 @@ fn pdf_ecc(cws: &mut Vec<u16>, level: usize) {
 // Aztec
 // ---------------------------------------------------------------------------------------------
 
-/// ^BO / ^B0 Aztec. `ecc_percent`: 0 = default (23%), 1-99 = minimum error correction percent,
-/// 101-104 = compact 1-4 layers, 201-232 = full-range 1-32 layers, 300 = rune (unsupported).
-/// Other values are treated as the default. If the data does not fit a fixed layer count the
+/// ^BO / ^B0 Aztec. `ecc_percent`: 0 = default (Zint's 23% + 3 codewords sizing), 1-99 =
+/// minimum error correction percent, 101-104 = compact 1-4 layers, 201-232 = full-range 1-32
+/// layers, 300 = rune. Other values are treated as the default. If the data does not fit a fixed layer count the
 /// symbol is sized automatically instead.
 pub fn aztec(data: &[u8], ecc_percent: u32) -> Result<Matrix, EncodeError> {
     if ecc_percent == 300 {
-        return Err(EncodeError::Unsupported);
+        // Like Labelary, data that is not a number 0-255 is rune 0.
+        let value = std::str::from_utf8(data).ok().and_then(|d| d.trim().parse::<u8>().ok());
+        return Ok(aztec_rune(value.unwrap_or(0)));
     }
     if data.is_empty() {
         return Err(EncodeError::InvalidData);
@@ -1176,7 +1189,10 @@ pub fn aztec(data: &[u8], ecc_percent: u32) -> Result<Matrix, EncodeError> {
 
     let layout = fixed
         .and_then(|(compact, layers)| aztec_fixed_layout(&bits, compact, layers, ecc_bits))
-        .or_else(|| aztec_auto_layout(&bits, ecc_bits))
+        .or_else(|| match ecc_percent {
+            1..=99 => aztec_auto_layout(&bits, ecc_bits),
+            _ => aztec_default_layout(&bits),
+        })
         .ok_or(EncodeError::TooLong)?;
     Ok(aztec_draw(layout))
 }
@@ -1249,6 +1265,25 @@ fn aztec_auto_layout(bits: &[bool], ecc_bits: u32) -> Option<AztecLayout> {
         }
     }
     None
+}
+
+/// Most data bits per layer count at the default error correction (23% + 3 codewords), from
+/// Zint, whose sizing Labelary follows: compact symbols, then full-range ones.
+const AZTEC_COMPACT_23: [u32; 4] = [66, 168, 288, 440];
+const AZTEC_FULL_23: [u32; 32] = [
+    84, 204, 352, 520, 720, 944, 1184, 1456, 1750, 2070, 2410, 2780, 3180, 3590, 4040, 4500, 5000,
+    5520, 6060, 6630, 7210, 7830, 8472, 9132, 9816, 10536, 11280, 12036, 12828, 13644, 14472, 15348,
+];
+
+/// The smallest symbol whose default-ECC capacity exceeds the stuffed data, compact first.
+fn aztec_default_layout(bits: &[bool]) -> Option<AztecLayout> {
+    let compact = AZTEC_COMPACT_23.iter().enumerate().map(|(i, &max)| (true, i as u32 + 1, max));
+    let full = AZTEC_FULL_23.iter().enumerate().map(|(i, &max)| (false, i as u32 + 1, max));
+    compact.chain(full).find_map(|(compact, layers, max)| {
+        let word_size = AZTEC_WORD_SIZE[layers as usize];
+        let stuffed = aztec_stuff_bits(bits, word_size);
+        (stuffed.len() < max as usize).then_some(AztecLayout { compact, layers, word_size, stuffed })
+    })
 }
 
 fn push_bits(out: &mut Vec<bool>, value: u32, n: u32) {
@@ -1465,8 +1500,32 @@ fn aztec_draw(l: AztecLayout) -> Matrix {
         row_offset += row_size * 8;
     }
 
-    // Mode message.
+    aztec_core(&mut m, compact, &mode_bits);
+
+    // Reference grid (full-range only).
     let center = size / 2;
+    if !compact {
+        let mut i = 0;
+        let mut j = 0;
+        while i < base / 2 - 1 {
+            let mut k = center & 1;
+            while k < size {
+                m.set(center - j, k);
+                m.set(center + j, k);
+                m.set(k, center - j);
+                m.set(k, center + j);
+                k += 2;
+            }
+            i += 15;
+            j += 16;
+        }
+    }
+    m
+}
+
+/// Draws the mode message and the bull's eye with its orientation marks around the centre.
+fn aztec_core(m: &mut Matrix, compact: bool, mode_bits: &[bool]) {
+    let center = m.width / 2;
     if compact {
         for i in 0..7 {
             let off = center - 3 + i;
@@ -1520,23 +1579,19 @@ fn aztec_draw(l: AztecLayout) -> Matrix {
     m.set(center + eye, center - eye + 1);
     m.set(center + eye, center + eye - 1);
 
-    // Reference grid (full-range only).
-    if !compact {
-        let mut i = 0;
-        let mut j = 0;
-        while i < base / 2 - 1 {
-            let mut k = center & 1;
-            while k < size {
-                m.set(center - j, k);
-                m.set(center + j, k);
-                m.set(k, center - j);
-                m.set(k, center + j);
-                k += 2;
-            }
-            i += 15;
-            j += 16;
-        }
+}
+
+/// Aztec rune `value` (^B0 ECC 300): the 11 x 11 compact core alone, its mode message the
+/// value's two 4-bit words plus five check words, every other bit inverted.
+fn aztec_rune(value: u8) -> Matrix {
+    let mut word = Vec::with_capacity(8);
+    push_bits(&mut word, u32::from(value), 8);
+    let mut mode_bits = aztec_check_words(&word, 28, 4);
+    for bit in mode_bits.iter_mut().step_by(2) {
+        *bit = !*bit;
     }
+    let mut m = Matrix::new(11, 11);
+    aztec_core(&mut m, true, &mode_bits);
     m
 }
 
@@ -1633,7 +1688,8 @@ fn az_latch_seq(from: usize, to: usize) -> &'static [(u32, u32)] {
         (AZ_UPPER, AZ_MIXED) => &[(29, 5)],
         (AZ_UPPER, AZ_DIGIT) => &[(30, 5)],
         (AZ_UPPER, AZ_PUNCT) => &[(29, 5), (30, 5)],
-        (AZ_LOWER, AZ_UPPER) => &[(30, 5), (14, 4)],
+        // Zint (and so Labelary) goes through mixed, not the shorter digit latch.
+        (AZ_LOWER, AZ_UPPER) => &[(29, 5), (29, 5)],
         (AZ_LOWER, AZ_MIXED) => &[(29, 5)],
         (AZ_LOWER, AZ_DIGIT) => &[(30, 5)],
         (AZ_LOWER, AZ_PUNCT) => &[(29, 5), (30, 5)],
@@ -1656,7 +1712,7 @@ fn az_latch_seq(from: usize, to: usize) -> &'static [(u32, u32)] {
 /// Latch cost in bits (precomputed from [`az_latch_seq`]).
 const AZ_LATCH_BITS: [[u32; 5]; 5] = [
     [0, 5, 5, 5, 10],
-    [9, 0, 5, 5, 10],
+    [10, 0, 5, 5, 10],
     [5, 5, 0, 10, 5],
     [4, 9, 9, 0, 14],
     [5, 10, 10, 10, 0],
@@ -1723,6 +1779,8 @@ fn aztec_high_level(data: &[u8]) -> Vec<bool> {
         }
         let ch = data[i];
         let pair = data.get(i + 1).map_or(0, |&nx| az_pair(ch, nx));
+        // Like Zint, only bytes no character mode holds go in binary shift runs.
+        let binary = (0..4).all(|m| az_code(m, ch) == 0) && az_punct(ch) == 0;
         let mut cur = [INF; AZ_STATES];
         cur.copy_from_slice(&cost[row..row + AZ_STATES]);
         let runs = [
@@ -1742,7 +1800,13 @@ fn aztec_high_level(data: &[u8]) -> Vec<bool> {
             if c == INF {
                 continue;
             }
+            // Like Zint (and so Labelary), a character the current mode holds (a space, or
+            // `,` `.` in digit mode) never latches away, even when that would be shorter.
+            let held = az_mode_code(m, ch) != 0;
             for (t, &latch) in AZ_LATCH_BITS[m].iter().enumerate() {
+                if held && t != m {
+                    continue;
+                }
                 if az_mode_code(t, ch) != 0 {
                     relax(i + 1, t, m, AzOp::Char, c + latch + az_bits(t), 0);
                 }
@@ -1758,19 +1822,23 @@ fn aztec_high_level(data: &[u8]) -> Vec<bool> {
                     relax(i + 2, m, m, AzOp::PunctShift, c + az_bits(m) + 5, 0);
                 }
             }
-            if (m == AZ_LOWER || m == AZ_DIGIT) && az_code(AZ_UPPER, ch) != 0 {
+            // Upper shift for a lone capital only; a run of them latches.
+            let lone = !data.get(i + 1).is_some_and(u8::is_ascii_uppercase);
+            if (m == AZ_LOWER || m == AZ_DIGIT) && lone && az_code(AZ_UPPER, ch) != 0 {
                 relax(i + 1, m, m, AzOp::UpperShift, c + az_bits(m) + 5, 0);
             }
             let (ret, pre) = match m {
                 AZ_UPPER | AZ_LOWER | AZ_MIXED => (m, 0),
                 _ => (AZ_UPPER, AZ_LATCH_BITS[m][AZ_UPPER]),
             };
-            relax(i + 1, AZ_BIN + ret, m, AzOp::BinStart, c + pre + 10 + 8, 1);
+            if binary {
+                relax(i + 1, AZ_BIN + ret, m, AzOp::BinStart, c + pre + 10 + 8, 1);
+            }
         }
         for r in 0..3 {
             let c = cur[AZ_BIN + r];
             let run = runs[r];
-            if c != INF && run < AZ_MAX_BIN {
+            if c != INF && binary && run < AZ_MAX_BIN {
                 let extra = if run + 1 == 32 { 11 } else { 0 };
                 relax(
                     i + 1,
@@ -2151,13 +2219,23 @@ mod tests {
         assert_eq!((m.width, m.height), (10, 10));
         let m = datamatrix(b"Hello", 0, 0, true, None).unwrap();
         assert_eq!((m.width, m.height), (18, 8));
-        // Explicit size honoured, too small request grows.
+        // An explicit size is exact (as on Labelary): too small, or not a symbol of the
+        // aspect ratio, prints nothing.
         let m = datamatrix(b"Hello", 24, 24, false, None).unwrap();
         assert_eq!((m.width, m.height), (24, 24));
-        let m = datamatrix(&[b'A'; 100], 10, 10, false, None).unwrap();
-        assert!(m.width > 10 && m.width == m.height);
-        let m = datamatrix(b"Hi", 12, 26, false, None).unwrap();
+        assert_eq!(datamatrix(&[b'A'; 100], 10, 10, false, None), Err(EncodeError::TooLong));
+        assert_eq!(datamatrix(b"AB", 8, 8, false, None), Err(EncodeError::TooLong));
+        assert_eq!(datamatrix(b"Hi", 12, 26, false, None), Err(EncodeError::TooLong));
+        assert_eq!(datamatrix(b"Hi", 36, 16, true, None), Err(EncodeError::TooLong));
+        let m = datamatrix(b"Hi", 12, 26, true, None).unwrap();
         assert_eq!((m.width, m.height), (26, 12));
+        let m = datamatrix(b"RECT8", 8, 18, true, None).unwrap();
+        assert_eq!((m.width, m.height), (18, 8));
+        // Rows or columns alone.
+        let m = datamatrix(b"ROWS ONLY", 16, 0, false, None).unwrap();
+        assert_eq!((m.width, m.height), (16, 16));
+        let m = datamatrix(b"COLS ONLY", 0, 16, false, None).unwrap();
+        assert_eq!((m.width, m.height), (16, 16));
         // Finder pattern: solid left column and bottom row.
         let m = datamatrix(b"Hello", 0, 0, false, None).unwrap();
         assert!((0..12).all(|y| m.get(0, y)));
@@ -2226,7 +2304,7 @@ mod tests {
                 inputs.push((0..(cap - 4) / 2).map(|i| 200 + (i % 50) as u8).collect()); // upper shift
             }
             for data in inputs {
-                let m = datamatrix(&data, s.rows, s.cols, false, None).unwrap();
+                let m = datamatrix(&data, s.rows, s.cols, s.rows != s.cols, None).unwrap();
                 assert_eq!(
                     (m.height, m.width),
                     (s.rows, s.cols),
@@ -2305,6 +2383,51 @@ mod tests {
     }
 
     #[test]
+    fn pdf417_auto_grid_matches_labelary() {
+        // (data, security) -> (data columns, rows), from Labelary's renders.
+        let a = |n: usize| "A".repeat(n);
+        let cases = [
+            ("AB".to_string(), 3, (1, 18)),
+            ("AB".to_string(), 4, (2, 17)),
+            ("AB".to_string(), 5, (3, 22)),
+            ("AB".to_string(), 6, (5, 26)),
+            ("AB".to_string(), 7, (8, 33)),
+            (a(30), 3, (2, 16)),
+            (a(32), 3, (2, 17)),
+            (a(62), 4, (3, 22)),
+            ("SECURITY 1".to_string(), 1, (1, 11)),
+            ("SECURITY 5".to_string(), 5, (3, 24)),
+        ];
+        for (data, security, (cols, rows)) in cases {
+            let m = pdf417(data.as_bytes(), Some(security), 0, 0, false).unwrap();
+            assert_eq!((m.width, m.height), (69 + 17 * cols, rows), "{data} s{security}");
+        }
+        // No security level is level 0: two error correction codewords.
+        let m = pdf417(b"AB", None, 0, 0, false).unwrap();
+        assert_eq!((m.width, m.height), (86, 4));
+    }
+
+    #[test]
+    fn pdf417_compaction_matches_labelary() {
+        // Data codewords (after the length descriptor) read off Labelary's renders.
+        let cases: [(&str, &[u16]); 8] = [
+            ("AB1234", &[1, 841, 63, 149]),
+            ("AB1234567", &[1, 902, 13, 782, 767]),
+            ("AB1234567CD", &[1, 841, 63, 125, 187, 842, 119]),
+            ("AB12345678CD", &[1, 902, 138, 628, 478, 900, 63]),
+            ("1234567AB", &[841, 63, 125, 187, 840, 59]),
+            ("123456", &[902, 1, 348, 256]),
+            ("ab12345678", &[810, 59, 902, 138, 628, 478]),
+            ("PDF417 TEST DATA 1234567890", &[453, 178, 121, 236, 859, 138, 596, 90, 570, 809, 902, 15, 369, 753, 190]),
+        ];
+        for (data, want) in cases {
+            let mut cws = Vec::new();
+            pdf_high_level(data.as_bytes(), &mut cws);
+            assert_eq!(cws, want, "{data}");
+        }
+    }
+
+    #[test]
     fn pdf417_ecc_generator() {
         assert_eq!(pdf_generator(0), &[27, 917]);
         assert_eq!(pdf_generator(1), &[522, 568, 723, 809]);
@@ -2344,9 +2467,49 @@ mod tests {
         assert_eq!(m.width, 19);
         let m = aztec(b"Hello", 215).unwrap();
         assert_eq!(m.width, 14 + 15 * 4 + 1 + 2 * ((37 - 1) / 15));
-        assert_eq!(aztec(b"Hello", 300), Err(EncodeError::Unsupported));
+        assert_eq!(aztec(b"Hello", 300).unwrap().width, 11);
         assert_eq!(aztec(b"", 0), Err(EncodeError::InvalidData));
         assert_eq!(aztec(&[0u8; 5000], 0), Err(EncodeError::TooLong));
+    }
+
+    /// `bits` as 0/1 text, `n` bits per group, for readable expectations.
+    fn groups(bits: &[bool], n: &[usize]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        for &len in n {
+            out.push(bits[at..at + len].iter().map(|&b| if b { '1' } else { '0' }).collect());
+            at += len;
+        }
+        out
+    }
+
+    #[test]
+    fn aztec_modes_follow_zint() {
+        // Labelary keeps the space in upper and latches to digit after it (ZXing's shortest
+        // path would take the space in digit mode).
+        let bits = aztec_high_level(b"C 1");
+        assert_eq!(groups(&bits, &[5, 5, 5, 4]), ["00100", "00001", "11110", "0011"]);
+        // Two capitals in lower latch through mixed; one is shifted.
+        let bits = aztec_high_level(b"aBCa");
+        assert_eq!(groups(&bits, &[5, 5, 5, 5, 5, 5, 5, 5]), ["11100", "00010", "11101", "11101", "00011", "00100", "11100", "00010"]);
+        let bits = aztec_high_level(b"aBa");
+        assert_eq!(groups(&bits, &[5, 5, 5, 5, 5]), ["11100", "00010", "11100", "00011", "00010"]);
+    }
+
+    #[test]
+    fn aztec_default_size_follows_zint() {
+        // Labelary: 14 characters (70 bits) need 2 compact layers (Zint: < 66 bits for one).
+        assert_eq!(aztec(b"AZTEC ROTATION", 0).unwrap().width, 19);
+        assert_eq!(aztec(b"AZTEC ROTAT", 0).unwrap().width, 15);
+    }
+
+    #[test]
+    fn aztec_rune_core() {
+        let rune = aztec(b"RUNE", 300).unwrap();
+        assert_eq!((rune.width, rune.height), (11, 11));
+        // Bull's eye: dark centre and ring at 2, light ring at 1, orientation mark top-left.
+        assert!(rune.get(5, 5) && !rune.get(5, 4) && rune.get(5, 3) && rune.get(0, 0));
+        assert_ne!(aztec(b"7", 300).unwrap(), rune);
     }
 
     #[test]

@@ -73,9 +73,9 @@ impl PngRenderer {
             }
         };
         if let Some(frame) = frame {
-            // ^FT: y is the bottom edge of the (unrotated) frame.
-            let y = if at.bottom { at.y.saturating_sub(frame.height()) } else { at.y };
-            self.place_symbol(image, &frame, at.x, y, at.orientation, 0, 0);
+            // ^FT: the bottom-left corner of the unrotated frame, rotated with it.
+            let bars = (0, 0, frame.width(), frame.height());
+            self.place_bars(image, &frame, at.x, at.y, at.bottom, at.orientation, bars);
         }
     }
 }

@@ -85,7 +85,8 @@ pub enum Command {
     },
 
     QrCode {
-        orientation: Orientation,
+        /// `None`: the ^FW default.
+        orientation: Option<Orientation>,
         model: QrModel,
         magnification: u32,
         error_correction: QrErrorCorrection,
@@ -614,6 +615,8 @@ pub enum Code128Mode {
     AutoMode,
     UccCase,
     Auto,
+    /// D: UCC/EAN-128 (GS1-128). FNC1 first; parentheses and spaces are printed, not encoded.
+    Gs1,
     Subset(Code128Subset),
 }
 

@@ -62,6 +62,60 @@ impl Code128 {
     }
 }
 
+/// Mode D interpretation line (Labelary): font 0 (Triumvirate) at `em` dots both ways,
+/// scaled so the ink spans [`Gs1Line::FILL`] of the bar width, centred under (or over) the
+/// bars. Below the bars the capitals start [`Gs1Line::GAP`] dots down; above them the
+/// baseline sits [`Gs1Line::ABOVE`] em over the bars.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Gs1Line {
+    pub em: f32,
+    /// Pen position of the first character, in the unrotated symbol frame.
+    pub x: f32,
+    pub baseline: f32,
+    /// Height the line adds to the symbol.
+    pub area: u32,
+    /// Top of the bars in the same frame.
+    pub bars_y: u32,
+}
+
+impl Gs1Line {
+    const FILL: f32 = 0.955;
+    const GAP: f32 = 5.0;
+    const ABOVE: f32 = 0.41;
+    /// Cap height and descent of font 0, in em.
+    const CAP: f32 = 0.75;
+    const DESCENT: f32 = 0.294;
+
+    /// Layout of `text` for bars `bars_w` x `height` dots; `None` for text without ink.
+    pub fn new(text: &str, bars_w: u32, height: u32, above: bool) -> Option<Self> {
+        use ab_glyph::{Font, FontRef};
+        let font = FontRef::try_from_slice(crate::TRIUMVIRATE).ok()?;
+        // Ink extent along the line, in font units, with the pen starting at 0.
+        let (mut pen, mut left, mut right) = (0.0f32, f32::MAX, f32::MIN);
+        for c in text.chars() {
+            let glyph = font.glyph_id(c);
+            if let Some(outline) = font.outline(glyph) {
+                left = left.min(pen + outline.bounds.min.x);
+                right = right.max(pen + outline.bounds.max.x);
+            }
+            pen += font.h_advance_unscaled(glyph);
+        }
+        if right <= left {
+            return None;
+        }
+        let em = Self::FILL * bars_w as f32 * font.units_per_em().unwrap_or(1000.0) / (right - left);
+        let unit = em / font.units_per_em().unwrap_or(1000.0);
+        let x = (bars_w as f32 - (right - left) * unit) / 2.0 - left * unit;
+        Some(if above {
+            let area = (em * (Self::CAP + Self::ABOVE)).ceil() as u32;
+            Self { em, x, baseline: area as f32 - em * Self::ABOVE, area, bars_y: area }
+        } else {
+            let area = (Self::GAP + em * (Self::CAP + Self::DESCENT)).ceil() as u32;
+            Self { em, x, baseline: height as f32 + Self::GAP + em * Self::CAP, area, bars_y: 0 }
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Token {
     Char(u8),
@@ -73,7 +127,8 @@ pub fn encode(data: &str, mode: Code128Mode) -> Code128 {
     let mut values = match mode {
         Code128Mode::AutoMode => encode_invocation(data, None),
         Code128Mode::Subset(subset) => encode_invocation(data, Some(subset)),
-        Code128Mode::Auto => encode_auto(data),
+        Code128Mode::Auto => encode_auto(data, false),
+        Code128Mode::Gs1 => encode_gs1(data),
         Code128Mode::UccCase => encode_ucc_case(data),
     };
     let checksum = checksum(&values.0);
@@ -228,8 +283,10 @@ fn encode_invocation(data: &str, forced_start: Option<Code128Subset>) -> (Vec<u8
     (values, text)
 }
 
-/// Zebra mode A: automatic subset selection, digit runs packed into subset C.
-fn encode_auto(data: &str) -> (Vec<u8>, String) {
+/// Zebra mode A: automatic subset selection, digit runs packed into subset C. With `gs1`
+/// the symbol starts in subset C on any leading digit pair (application identifiers are at
+/// least two digits), as Labelary does in mode D.
+fn encode_auto(data: &str, gs1: bool) -> (Vec<u8>, String) {
     let tokens: Vec<Token> = tokenize(data)
         .into_iter()
         .filter_map(|t| match t {
@@ -253,8 +310,10 @@ fn encode_auto(data: &str) -> (Vec<u8>, String) {
         Code128Subset::B
     };
 
-    let first_run = if tokens.is_empty() { 0 } else { digit_run(0) };
-    let mut subset = if first_run >= 4 || (first_run == 2 && tokens.len() == 2) {
+    // Leading FNC1s do not count: the start character comes before them.
+    let first = tokens.iter().take_while(|t| **t == Token::Raw(FNC1)).count();
+    let first_run = digit_run(first);
+    let mut subset = if first_run >= 4 || (first_run == 2 && tokens.len() == first + 2) || (gs1 && first_run >= 2) {
         Code128Subset::C
     } else {
         best_ab(0)
@@ -321,6 +380,17 @@ fn encode_auto(data: &str) -> (Vec<u8>, String) {
     }
 
     (values, text)
+}
+
+/// Zebra mode D: UCC/EAN-128. FNC1 follows the start character; parentheses and spaces are
+/// stripped from the bars but kept in the interpretation line. Like Labelary, no FNC1
+/// separates chained application identifiers, and no check digit is added.
+fn encode_gs1(data: &str) -> (Vec<u8>, String) {
+    let mut encoded = String::with_capacity(data.len() + 2);
+    encoded.push_str(">8");
+    encoded.extend(data.chars().filter(|c| !matches!(c, '(' | ')' | ' ')));
+    let (values, _) = encode_auto(&encoded, true);
+    (values, data.chars().filter(|&c| c.is_ascii() && c >= ' ').collect())
 }
 
 /// Zebra mode U: UCC case mode, 19 digits (padded / truncated) plus a mod-10 check digit.
@@ -393,6 +463,33 @@ mod tests {
         assert_eq!(&code.values[..code.values.len() - 1],
                    &[START_B, 33, 34, CODE_C, 12, 34, 56, CODE_B, 35, 36, 30]);
         assert_eq!(code.text, "AB123456CD>");
+    }
+
+    #[test]
+    fn mode_d_matches_labelary() {
+        // Labelary's symbols: start C, FNC1, AIs packed in C, no FNC1 between chained AIs.
+        let code = encode("(01)12345678901231(10)ABC123", Code128Mode::Gs1);
+        assert_eq!(code.values[..code.values.len() - 1],
+                   [START_C, FNC1, 1, 12, 34, 56, 78, 90, 12, 31, 10, CODE_B, 33, 34, 35, 17, 18, 19]);
+        assert_eq!(code.text, "(01)12345678901231(10)ABC123");
+        let code = encode("(10) A1", Code128Mode::Gs1);
+        assert_eq!(code.values[..code.values.len() - 1], [START_C, FNC1, 10, CODE_B, 33, 17]);
+        assert_eq!(code.text, "(10) A1");
+        let code = encode("(10)AB(21)CD", Code128Mode::Gs1);
+        assert_eq!(code.values[..code.values.len() - 1], [START_C, FNC1, 10, CODE_B, 33, 34, 18, 17, 35, 36]);
+    }
+
+    #[test]
+    fn mode_d_line_spans_the_bars() {
+        let below = Gs1Line::new("(10)A1", 180, 80, false).unwrap();
+        let above = Gs1Line::new("(10)A1", 180, 80, true).unwrap();
+        // Labelary prints this ~65-70 dots tall; ink 0.955 of the bars, centred.
+        assert!((below.em - 70.0).abs() < 3.0, "{below:?}");
+        assert_eq!(below.em, above.em);
+        assert!(below.x.abs() < 5.0, "{below:?}");
+        assert_eq!((below.bars_y, above.bars_y), (0, above.area));
+        assert!(below.baseline > 85.0 && above.baseline < above.area as f32);
+        assert_eq!(Gs1Line::new(" ", 180, 80, false), None);
     }
 
     #[test]

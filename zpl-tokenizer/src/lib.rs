@@ -213,6 +213,30 @@ impl<'a> Tokenizer<'a> {
         Token::Command { prefix, name, params, span: Span { start, end: self.position } }
     }
 
+    /// ^GFB,b,...: binary data is exactly `b` bytes after the fourth delimiter, and may hold
+    /// any byte, prefixes and delimiters included. The input is one character per byte
+    /// (Latin-1), so `b` bytes are `b` characters. `None` (other compressions, Z64/B64 data or
+    /// a bad byte count) leaves the command to [`Tokenizer::raw_command`].
+    fn binary_graphic(&mut self, prefix: CommandPrefix, name: &'a str, start: usize) -> Option<Token<'a>> {
+        let rest = &self.input[self.position..];
+        let mut fields = rest.splitn(5, self.delimiter);
+        let leading: [&'a str; 4] = [fields.next()?, fields.next()?, fields.next()?, fields.next()?];
+        let data = fields.next()?;
+        if leading.iter().any(|f| f.contains([self.caret, self.tilde]))
+            || !leading[0].trim().eq_ignore_ascii_case("B")
+            || data.starts_with(":Z64:")
+            || data.starts_with(":B64:")
+        {
+            return None;
+        }
+        let count: usize = leading[1].trim().parse().ok()?;
+        let len = data.char_indices().nth(count).map_or(data.len(), |(i, _)| i);
+        self.position += rest.len() - data.len() + len;
+        let mut params: Vec<&'a str> = leading.iter().map(|f| f.trim()).collect();
+        params.push(&data[..len]);
+        Some(Token::Command { prefix, name, params, span: Span { start, end: self.position } })
+    }
+
     pub fn next_token(&mut self) -> Option<Token<'a>> {
         self.skip_whitespace();
 
@@ -314,7 +338,10 @@ impl<'a> Tokenizer<'a> {
 
             // Bitmap data may be wrapped over several lines: take everything up to the next
             // command and split off only the leading parameters.
-            (CommandPrefix::Caret, "GF") => self.raw_command(prefix, name, start, 4),
+            (CommandPrefix::Caret, "GF") => match self.binary_graphic(prefix, name, start) {
+                Some(token) => token,
+                None => self.raw_command(prefix, name, start, 4),
+            },
             (CommandPrefix::Tilde, "DG") => self.raw_command(prefix, name, start, 3),
             (CommandPrefix::Tilde, "DY") => self.raw_command(prefix, name, start, 5),
             (CommandPrefix::Tilde, "DU" | "DT") => self.raw_command(prefix, name, start, 2),

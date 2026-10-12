@@ -255,6 +255,20 @@ fn test_graphic_field_ascii() {
 }
 
 #[test]
+fn test_graphic_field_binary_takes_byte_count() {
+    // Binary data is exactly `b` bytes and may contain prefixes, delimiters and whitespace;
+    // bytes above 0x7F arrive as one Latin-1 character each.
+    let parser = Parser::new("^GFB,6,6,2,^,\n \u{ff}\u{80}^FS^FO1,2");
+    let result = parser.parse().unwrap();
+    let Command::GraphicField { compression, data, .. } = &result[0] else {
+        panic!("Expected GraphicField command, got {:?}", result[0]);
+    };
+    assert_eq!(compression, &CompressionType::Binary);
+    assert_eq!(data, &vec![b'^', b',', b'\n', b' ', 0xFF, 0x80]);
+    assert!(matches!(result[1..], [Command::FieldSeperator, Command::FieldOrigin { x: 1, y: 2, .. }]), "{result:?}");
+}
+
+#[test]
 fn test_graphic_circle_minimal() {
     let parser = Parser::new("^GC50");
     let result = parser.parse().unwrap();
@@ -369,9 +383,9 @@ fn test_qr_code_minimal() {
     assert_eq!(
         result[0],
         Command::QrCode {
-            orientation: Orientation::Normal,
+            orientation: Some(Orientation::Normal),
             model: QrModel::Model2,
-            magnification: 1,
+            magnification: 2,
             error_correction: QrErrorCorrection::HighReliability,
             mask: Some(7)
         }
@@ -385,7 +399,7 @@ fn test_qr_code_full() {
     assert_eq!(
         result[0],
         Command::QrCode {
-            orientation: Orientation::Rotated90,
+            orientation: Some(Orientation::Rotated90),
             model: QrModel::Model1,
             magnification: 5,
             error_correction: QrErrorCorrection::UltraHighReliability,
@@ -646,7 +660,7 @@ fn test_line_color_values() {
 
 #[test]
 fn test_compression_types() {
-    let parser = Parser::new("^GFA,10,10,1,FF^GFB,10,10,1,FF^GFC,10,10,1,FF");
+    let parser = Parser::new("^GFA,10,10,1,FF^GFB,2,2,1,FF^GFC,10,10,1,FF");
     let result = parser.parse().unwrap();
 
     if let Command::GraphicField { compression, .. } = result[0] {

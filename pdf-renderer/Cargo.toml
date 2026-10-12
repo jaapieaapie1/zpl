@@ -15,6 +15,11 @@ qr-encode = { git = "ssh://git@github.com/jaapieaapie1/qrcode.git", rev = "766b3
 qr-core = { git = "ssh://git@github.com/jaapieaapie1/qrcode.git", rev = "766b33a5c6d8d70ab03e5a5f81bd2ffedf8da083", default-features = false }
 miniz_oxide = "0.8"
 subsetter = { version = "0.2", default-features = false }
+# ^PA advanced text layout: OpenType shaping and Unicode bidi.
+rustybuzz = "0.20.1"
+unicode-bidi = "0.3.18"
+unicode-script = "0.5.8"
+unicode-bidi-mirroring = "0.4.0"
 
 [[bench]]
 name = "render"

@@ -4,7 +4,7 @@ use zpl_tokenizer::Span;
 
 use super::Parser;
 use crate::{
-    command::{Code49Interpretation, Command, FieldDirection, LinearKind, LineColor, MsiCheck, Orientation, PostalKind},
+    command::{Code49Interpretation, Command, FieldDirection, LinearKind, LineColor, MsiCheck, Orientation, PostalKind, TextLayout},
     error::ParseError,
 };
 
@@ -179,6 +179,12 @@ impl Parser<'_> {
                     hours: n(4)?,
                     minutes: n(5)?,
                     seconds: n(6)?,
+                })
+            }
+            (false, "PA") => {
+                let on = |i| param(params, i) == "1";
+                Ok(Command::AdvancedText {
+                    layout: TextLayout { default_glyph: on(0), bidi: on(1), shaping: on(2), opentype: on(3) },
                 })
             }
             (false, "FE") => Ok(Command::FieldEmbed { indicator: first_char(params, 0).unwrap_or('#') }),

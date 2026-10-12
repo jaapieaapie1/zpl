@@ -30,17 +30,17 @@ pub enum FontId {
     DejaVuSansBold,
 }
 
-static TRIUMVIRATE_DATA: &[u8] = include_bytes!("../../png-renderer/fonts/ATTriumvirate-BoldCd.otf");
-static DEJAVU_MONO_DATA: &[u8] = include_bytes!("../../png-renderer/fonts/DejaVuSansMono.ttf");
-static DEJAVU_SANS_BOLD_DATA: &[u8] = include_bytes!("../fonts/DejaVuSans-Bold.ttf");
 
 impl FontId {
-    /// Raw font file bytes.
+    /// Raw font file bytes. The files are included by png-renderer, which renders with the
+    /// same fonts, and read from its statics at run time: a `static` initialised from them
+    /// would be const-evaluated and give this crate a second copy of every font.
     pub(crate) fn data(self) -> &'static [u8] {
         match self {
-            FontId::Triumvirate => TRIUMVIRATE_DATA,
-            FontId::DejaVuMono => DEJAVU_MONO_DATA,
-            FontId::DejaVuSansBold => DEJAVU_SANS_BOLD_DATA,
+            FontId::Triumvirate => png_renderer::TRIUMVIRATE,
+            FontId::DejaVuMono => png_renderer::DEJAVU_SANS_MONO,
+            // pdf-renderer/fonts/DejaVuSans-Bold.ttf
+            FontId::DejaVuSansBold => png_renderer::DEJAVU_SANS_BOLD,
         }
     }
 
@@ -66,6 +66,12 @@ impl FontId {
             FontId::DejaVuMono => "DejaVuSansMono",
             FontId::DejaVuSansBold => "DejaVuSans-Bold",
         }
+    }
+
+    /// Shaping face over the same bytes as [`FontId::data`] (built once, cached).
+    pub(crate) fn shaper(self) -> &'static rustybuzz::Face<'static> {
+        static SHAPERS: [OnceLock<rustybuzz::Face<'static>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+        SHAPERS[self as usize].get_or_init(|| rustybuzz::Face::from_face(self.face().clone()))
     }
 
     /// Glyph ID for `ch` (0 / .notdef when the font has no glyph for it).
@@ -97,7 +103,7 @@ pub(crate) struct ResName {
 }
 
 impl ResName {
-    fn of(key: FontKey) -> Self {
+    pub(crate) fn of(key: FontKey) -> Self {
         let mut buf = [0u8; 8];
         let len = match key {
             FontKey::Builtin(id) => {
@@ -123,6 +129,8 @@ impl ResName {
 /// A downloaded font. `face` borrows `data`'s heap buffer, so it is declared first and
 /// therefore dropped first; the buffer is never mutated (it sits behind an `Arc`).
 struct CustomFont {
+    /// Shaping face, built on first use (^PA shaping); borrows `data` like `face`.
+    shaper: OnceLock<Option<rustybuzz::Face<'static>>>,
     face: Option<Face<'static>>,
     data: Arc<Vec<u8>>,
     /// PostScript name for /BaseFont.
@@ -141,7 +149,7 @@ impl CustomFont {
             .as_ref()
             .and_then(postscript_name)
             .unwrap_or_else(|| format!("ZplCustom{index}"));
-        CustomFont { face, data, base_font }
+        CustomFont { shaper: OnceLock::new(), face, data, base_font }
     }
 }
 
@@ -241,6 +249,21 @@ impl FontRegistry {
         }
     }
 
+    /// Shaping face of `key`, over the same font bytes that get embedded.
+    pub fn shaper(&self, key: FontKey) -> &rustybuzz::Face<'_> {
+        match key {
+            FontKey::Builtin(id) => id.shaper(),
+            FontKey::Custom(i) => {
+                let custom = &self.custom[i as usize];
+                custom
+                    .shaper
+                    .get_or_init(|| custom.face.clone().map(rustybuzz::Face::from_face))
+                    .as_ref()
+                    .expect("custom font key without a face")
+            }
+        }
+    }
+
     fn data(&self, key: FontKey) -> &[u8] {
         match key {
             FontKey::Builtin(id) => id.data(),
@@ -272,6 +295,16 @@ impl FontRegistry {
             out.extend_from_slice(&used.add(ch, gid).to_be_bytes());
         }
         ResName::of(key)
+    }
+
+    /// Records one (possibly shaped) glyph of `key` standing for `text` (the source
+    /// characters of its cluster, for ToUnicode; empty for none) and returns its 2-byte code.
+    /// Glyph IDs need not be reachable through the cmap (contextual forms, ligatures).
+    pub fn use_glyph(&mut self, key: FontKey, gid: u16, text: &str) -> u16 {
+        let used = self.used.entry(key).or_default();
+        let cid = used.remapper.remap(gid);
+        used.glyphs.entry(cid).or_insert_with(|| (gid, if gid == 0 { String::new() } else { text.to_owned() }));
+        cid
     }
 
     /// Records `text` shown entirely in `key` and appends its 2-byte subset codes to

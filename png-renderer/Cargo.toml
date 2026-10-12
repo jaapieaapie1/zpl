@@ -11,3 +11,7 @@ imageproc = "0.25"
 qrcode = "0.14"
 ab_glyph = "0.2"
 zpl-symbols = { path = "../zpl-symbols" }
+# ^PA advanced text layout (src/layout.rs).
+rustybuzz = "0.20.1"
+unicode-bidi = "0.3.18"
+unicode-bidi-mirroring = "0.4.0"

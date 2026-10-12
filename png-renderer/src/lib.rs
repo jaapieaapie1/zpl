@@ -5,14 +5,21 @@ use image::{ImageBuffer, Rgb, RgbImage};
 use imageproc::drawing;
 use zpl_parser::command::{
     BlockJustification, Code128Mode, DiagonalDirection, FontName, Justification, LineColor, LinearKind,
-    Orientation,
+    Orientation, TextLayout,
 };
 use zpl_state_manager::{DrawInstruction, TextAnchor, TextBlock};
 use zpl_symbols::linear::{self, LinearSymbol, Symbology};
 use zpl_symbols::matrix::{self, Matrix};
 
 pub mod code128;
+mod layout;
 mod symbols;
+
+pub use layout::DEJAVU_SANS_BOLD;
+
+/// Font files, shared with pdf-renderer so the binary holds one copy of each.
+pub static TRIUMVIRATE: &[u8] = include_bytes!("../fonts/ATTriumvirate-BoldCd.otf");
+pub static DEJAVU_SANS_MONO: &[u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
 
 const WHITE: Rgb<u8> = Rgb([255, 255, 255]);
 const BLACK: Rgb<u8> = Rgb([0, 0, 0]);
@@ -27,6 +34,9 @@ pub struct PngRenderer {
 /// TrueType/OpenType font, or a monospaced stand-in for the bitmap fonts A–H.
 struct TextFont {
     font: FontArc,
+    /// The font's bytes (for ^PA shaping) and cap height in em.
+    data: layout::FontData,
+    cap_em: f32,
     scale: PxScale,
     /// Distance from ab_glyph's draw origin (ascent line) down to the cap line.
     y_offset: i32,
@@ -105,11 +115,10 @@ impl TextFont {
     fn new(name: FontName, custom: Option<&Arc<Vec<u8>>>, height: u32, width: u32) -> Self {
         use ab_glyph::Font;
 
-        static TRIUMVIRATE: &[u8] = include_bytes!("../fonts/ATTriumvirate-BoldCd.otf");
-        static MONO: &[u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
+        let mono: &'static [u8] = DEJAVU_SANS_MONO;
 
         if let (None, Some((h, w, gap, base, uppercase))) = (custom, bitmap_cell(name)) {
-            let font = FontArc::try_from_slice(MONO).expect("Error loading font");
+            let font = FontArc::try_from_slice(mono).expect("Error loading font");
             let (mh, mw) = magnification(height, width, h, w);
             let upem = font.units_per_em().unwrap_or(2048.0);
             // Outline bounds may be y-down; 'H' sits on the baseline, so its extent is the cap height.
@@ -127,6 +136,8 @@ impl TextFont {
             let y_offset = ((font.ascent_unscaled() - cap_unscaled) / upem * em_y).round() as i32;
             return Self {
                 font,
+                data: layout::FontData::Static(mono),
+                cap_em: cap_unscaled / upem,
                 scale,
                 y_offset,
                 cap: cap.round() as i32,
@@ -136,7 +147,12 @@ impl TextFont {
             };
         }
 
-        let (font, cap_em) = match custom.and_then(custom_font) {
+        let custom_font = custom.and_then(|data| custom_font(data).map(|font| (font, data)));
+        let data = match &custom_font {
+            Some((_, data)) => layout::FontData::Shared(Arc::clone(data)),
+            None => layout::FontData::Static(TRIUMVIRATE),
+        };
+        let (font, cap_em) = match custom_font.map(|(font, _)| font) {
             Some(font) => {
                 let upem = font.units_per_em().unwrap_or(1000.0);
                 let cap = font
@@ -169,7 +185,7 @@ impl TextFont {
         let cap_height = units_per_em * cap_em;
         let y_offset = ((font.ascent_unscaled() - cap_height) / units_per_em * height as f32).round() as i32;
         let cap = (height as f32 * cap_em).round() as i32;
-        Self { font, scale, y_offset, cap, line_h: height, cell: None, uppercase: false }
+        Self { font, data, cap_em, scale, y_offset, cap, line_h: height, cell: None, uppercase: false }
     }
 
     /// Advance width of `text` in dots.
@@ -301,7 +317,13 @@ fn encode_linear(kind: LinearKind, data: &str) -> Option<LinearSymbol> {
 
 /// Greedy word wrap of `text` into lines no wider than `width` (the first line) or
 /// `width - indent` (the others). `\&` forces a line break; overlong words are split.
+#[cfg(test)]
 fn wrap_lines(font: &TextFont, text: &str, width: u32, indent: u32) -> Vec<String> {
+    wrap_lines_with(&|s: &str| font.measure(s), text, width, indent)
+}
+
+/// [`wrap_lines`] with `measure` giving the width of a line.
+fn wrap_lines_with(measure: &dyn Fn(&str) -> f32, text: &str, width: u32, indent: u32) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     let avail = |lines: &Vec<String>| {
         if lines.is_empty() { width as f32 } else { width.saturating_sub(indent).max(1) as f32 }
@@ -310,7 +332,7 @@ fn wrap_lines(font: &TextFont, text: &str, width: u32, indent: u32) -> Vec<Strin
         let mut line = String::new();
         for word in paragraph.split(' ').filter(|w| !w.is_empty()) {
             let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
-            if font.measure(&candidate) <= avail(&lines) {
+            if measure(&candidate) <= avail(&lines) {
                 line = candidate;
                 continue;
             }
@@ -320,7 +342,7 @@ fn wrap_lines(font: &TextFont, text: &str, width: u32, indent: u32) -> Vec<Strin
             // Split a word that does not fit on a line of its own.
             for c in word.chars() {
                 line.push(c);
-                if font.measure(&line) > avail(&lines) && line.chars().count() > 1 {
+                if measure(&line) > avail(&lines) && line.chars().count() > 1 {
                     line.pop();
                     lines.push(std::mem::take(&mut line));
                     line.push(c);
@@ -354,7 +376,7 @@ impl PngRenderer {
     fn render_instruction(&self, image: &mut RgbImage, instruction: &DrawInstruction) {
         match instruction {
             DrawInstruction::DrawText {
-                x, y, text, font, height, width, orientation, justification, anchor, block, custom_font, ..
+                x, y, text, font, height, width, orientation, justification, anchor, block, custom_font, layout, ..
             } => {
                 if self.debug {
                     self.draw_origin_cross(image, *x, *y, Rgb([255, 0, 0]));
@@ -362,7 +384,7 @@ impl PngRenderer {
                 let font = TextFont::new(*font, custom_font.as_ref(), *height, *width);
                 let text = if font.uppercase { text.to_uppercase() } else { text.clone() };
                 self.render_text(
-                    image, *x, *y, &text, &font, *orientation, *justification, *anchor, block.as_ref(),
+                    image, *x, *y, &text, &font, *orientation, *justification, *anchor, block.as_ref(), layout,
                 );
             }
             DrawInstruction::DrawBarcode {
@@ -464,8 +486,19 @@ impl PngRenderer {
         justification: Justification,
         anchor: TextAnchor,
         block: Option<&TextBlock>,
+        text_layout: &TextLayout,
     ) {
         let height = font.line_h;
+        // ^PA bidi/shaping: scalable fonts are laid out as glyph runs (with a fallback font
+        // for Hebrew/Arabic); bitmap fonts keep their cells and are only reordered.
+        let advanced = layout::active(text_layout, text);
+        let runs = advanced && font.cell.is_none();
+        let primary = runs.then(|| layout::LayoutFont { font: font.font.clone(), data: font.data.clone(), scale: font.scale });
+        let measure = |s: &str| match &primary {
+            Some(p) => layout::layout_line(p, font.cap_em, text_layout, s).width,
+            None => font.measure(s),
+        };
+        let display = |s: String| if advanced && font.cell.is_some() { layout::visual_string(text_layout, &s) } else { s };
 
         // Height of the unrotated frame per orientation; the placement below is tuned to these.
         let frame_extra = match orientation {
@@ -477,13 +510,13 @@ impl PngRenderer {
         let mut rows: Vec<(i32, i32, String)> = Vec::new();
         let (frame_w, frame_h, last_row_top, justification) = match block {
             None => {
-                let w = font.measure(text).ceil() as u32 + 10;
-                rows.push((0, 0, text.to_string()));
+                let w = measure(text).ceil() as u32 + 10;
+                rows.push((0, 0, display(text.to_string())));
                 (w, frame_extra, 0, justification)
             }
             Some(b) => {
                 let line_height = (height as i32 + b.line_spacing).max(1);
-                let mut lines = wrap_lines(font, text, b.width, b.hanging_indent);
+                let mut lines = wrap_lines_with(&measure, text, b.width, b.hanging_indent);
                 if let Some(clip) = b.clip_height {
                     // ^TB: drop lines that do not fit in the block height (keep at least one).
                     let fit = ((clip as i32 - height as i32) / line_height + 1).max(1) as usize;
@@ -496,14 +529,14 @@ impl PngRenderer {
                     let row = i.min(max_rows - 1);
                     last_row = last_row.max(row);
                     let indent = if i > 0 { b.hanging_indent as f32 } else { 0.0 };
-                    let line_w = font.measure(&line);
+                    let line_w = measure(&line);
                     let free = (b.width as f32 - indent - line_w).max(0.0);
                     let x_off = match b.justification {
                         BlockJustification::Left | BlockJustification::Justified => indent,
                         BlockJustification::Center => indent + free / 2.0,
                         BlockJustification::Right => indent + free,
                     };
-                    rows.push((x_off.round() as i32, row as i32 * line_height, line));
+                    rows.push((x_off.round() as i32, row as i32 * line_height, display(line)));
                 }
                 let last_top = last_row as i32 * line_height;
                 (b.width.max(1), last_top as u32 + frame_extra, last_top, Justification::Left)
@@ -515,7 +548,15 @@ impl PngRenderer {
 
         let mut temp: RgbImage = ImageBuffer::from_pixel(frame_w, frame_h, WHITE);
         for (x_off, top, line) in &rows {
-            font.draw(&mut temp, *x_off, *top, line);
+            match &primary {
+                Some(p) => {
+                    use ab_glyph::{Font, ScaleFont};
+                    let laid = layout::layout_line(p, font.cap_em, text_layout, line);
+                    let baseline = (top - font.y_offset) as f32 + font.font.as_scaled(font.scale).ascent();
+                    layout::draw_line(&mut temp, p, &laid, *x_off as f32, baseline);
+                }
+                None => font.draw(&mut temp, *x_off, *top, line),
+            }
         }
 
         // ^FT: the origin is the baseline of the (last) line; move it to where the top would be.

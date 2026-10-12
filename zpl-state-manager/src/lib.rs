@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use zpl_parser::command::{
     BlockJustification, Code128Mode, Code49Interpretation, Command, DiagonalDirection, Encoding, FieldDirection,
-    FontName, Justification, LineColor, LinearKind, Orientation, PostalKind, QrErrorCorrection, QrModel,
+    FontName, Justification, LineColor, LinearKind, Orientation, PostalKind, QrErrorCorrection, QrModel, TextLayout,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +31,8 @@ pub enum DrawInstruction {
         /// TrueType/OpenType font downloaded with ~DU / ~DT / ~DY and selected through ^A@ or
         /// a ^CW alias; `None` means the built-in font for `font`.
         custom_font: Option<Arc<Vec<u8>>>,
+        /// ^PA advanced layout (bidi, shaping, OpenType features).
+        layout: TextLayout,
     },
     /// Code 128 (^BC).
     DrawBarcode {
@@ -329,6 +331,7 @@ pub struct StateManager {
     current_font_height: u32,
     current_font_width: u32,
     current_custom_font: Option<Arc<Vec<u8>>>,
+    text_layout: TextLayout,
 
     print_width: Option<u32>,
     label_length: Option<u32>,
@@ -486,6 +489,7 @@ impl StateManager {
             current_font_height: 9,
             current_font_width: 5,
             current_custom_font: None,
+            text_layout: TextLayout::default(),
 
             print_width: None,
             label_length: None,
@@ -715,6 +719,7 @@ impl StateManager {
                 self.clock_offsets[usize::from(clock == 3)] =
                     clock::Offset { months, days, years, hours, minutes, seconds };
             }
+            Command::AdvancedText { layout } => self.text_layout = layout,
             Command::FieldEmbed { indicator } => self.field.embed = Some(indicator),
             Command::ImageSave { name, print } => self.save_image = Some((stored_name(&name), print)),
             Command::ImageLoad { name } => {
@@ -989,6 +994,7 @@ impl StateManager {
                 direction: field.direction,
                 char_gap: field.char_gap,
                 custom_font: self.current_custom_font.clone(),
+                layout: self.text_layout,
             },
             FieldMode::GraphicSymbol { orientation, height, width } => DrawInstruction::DrawText {
                 x,
@@ -1005,6 +1011,7 @@ impl StateManager {
                 direction: FieldDirection::Horizontal,
                 char_gap: 0,
                 custom_font: None,
+                layout: self.text_layout,
             },
             FieldMode::Code128 {
                 orientation,

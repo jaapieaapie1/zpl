@@ -890,3 +890,14 @@ fn test_label_and_field_settings() {
     assert_eq!(result[8], Command::GraphicEllipse { width: 100, height: 50, thickness: 2, color: LineColor::Black });
     assert!(matches!(result[9], Command::GraphicSymbol { height: Some(20), .. }));
 }
+
+#[test]
+fn test_advanced_text() {
+    use zpl_parser::command::TextLayout;
+    let result = Parser::new("^PA0,1,1,0^PA").parse().unwrap();
+    assert_eq!(
+        result[0],
+        Command::AdvancedText { layout: TextLayout { default_glyph: false, bidi: true, shaping: true, opentype: false } }
+    );
+    assert_eq!(result[1], Command::AdvancedText { layout: TextLayout::default() });
+}

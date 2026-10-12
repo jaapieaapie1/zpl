@@ -388,6 +388,11 @@ pub enum Command {
         name: String,
     },
 
+    /// ^PA: advanced text layout.
+    AdvancedText {
+        layout: TextLayout,
+    },
+
     /// ^BO / ^B0
     Aztec {
         orientation: Option<Orientation>,
@@ -400,6 +405,19 @@ pub enum Command {
         name: String,
         params: Vec<String>,
     },
+}
+
+/// ^PA settings. All off is the classic one-glyph-per-character layout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TextLayout {
+    /// Missing glyphs print the font's .notdef glyph (usually a box) instead of a space.
+    pub default_glyph: bool,
+    /// Unicode bidirectional reordering (right-to-left scripts).
+    pub bidi: bool,
+    /// Contextual shaping (e.g. Arabic joining forms).
+    pub shaping: bool,
+    /// OpenType layout features (ligatures, kerning, mark positioning).
+    pub opentype: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

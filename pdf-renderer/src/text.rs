@@ -481,12 +481,18 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
         *orientation,
         *anchor,
     );
+    // Control characters (from ^FH escapes such as _0D) print nothing.
+    let text: Cow<str> = if text.chars().any(|c| c < ' ' || c == '\x7f') {
+        Cow::Owned(text.chars().filter(|&c| c >= ' ' && c != '\x7f').collect())
+    } else {
+        Cow::Borrowed(text)
+    };
     // Uppercase-only bitmap fonts print lowercase letters as capitals.
     let text: Cow<str> = match bitmap_cell(*font, ctx.dpmm) {
         Some(cell) if cell.uppercase && custom_font.is_none() && text.chars().any(char::is_lowercase) => {
             Cow::Owned(text.to_uppercase())
         }
-        _ => Cow::Borrowed(text),
+        _ => text,
     };
     let text: &str = &text;
     field.notdef = layout.default_glyph;

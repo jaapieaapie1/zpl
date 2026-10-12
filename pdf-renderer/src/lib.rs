@@ -348,6 +348,13 @@ mod tests {
     }
 
     #[test]
+    fn control_characters_print_nothing() {
+        let plain = render_zpl("^XA^FO10,10^A0N,30^FDVAN:^FS^FO10,60^ADN^FDab^FS^XZ");
+        assert_eq!(render_zpl("^XA^FO10,10^A0N,30^FDVAN:\r\n^FS^FO10,60^ADN^FDa\nb^FS^XZ"), plain);
+        assert_eq!(render_zpl("^XA^FO10,10^A0N,30^FH^FDVAN:_0D_0A^FS^FO10,60^ADN^FH^FDa_09_7Fb^FS^XZ"), plain);
+    }
+
+    #[test]
     fn render_is_a_single_page() {
         let pdf = PdfRenderer::new(203, 203).render(&[]);
         let pdf = String::from_utf8_lossy(&pdf);

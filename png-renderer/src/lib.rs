@@ -504,7 +504,9 @@ impl PngRenderer {
                     self.draw_origin_cross(image, *x, *y, Rgb([255, 0, 0]));
                 }
                 let font = TextFont::new(*font, custom_font.as_ref(), *height, *width, self.dpmm);
-                let text = if font.uppercase { text.to_uppercase() } else { text.clone() };
+                // Control characters (from ^FH escapes such as _0D) print nothing.
+                let text: String = text.chars().filter(|&c| c >= ' ' && c != '\x7f').collect();
+                let text = if font.uppercase { text.to_uppercase() } else { text };
                 self.render_text(
                     image, *x, *y, &text, &font, *orientation, *justification, *anchor, block.as_ref(), layout,
                 );
@@ -1249,6 +1251,31 @@ mod tests {
         assert!(!black(&image, 22, 10));
         // Leading digit sits left of the bars.
         assert!((0..20).any(|x| (50..80).any(|y| black(&image, x, y))));
+    }
+
+    /// Rightmost dark column of `zpl` rendered on a 400 x 100 page, for every font kind.
+    fn ink_right(zpl_field: &str) -> Vec<Option<u32>> {
+        ["^A0N,40,40", "^ADN,36,20", "^AEN,28,15"]
+            .iter()
+            .map(|font| {
+                let zpl = format!("^XA^PW400^LL100^FO10,10{font}{zpl_field}^XZ");
+                let instructions =
+                    zpl_state_manager::StateManager::new().process(zpl_parser::Parser::new(&zpl).parse().unwrap());
+                let image = PngRenderer::new(400, 100).render(&instructions);
+                (0..400).rev().find(|&x| (0..100).any(|y| image.get_pixel(x, y)[0] < 128))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn line_breaks_and_control_characters_print_nothing() {
+        let plain = ink_right("^FDVAN:^FS");
+        assert!(plain.iter().all(Option::is_some));
+        assert_eq!(ink_right("^FDVAN:\n^FS"), plain);
+        assert_eq!(ink_right("^FDVAN:\r\n^FS"), plain);
+        // ^FH escapes survive the parser; the renderer skips them.
+        assert_eq!(ink_right("^FH^FDVAN:_0D_0A_09_7F^FS"), plain);
+        assert_eq!(ink_right("^FDab\r\ncd^FS"), ink_right("^FDabcd^FS"));
     }
 
     #[cfg(feature = "source-map")]

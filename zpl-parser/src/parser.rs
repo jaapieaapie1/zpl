@@ -26,6 +26,16 @@ pub struct Parser<'a> {
     half_density: std::cell::Cell<bool>,
 }
 
+/// ^FD / ^FV text without raw CR and LF: printers ignore line breaks in ZPL, and labels
+/// often end the data with one before ^FS.
+fn field_text(data: &str) -> String {
+    if data.contains(['\r', '\n']) {
+        data.chars().filter(|c| !matches!(c, '\r' | '\n')).collect()
+    } else {
+        data.to_string()
+    }
+}
+
 /// Printer resolution assumed by [`Parser::new`]: 8 dots/mm (203 dpi).
 pub const DEFAULT_DPMM: u32 = 8;
 
@@ -113,7 +123,7 @@ impl<'a> Parser<'a> {
             Token::EndToken => Command::EndFormat,
             Token::FieldSeparator => Command::FieldSeperator,
             Token::FieldData { data, .. } => Command::FielData {
-                data: data.to_string(),
+                data: field_text(data),
             },
 
             Token::Command {

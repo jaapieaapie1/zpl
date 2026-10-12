@@ -1521,6 +1521,12 @@ mod tests {
     }
 
     #[test]
+    fn line_breaks_in_field_data_are_ignored() {
+        let ins = run("^XA^FO1,1^FDVAN:\n^FS^FO1,1^FDab\r\ncd^FS^FO1,1^FVx\r\n^FS^FO1,1^FDplain^FS^XZ");
+        assert_eq!(texts(&ins), ["VAN:", "abcd", "x", "plain"]);
+    }
+
+    #[test]
     fn bad_parameters_skip_the_command() {
         let ins = run("^XA^FOx,1^GB5,5,1^FS^CI99^FO1,1^FDok^FS^XZ");
         assert_eq!(texts(&ins), ["ok"]);

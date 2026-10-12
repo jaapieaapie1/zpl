@@ -51,5 +51,5 @@ fn draw(ctx: &mut Ctx, m: &Matrix, x: u32, y: u32, orientation: Orientation, mod
             rects.push((start as f32 * mw, row as f32 * mh, len as f32 * mw, mh));
         }
     }
-    fill_rects(ctx, placement(orientation, x, y, w, h, 0), &rects);
+    fill_rects(ctx, placement(orientation, x, y, w, h), &rects);
 }

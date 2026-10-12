@@ -17,17 +17,17 @@ use zpl_state_manager::DrawInstruction;
 pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
     match instruction {
         DrawInstruction::DrawBarcode {
-            x, y, data, orientation, height, module_width,
+            x, y, bottom, data, orientation, height, module_width,
             print_interpretation_line, print_interpretation_line_above, mode, ..
         } => render_code128(
-            ctx, *x, *y, data, *orientation, *height, *module_width,
+            ctx, (*x, *y, *bottom), data, *orientation, *height, *module_width,
             *print_interpretation_line, *print_interpretation_line_above, *mode,
         ),
         DrawInstruction::DrawLinear {
-            x, y, kind, data, orientation, height, module_width, wide_bar_ratio,
+            x, y, bottom, kind, data, orientation, height, module_width, wide_bar_ratio,
             print_interpretation_line, print_interpretation_line_above,
         } => render_linear(
-            ctx, *x, *y, *kind, data, *orientation, *height, *module_width, *wide_bar_ratio,
+            ctx, (*x, *y, *bottom), *kind, data, *orientation, *height, *module_width, *wide_bar_ratio,
             *print_interpretation_line, *print_interpretation_line_above,
         ),
         DrawInstruction::DrawQrCode { x, y, data, magnification, mask, bottom, .. } => {
@@ -42,21 +42,43 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
 
 /// Transform mapping a local `w` x `h` frame onto the page the way the PNG renderer rotates
 /// its temp image (`imageops::rotate*`) and overlays it at its (saturating) offset.
-/// `pad` is the Code 128 interpretation-line padding the PNG renderer subtracts from the origin.
-pub(crate) fn placement(orientation: Orientation, x: u32, y: u32, w: u32, h: u32, pad: u32) -> [f32; 6] {
+pub(crate) fn placement(orientation: Orientation, x: u32, y: u32, w: u32, h: u32) -> [f32; 6] {
     let (w_f, h_f) = (w as f32, h as f32);
     match orientation {
-        Orientation::Normal => [1.0, 0.0, 0.0, 1.0, x.saturating_sub(pad) as f32, y as f32],
+        Orientation::Normal => [1.0, 0.0, 0.0, 1.0, x as f32, y as f32],
         // rotate90 (clockwise): local (u, v) -> (h - v, u)
-        Orientation::Rotated90 => [0.0, 1.0, -1.0, 0.0, x as f32 + h_f, y.saturating_sub(pad) as f32],
+        Orientation::Rotated90 => [0.0, 1.0, -1.0, 0.0, x as f32 + h_f, y as f32],
         // rotate180: local (u, v) -> (w - u, h - v)
-        Orientation::Rotated180 => [-1.0, 0.0, 0.0, -1.0, x.saturating_sub(pad) as f32 + w_f, y as f32 + h_f],
+        Orientation::Rotated180 => [-1.0, 0.0, 0.0, -1.0, x as f32 + w_f, y as f32 + h_f],
         // rotate270 (counter-clockwise): local (u, v) -> (v, w - u); image is h wide, w tall
         Orientation::Rotated270 => {
             let ox = x.saturating_sub(h) as f32;
-            let oy = y.saturating_sub(w).saturating_sub(pad) as f32;
+            let oy = y.saturating_sub(w) as f32;
             [0.0, -1.0, 1.0, 0.0, ox, oy + w_f]
         }
+    }
+}
+
+/// Transform for a 1D symbol whose bars are the local box `bars` (x, y, w, h): ^FO puts the
+/// rotated bars' top-left on (`x`, `y`), ^FT (`bottom`) the bars' bottom-left corner, rotated
+/// with the symbol; the interpretation line follows the bars (as the PNG renderer's `place_bars`).
+pub(crate) fn bars_placement(orientation: Orientation, (x, y, bottom): (u32, u32, bool), bars: [f32; 4]) -> [f32; 6] {
+    let [bx, by, bw, bh] = bars;
+    let (x, y) = (x as f32, y as f32);
+    // Top-left of the rotated bars on the page.
+    let (left, top) = match (bottom, orientation) {
+        (false, _) | (true, Orientation::Rotated90) => (x, y),
+        (true, Orientation::Normal) => (x, y - bh),
+        (true, Orientation::Rotated180) => (x - bw, y),
+        (true, Orientation::Rotated270) => (x - bh, y - bw),
+    };
+    match orientation {
+        Orientation::Normal => [1.0, 0.0, 0.0, 1.0, left - bx, top - by],
+        // Clockwise: local (u, v) -> (left + by + bh - v, top + u - bx)
+        Orientation::Rotated90 => [0.0, 1.0, -1.0, 0.0, left + by + bh, top - bx],
+        Orientation::Rotated180 => [-1.0, 0.0, 0.0, -1.0, left + bx + bw, top + by + bh],
+        // Counter-clockwise: local (u, v) -> (left + v - by, top + bx + bw - u)
+        Orientation::Rotated270 => [0.0, -1.0, 1.0, 0.0, left - by, top + bx + bw],
     }
 }
 
@@ -102,7 +124,7 @@ fn interpretation(bar_width: u32) -> Interpretation {
 
 #[allow(clippy::too_many_arguments)]
 fn render_code128(
-    ctx: &mut Ctx, x: u32, y: u32, data: &str, orientation: Orientation, height: u32,
+    ctx: &mut Ctx, origin: (u32, u32, bool), data: &str, orientation: Orientation, height: u32,
     module_width: u32, print_line: bool, line_above: bool, mode: Code128Mode,
 ) {
     let code = code128::encode(data, mode);
@@ -118,8 +140,6 @@ fn render_code128(
     let text_area = if show_text { (text_gap + ip.digit_height + ip.descent).ceil() as u32 } else { 0 };
 
     let pad = text_width.saturating_sub(barcode_width) / 2;
-    let total_width = (barcode_width + 2 * pad).max(1);
-    let total_height = (height + text_area).max(1);
     let (bars_y, baseline) = if line_above {
         (text_area, ip.digit_height)
     } else {
@@ -136,7 +156,8 @@ fn render_code128(
         x_pos += px;
     }
 
-    let matrix = placement(orientation, x, y, total_width, total_height, pad);
+    let bars = [pad as f32, bars_y as f32, barcode_width as f32, height as f32];
+    let matrix = bars_placement(orientation, origin, bars);
     fill_rects(ctx, matrix, &rects);
 
     if show_text {
@@ -191,12 +212,12 @@ fn encode_linear(kind: LinearKind, data: &str) -> Option<LinearSymbol> {
     Some(symbol)
 }
 
-/// All 1D symbologies except Code 128. Bars start at the field origin; the interpretation line
-/// (DejaVu Sans Mono at the Code 128 proportions) goes below, or above when requested. EAN/UPC
-/// guard bars extend halfway into the digits.
+/// All 1D symbologies except Code 128, placed by their bars (`bars_placement`); the
+/// interpretation line (DejaVu Sans Mono at the Code 128 proportions) goes below, or above
+/// when requested. EAN/UPC guard bars extend halfway into the digits.
 #[allow(clippy::too_many_arguments)]
 fn render_linear(
-    ctx: &mut Ctx, x: u32, y: u32, kind: LinearKind, data: &str, orientation: Orientation, height: u32,
+    ctx: &mut Ctx, origin: (u32, u32, bool), kind: LinearKind, data: &str, orientation: Orientation, height: u32,
     module_width: u32, ratio: f32, print_line: bool, line_above: bool,
 ) {
     let Some(symbol) = encode_linear(kind, data) else { return };
@@ -224,7 +245,7 @@ fn render_linear(
         x_pos += dots;
     }
 
-    let matrix = placement(orientation, x, y, width.max(1), (height + text_area).max(1), 0);
+    let matrix = bars_placement(orientation, origin, [0.0, bars_y as f32, width as f32, height as f32]);
     fill_rects(ctx, matrix, &rects);
 
     if show_text {
@@ -322,7 +343,7 @@ mod tests {
 
     fn code128(data: &str, orientation: Orientation, line: bool) -> DrawInstruction {
         DrawInstruction::DrawBarcode {
-            x: 100, y: 50, data: data.into(), orientation, height: 80, module_width: 2,
+            x: 100, y: 50, bottom: false, data: data.into(), orientation, height: 80, module_width: 2,
             wide_bar_ratio: 3.0, print_interpretation_line: line,
             print_interpretation_line_above: false, check_digit: false, mode: Code128Mode::Auto,
         }
@@ -383,17 +404,25 @@ mod tests {
         assert!(c.contains(&format!("0 1 -1 0 {} 50 cm", 100 + h)));
         let c = content_of(code128("12345678", Orientation::Rotated180, false));
         assert!(c.contains(&format!("-1 0 0 -1 {} {} cm", 100 + w, 50 + h)));
-        let c = content_of(DrawInstruction::DrawBarcode {
-            x: 500, y: 600, data: "12345678".into(), orientation: Orientation::Rotated270,
+        let rotated270 = |bottom| DrawInstruction::DrawBarcode {
+            x: 500, y: 600, bottom, data: "12345678".into(), orientation: Orientation::Rotated270,
             height: 80, module_width: 2, wide_bar_ratio: 3.0, print_interpretation_line: false,
             print_interpretation_line_above: false, check_digit: false, mode: Code128Mode::Auto,
-        });
-        assert!(c.contains(&format!("0 -1 1 0 {} {} cm", 500 - h, 600)));
+        };
+        // ^FO: the rotated bars start at the origin and run down and right of it.
+        assert!(content_of(rotated270(false)).contains(&format!("0 -1 1 0 500 {} cm", 600 + w)));
+        // ^FT: the unrotated bottom-left corner is the origin, so the bars end on it.
+        assert!(content_of(rotated270(true)).contains(&format!("0 -1 1 0 {} 600 cm", 500 - h)));
+        let mut inverted = code128("12345678", Orientation::Rotated180, false);
+        if let DrawInstruction::DrawBarcode { bottom, .. } = &mut inverted {
+            *bottom = true;
+        }
+        assert!(content_of(inverted).contains(&format!("-1 0 0 -1 100 {} cm", 50 + h)));
     }
 
     fn linear(kind: LinearKind, data: &str, line: bool) -> DrawInstruction {
         DrawInstruction::DrawLinear {
-            x: 10, y: 20, kind, data: data.into(), orientation: Orientation::Normal, height: 50,
+            x: 10, y: 20, bottom: false, kind, data: data.into(), orientation: Orientation::Normal, height: 50,
             module_width: 1, wide_bar_ratio: 3.0, print_interpretation_line: line,
             print_interpretation_line_above: false,
         }

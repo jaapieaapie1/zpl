@@ -954,3 +954,24 @@ fn test_format_conversion_and_half_density() {
     assert_eq!(origin("^MUM,200,600^FO12,0"), 48);
     assert_eq!(origin("^MUD,200,600^FO12,0"), 12);
 }
+
+#[test]
+fn test_font_comma_after_letter_leaves_orientation_empty() {
+    // ^AF,N,13,26: orientation empty, "N" in the height slot (not a size, so not given),
+    // width 13; the extra parameter is ignored.
+    let result = Parser::new("^AF,N,13,26^AF,N,40,40").parse().unwrap();
+    assert_eq!(
+        result,
+        vec![
+            Command::Font { font: FontName::FontF, orientation: None, height: None, width: Some(13) },
+            Command::Font { font: FontName::FontF, orientation: None, height: None, width: Some(40) },
+        ]
+    );
+}
+
+#[test]
+fn test_field_origin_ignores_minus_sign() {
+    let result = Parser::new("^FO156,-1257^FT-30,20").parse().unwrap();
+    assert_eq!(result[0], Command::FieldOrigin { x: 156, y: 1257, justification: None });
+    assert_eq!(result[1], Command::FieldTypeset { x: 30, y: 20, justification: None });
+}

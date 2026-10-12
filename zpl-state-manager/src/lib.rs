@@ -25,11 +25,14 @@ pub enum DrawInstruction {
         y: u32,
         text: String,
         font: FontName,
+        /// 0: only a width was given (see `set_font_size`).
         height: u32,
+        /// 0: only a height was given.
         width: u32,
         orientation: Orientation,
         justification: Justification,
-        /// ^FO places the top of the text at `y`, ^FT the baseline.
+        /// ^FO puts the top-left of the rotated text box (^FB block) on (`x`, `y`); ^FT puts
+        /// the start of the (last line's) baseline there, rotated with the text.
         anchor: TextAnchor,
         /// ^FB / ^TB word-wrapped block.
         block: Option<TextBlock>,
@@ -43,10 +46,13 @@ pub enum DrawInstruction {
         /// ^PA advanced layout (bidi, shaping, OpenType features).
         layout: TextLayout,
     },
-    /// Code 128 (^BC).
+    /// Code 128 (^BC). With ^FO, (`x`, `y`) is the top-left of the rotated bars; with ^FT
+    /// (`bottom`) it is the bars' bottom-left corner in the unrotated symbol, rotated with it.
+    /// The interpretation line sits outside the bars.
     DrawBarcode {
         x: u32,
         y: u32,
+        bottom: bool,
         data: String,
         orientation: Orientation,
         height: u32,
@@ -57,10 +63,11 @@ pub enum DrawInstruction {
         check_digit: bool,
         mode: Code128Mode,
     },
-    /// Every other 1D symbology; `(x, y)` is the top-left of the bars.
+    /// Every other 1D symbology, placed like `DrawBarcode`.
     DrawLinear {
         x: u32,
         y: u32,
+        bottom: bool,
         kind: LinearKind,
         data: String,
         orientation: Orientation,
@@ -406,7 +413,8 @@ pub struct StateManager {
     default_justification: Justification,
 
     current_font: FontName,
-    current_font_orientation: Orientation,
+    /// ^A orientation; `None` follows the ^FW default in force when the field is printed.
+    current_font_orientation: Option<Orientation>,
     current_font_height: u32,
     current_font_width: u32,
     current_custom_font: Option<Arc<Vec<u8>>>,
@@ -575,7 +583,7 @@ impl StateManager {
             default_justification: Justification::Left,
 
             current_font: FontName::FontA,
-            current_font_orientation: Orientation::Normal,
+            current_font_orientation: None,
             current_font_height: 9,
             current_font_width: 5,
             current_custom_font: None,
@@ -727,17 +735,17 @@ impl StateManager {
         }
     }
 
-    /// Width 0 means "not given": scalable fonts then use the height, bitmap fonts the
-    /// height's magnification.
+    /// 0 means "not given". Height only: scalable fonts are as wide as tall, bitmap fonts
+    /// magnify both ways by the height's factor. Width only (height 0): scalable fonts are as
+    /// tall as wide, bitmap fonts magnify both ways by the width's factor (^AF,,26 is 2x2).
     fn set_font_size(&mut self, height: Option<u32>, width: Option<u32>) {
         match (height, width) {
             (Some(h), w) => {
                 self.current_font_height = h;
                 self.current_font_width = w.unwrap_or(0);
             }
-            // Width only: scalable fonts keep their aspect ratio.
             (None, Some(w)) => {
-                self.current_font_height = w;
+                self.current_font_height = 0;
                 self.current_font_width = w;
             }
             (None, None) => {}
@@ -796,12 +804,13 @@ impl StateManager {
             Command::Font { font, orientation, height, width } => {
                 self.current_font = font;
                 self.current_custom_font = self.aliased_font(font);
-                self.current_font_orientation = orientation.unwrap_or(self.default_orientation);
+                self.current_font_orientation = orientation;
                 self.set_font_size(height, width);
             }
 
             Command::ChangeFont { font, height, width } => {
                 self.current_font = font;
+                self.current_font_orientation = None;
                 self.current_custom_font = self.aliased_font(font);
                 self.set_font_size(height, width);
             }
@@ -904,7 +913,7 @@ impl StateManager {
             Command::FontByName { orientation, height, width, name } => {
                 self.current_font = FontName::Custom('@');
                 self.current_custom_font = self.fonts.get(&stored_name(&name)).cloned();
-                self.current_font_orientation = orientation.unwrap_or(self.default_orientation);
+                self.current_font_orientation = orientation;
                 self.set_font_size(height, width);
             }
             Command::MaxiCode { mode, symbol_number, total_symbols } => {
@@ -1171,7 +1180,10 @@ impl StateManager {
                 font: self.current_font,
                 height: self.current_font_height,
                 width: self.current_font_width,
-                orientation: field.orientation.unwrap_or(self.current_font_orientation),
+                orientation: field
+                    .orientation
+                    .or(self.current_font_orientation)
+                    .unwrap_or(self.default_orientation),
                 justification: self.field_justification,
                 anchor: if bottom { TextAnchor::Baseline } else { TextAnchor::Top },
                 block: field.block,
@@ -1204,27 +1216,25 @@ impl StateManager {
                 print_interpretation_line_above,
                 check_digit,
                 mode,
-            } => {
-                let y = if bottom && orientation == Orientation::Normal { y.saturating_sub(height) } else { y };
-                DrawInstruction::DrawBarcode {
-                    x,
-                    y,
-                    data,
-                    orientation,
-                    height,
-                    module_width: self.barcode_module_width,
-                    wide_bar_ratio: self.barcode_wide_bar_ratio,
-                    print_interpretation_line,
-                    print_interpretation_line_above,
-                    check_digit,
-                    mode,
-                }
-            }
+            } => DrawInstruction::DrawBarcode {
+                x,
+                y,
+                bottom,
+                data,
+                orientation,
+                height,
+                module_width: self.barcode_module_width,
+                wide_bar_ratio: self.barcode_wide_bar_ratio,
+                print_interpretation_line,
+                print_interpretation_line_above,
+                check_digit,
+                mode,
+            },
             FieldMode::Linear { kind, orientation, height, print_interpretation_line, print_interpretation_line_above } => {
-                let y = if bottom && orientation == Orientation::Normal { y.saturating_sub(height) } else { y };
                 DrawInstruction::DrawLinear {
                     x,
                     y,
+                    bottom,
                     kind,
                     data,
                     orientation,
@@ -1424,6 +1434,42 @@ mod tests {
     fn field_orientation_default() {
         let ins = run("^XA^FWR^FO1,1^A0,20^FDa^FS^XZ");
         assert!(matches!(ins[0], DrawInstruction::DrawText { orientation: Orientation::Rotated90, .. }));
+    }
+
+    #[test]
+    fn font_orientation_follows_field_default_when_not_given() {
+        // ^A without an orientation takes the ^FW in force when the field prints; ^CF has none.
+        let ins = run("^XA^A0,20^FWB^FO1,1^FDa^FS^FO1,1^A0N,20^FDb^FS^FWI^CF0,20^FO1,1^FDc^FS^XZ");
+        let orientations: Vec<_> = ins
+            .iter()
+            .map(|i| match i {
+                DrawInstruction::DrawText { orientation, .. } => *orientation,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(orientations, [Orientation::Rotated270, Orientation::Normal, Orientation::Rotated180]);
+    }
+
+    #[test]
+    fn font_comma_form_is_sized_by_width() {
+        // ^AF,N,40,40 under ^FWB: rotated, height not given (0), width 40 (3x3 for font F).
+        let ins = run("^XA^FWB^FO165,180^AF,N,40,40^FDCARRIER^FS^FO1,1^AFN,,40^FDx^FS^XZ");
+        assert!(matches!(
+            ins[0],
+            DrawInstruction::DrawText { font: FontName::FontF, orientation: Orientation::Rotated270, height: 0, width: 40, .. }
+        ));
+        assert!(matches!(ins[1], DrawInstruction::DrawText { orientation: Orientation::Normal, height: 0, width: 40, .. }));
+    }
+
+    #[test]
+    fn barcode_typeset_origin_is_passed_on() {
+        // The renderers place ^FT barcodes by the rotated bars; the origin stays as given.
+        let ins = run("^XA^FWB^BY4^FT600,200^BC,142,Y,N,N,N^FD123^FS^FO600,200^B3,N,80^FD12^FS^XZ");
+        assert!(matches!(
+            ins[0],
+            DrawInstruction::DrawBarcode { x: 600, y: 200, bottom: true, orientation: Orientation::Rotated270, .. }
+        ));
+        assert!(matches!(ins[1], DrawInstruction::DrawLinear { x: 600, y: 200, bottom: false, .. }));
     }
 
     #[test]

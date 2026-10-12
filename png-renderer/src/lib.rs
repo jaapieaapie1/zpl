@@ -118,10 +118,9 @@ fn fixed_scalable(font: FontName) -> Option<(u32, u32)> {
 }
 
 /// Integer magnifications (vertical, horizontal), nearest multiple of the matrix, 1 to 10.
-/// `width == height` means only a height was given (see pdf-renderer's `magnification`).
+/// A size of 0 was not given and takes the other one's factor (see pdf-renderer's `magnification`).
 fn magnification(height: u32, width: u32, base_h: u32, base_w: u32) -> (u32, u32) {
     let mag = |v: u32, base: u32| (v > 0).then(|| ((v as f32 / base as f32).round() as u32).clamp(1, 10));
-    let width = if width == height && base_h != base_w { 0 } else { width };
     match (mag(height, base_h), mag(width, base_w)) {
         (Some(h), Some(w)) => (h, w),
         (Some(m), None) | (None, Some(m)) => (m, m),
@@ -210,9 +209,11 @@ impl TextFont {
             None => (height, width),
         };
 
-        // Zebra sizes scalable fonts in em units, ab_glyph's PxScale is ascent - descent
+        // Zebra sizes scalable fonts in em units, ab_glyph's PxScale is ascent - descent.
+        // A size given alone sets both.
         let units_per_em = font.units_per_em().unwrap_or(1000.0);
         let px_per_em = font.height_unscaled() / units_per_em;
+        let height = if height == 0 { width } else { height };
         let width = if width == 0 { height } else { width };
         let scale = PxScale {
             x: width as f32 * px_per_em,
@@ -512,20 +513,20 @@ impl PngRenderer {
                 );
             }
             DrawInstruction::DrawBarcode {
-                x, y, data, orientation, height, module_width,
+                x, y, bottom, data, orientation, height, module_width,
                 print_interpretation_line, print_interpretation_line_above, mode, ..
             } => {
                 self.render_code128(
-                    image, *x, *y, data, orientation, *height, *module_width,
+                    image, *x, *y, *bottom, data, *orientation, *height, *module_width,
                     *print_interpretation_line, *print_interpretation_line_above, *mode,
                 );
             }
             DrawInstruction::DrawLinear {
-                x, y, kind, data, orientation, height, module_width, wide_bar_ratio,
+                x, y, bottom, kind, data, orientation, height, module_width, wide_bar_ratio,
                 print_interpretation_line, print_interpretation_line_above,
             } => {
                 self.render_linear(
-                    image, *x, *y, *kind, data, *orientation, *height, *module_width, *wide_bar_ratio,
+                    image, *x, *y, *bottom, *kind, data, *orientation, *height, *module_width, *wide_bar_ratio,
                     *print_interpretation_line, *print_interpretation_line_above,
                 );
             }
@@ -628,19 +629,13 @@ impl PngRenderer {
         };
         let display = |s: String| if advanced && font.cell.is_some() { layout::visual_string(text_layout, &s) } else { s };
 
-        // Height of the unrotated frame per orientation; the placement below is tuned to these.
-        let frame_extra = match orientation {
-            Orientation::Rotated270 => height + 10,
-            _ => height * 2,
-        };
-
-        // (x offset, top of capitals, text) per row, in the unrotated frame.
+        // The unrotated text box: as wide as the text (or the ^FB block), one line height per
+        // row, with the top of the capitals at the top of each row.
         let mut rows: Vec<(i32, i32, String)> = Vec::new();
-        let (frame_w, frame_h, last_row_top, justification) = match block {
+        let (box_w, box_h, last_row_top) = match block {
             None => {
-                let w = measure(text).ceil() as u32 + 10;
                 rows.push((0, 0, display(text.to_string())));
-                (w, frame_extra, 0, justification)
+                (measure(text).ceil() as u32, height, 0)
             }
             Some(b) => {
                 let line_height = (height as i32 + b.line_spacing).max(1);
@@ -667,87 +662,61 @@ impl PngRenderer {
                     rows.push((x_off.round() as i32, row as i32 * line_height, display(line)));
                 }
                 let last_top = last_row as i32 * line_height;
-                (b.width.max(1), last_top as u32 + frame_extra, last_top, Justification::Left)
+                (b.width.max(1), last_top as u32 + height, last_top)
             }
         };
-        if frame_w == 0 || frame_h == 0 {
+        if box_w == 0 || box_h == 0 {
             return;
         }
 
-        let mut temp: RgbImage = ImageBuffer::from_pixel(frame_w, frame_h, WHITE);
+        // Drawn with a margin so accents and descenders outside the box are kept.
+        let margin = height / 2 + 2;
+        let mut temp: RgbImage = ImageBuffer::from_pixel(box_w + 2 * margin, box_h + 2 * margin, WHITE);
         for (x_off, top, line) in &rows {
+            let (x_off, top) = (x_off + margin as i32, top + margin as i32);
             match &primary {
                 Some(p) => {
                     use ab_glyph::{Font, ScaleFont};
                     let laid = layout::layout_line(p, font.cap_em, text_layout, line);
                     let baseline = (top - font.y_offset) as f32 + font.font.as_scaled(font.scale).ascent();
-                    layout::draw_line(&mut temp, p, &laid, *x_off as f32, baseline);
+                    layout::draw_line(&mut temp, p, &laid, x_off as f32, baseline);
                 }
-                None => font.draw(&mut temp, *x_off, *top, line),
+                None => font.draw(&mut temp, x_off, top, line),
             }
         }
 
-        // ^FT: the origin is the baseline of the (last) line; move it to where the top would be.
-        let (mut x, mut y) = (x as i64, y as i64);
-        if anchor == TextAnchor::Baseline {
-            let up = (last_row_top + font.cap) as i64;
-            let below = frame_h as i64 - up;
-            match orientation {
-                Orientation::Normal => y -= up,
-                Orientation::Rotated90 => x -= below,
-                Orientation::Rotated180 => y -= below,
-                Orientation::Rotated270 => x += below,
-            }
-        }
-
-        self.place_text(image, &temp, x, y, orientation, justification);
-    }
-
-    /// Places an unrotated text frame at the field origin, rotated and justified.
-    fn place_text(
-        &self,
-        image: &mut RgbImage,
-        temp: &RgbImage,
-        x: i64,
-        y: i64,
-        orientation: Orientation,
-        justification: Justification,
-    ) {
-        let justify = |x: i64, w: u32| match justification {
-            Justification::Left => x,
-            Justification::Right => x - w as i64,
-            Justification::Auto => x - (w / 2) as i64,
+        // ^FO: the rotated box's top-left is the origin. ^FT: the start of the last line's
+        // baseline is, so find where that point lands in the rotated box.
+        let (w, h) = (box_w as i64, box_h as i64);
+        let baseline = (last_row_top + font.cap) as i64;
+        let (rotated_w, (px, py)) = match orientation {
+            Orientation::Normal => (w, (0, baseline)),
+            Orientation::Rotated90 => (h, (h - baseline, 0)),
+            Orientation::Rotated180 => (w, (w, h - baseline)),
+            Orientation::Rotated270 => (h, (baseline, w)),
         };
-        match orientation {
-            Orientation::Normal => {
-                self.overlay_at(image, temp, justify(x, temp.width()), y);
-            }
-            Orientation::Rotated90 => {
-                let rotated = image::imageops::rotate90(temp);
-                self.overlay_at(image, &rotated, justify(x, rotated.width()), y);
-            }
-            Orientation::Rotated180 => {
-                let rotated = image::imageops::rotate180(temp);
-                self.overlay_at(image, &rotated, justify(x, temp.width()), y);
-            }
-            Orientation::Rotated270 => {
-                let rotated = image::imageops::rotate270(temp);
-                let adjusted_x = match justification {
-                    Justification::Left => x - rotated.width() as i64,
-                    Justification::Right => x,
-                    Justification::Auto => x - (rotated.width() / 2) as i64,
-                };
-                let adjusted_y = y - rotated.height() as i64;
+        let (mut x, y) = match anchor {
+            TextAnchor::Top => (x as i64, y as i64),
+            TextAnchor::Baseline => (x as i64 - px, y as i64 - py),
+        };
+        // ^FO / ^FT justification moves the rotated box left on the page.
+        x -= match justification {
+            Justification::Left => 0,
+            Justification::Right => rotated_w,
+            Justification::Auto => rotated_w / 2,
+        };
 
-                if self.debug && adjusted_x >= 0 && adjusted_y >= 0 {
-                    self.draw_debug_box(
-                        image, adjusted_x as u32, adjusted_y as u32, rotated.width(), rotated.height(), Rgb([255, 0, 0]),
-                    );
-                }
-
-                self.overlay_at(image, &rotated, adjusted_x, adjusted_y);
-            }
+        let rotated = match orientation {
+            Orientation::Normal => temp,
+            Orientation::Rotated90 => image::imageops::rotate90(&temp),
+            Orientation::Rotated180 => image::imageops::rotate180(&temp),
+            Orientation::Rotated270 => image::imageops::rotate270(&temp),
+        };
+        if self.debug && x >= 0 && y >= 0 {
+            let (bw, bh) = (rotated.width() - 2 * margin, rotated.height() - 2 * margin);
+            self.draw_debug_box(image, x as u32, y as u32, bw, bh, Rgb([255, 0, 0]));
         }
+        self.overlay_at(image, &rotated, x - margin as i64, y - margin as i64);
     }
 
     fn overlay_image(&self, target: &mut RgbImage, source: &RgbImage, x: u32, y: u32) {
@@ -815,8 +784,50 @@ impl PngRenderer {
         }
     }
 
+    /// Places the unrotated image of a 1D symbol whose bars are the `bars_w` x `bars_h` box at
+    /// (`bars_x`, `bars_y`): ^FO puts the rotated bars' top-left on (`x`, `y`), ^FT (`bottom`)
+    /// the bars' bottom-left corner, rotated with the symbol. The interpretation line follows
+    /// the bars wherever it lands.
     #[allow(clippy::too_many_arguments)]
-    fn render_code128(&self, image: &mut RgbImage, x: u32, y: u32, data: &str, orientation: &Orientation, height: u32, module_width: u32, print_interpretation_line: bool, print_interpretation_line_above: bool, mode: Code128Mode) {
+    fn place_bars(
+        &self,
+        image: &mut RgbImage,
+        temp: &RgbImage,
+        x: u32,
+        y: u32,
+        bottom: bool,
+        orientation: Orientation,
+        (bars_x, bars_y, bars_w, bars_h): (u32, u32, u32, u32),
+    ) {
+        let (x, y) = (x as i64, y as i64);
+        let (bx, by, bw, bh) = (bars_x as i64, bars_y as i64, bars_w as i64, bars_h as i64);
+        let (tw, th) = (temp.width() as i64, temp.height() as i64);
+        // Top-left of the rotated bars on the page.
+        let (left, top) = match (bottom, orientation) {
+            (false, _) | (true, Orientation::Rotated90) => (x, y),
+            (true, Orientation::Normal) => (x, y - bh),
+            (true, Orientation::Rotated180) => (x - bw, y),
+            (true, Orientation::Rotated270) => (x - bh, y - bw),
+        };
+        match orientation {
+            Orientation::Normal => self.overlay_at(image, temp, left - bx, top - by),
+            Orientation::Rotated90 => {
+                let rotated = image::imageops::rotate90(temp);
+                self.overlay_at(image, &rotated, left - (th - by - bh), top - bx);
+            }
+            Orientation::Rotated180 => {
+                let rotated = image::imageops::rotate180(temp);
+                self.overlay_at(image, &rotated, left - (tw - bx - bw), top - (th - by - bh));
+            }
+            Orientation::Rotated270 => {
+                let rotated = image::imageops::rotate270(temp);
+                self.overlay_at(image, &rotated, left - by, top - (tw - bx - bw));
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_code128(&self, image: &mut RgbImage, x: u32, y: u32, bottom: bool, data: &str, orientation: Orientation, height: u32, module_width: u32, print_interpretation_line: bool, print_interpretation_line_above: bool, mode: Code128Mode) {
         let code = code128::encode(data, mode);
         let bar_width = module_width.max(1);
         let widths = code.widths();
@@ -858,35 +869,19 @@ impl PngRenderer {
             ip.draw(&mut temp_image, &code.text, text_x, baseline);
         }
 
-        match orientation {
-            Orientation::Normal => {
-                self.overlay_image(image, &temp_image, x.saturating_sub(pad), y);
-            }
-            Orientation::Rotated90 => {
-                let rotated = image::imageops::rotate90(&temp_image);
-                self.overlay_image(image, &rotated, x, y.saturating_sub(pad));
-            }
-            Orientation::Rotated180 => {
-                let rotated = image::imageops::rotate180(&temp_image);
-                self.overlay_image(image, &rotated, x.saturating_sub(pad), y);
-            }
-            Orientation::Rotated270 => {
-                let rotated = image::imageops::rotate270(&temp_image);
-                let adjusted_x = x.saturating_sub(rotated.width());
-                let adjusted_y = y.saturating_sub(rotated.height()).saturating_sub(pad);
-                self.overlay_image(image, &rotated, adjusted_x, adjusted_y);
-            }
-        }
+        self.place_bars(image, &temp_image, x, y, bottom, orientation, (pad, bars_y, barcode_width, height));
     }
 
-    /// All 1D symbologies except Code 128. Bars start at the field origin; the interpretation
-    /// line goes below, or above when requested. EAN/UPC guard bars extend halfway into the digits.
+    /// All 1D symbologies except Code 128, placed by their bars (see `place_bars`); the
+    /// interpretation line goes below, or above when requested. EAN/UPC guard bars extend
+    /// halfway into the digits.
     #[allow(clippy::too_many_arguments)]
     fn render_linear(
         &self,
         image: &mut RgbImage,
         x: u32,
         y: u32,
+        bottom: bool,
         kind: LinearKind,
         data: &str,
         orientation: Orientation,
@@ -950,7 +945,7 @@ impl PngRenderer {
             }
         }
 
-        self.place_symbol(image, &temp, x, y, orientation, pad_l, pad_r);
+        self.place_bars(image, &temp, x, y, bottom, orientation, (pad_l, bars_y, width, height));
     }
 
     /// 2D symbol with `module_w` x `module_h` dot modules; with `bottom` (^FT) `y` is the
@@ -1241,7 +1236,7 @@ mod tests {
     #[test]
     fn linear_ean13_draws_bars() {
         let ean = DrawInstruction::DrawLinear {
-            x: 20, y: 0, kind: LinearKind::Ean13, data: "590123412345".into(),
+            x: 20, y: 0, bottom: false, kind: LinearKind::Ean13, data: "590123412345".into(),
             orientation: Orientation::Normal, height: 50, module_width: 2, wide_bar_ratio: 3.0,
             print_interpretation_line: true, print_interpretation_line_above: false,
         };
@@ -1322,5 +1317,115 @@ mod tests {
         let font = TextFont::new(FontName::Font0, None, 30, 30, 8);
         let lines = wrap_lines(&font, "aaa bbb ccc\\&ddd", font.measure("aaa bbb") as u32 + 1, 0);
         assert_eq!(lines, vec!["aaa bbb", "ccc", "ddd"]);
+    }
+
+    /// Ink bounding box (x0, y0, x1, y1), inclusive, of a 4x6 inch label at 8 dots/mm,
+    /// within `area` (x0, y0, x1, y1, exclusive ends).
+    fn ink_box(zpl: &str, area: (u32, u32, u32, u32)) -> Option<(u32, u32, u32, u32)> {
+        use zpl_state_manager::StateManager;
+        let instructions = StateManager::new().process(zpl_parser::Parser::new(zpl).parse().unwrap());
+        let image = PngRenderer::new(812, 1218).render(&instructions);
+        let mut found: Option<(u32, u32, u32, u32)> = None;
+        for y in area.1..area.3 {
+            for x in area.0..area.2 {
+                if black(&image, x, y) {
+                    let b = found.get_or_insert((x, y, x, y));
+                    *b = (b.0.min(x), b.1.min(y), b.2.max(x), b.3.max(y));
+                }
+            }
+        }
+        found
+    }
+
+    /// Each field alone on a label; the box is Labelary's (8dpmm, 4x6), within 3 dots.
+    fn assert_matches_labelary(cases: &[(&str, (u32, u32, u32, u32))]) {
+        for (field, expected) in cases {
+            let got = ink_box(&format!("^XA{field}^XZ"), (0, 0, 812, 1218)).expect(field);
+            let close = |a: u32, b: u32| a.abs_diff(b) <= 3;
+            assert!(
+                close(got.0, expected.0) && close(got.1, expected.1) && close(got.2, expected.2) && close(got.3, expected.3),
+                "{field}: {got:?}, Labelary {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rotated_text_matches_labelary() {
+        assert_matches_labelary(&[
+            // ^FO: the rotated box (advance x line height) has its top-left on the origin.
+            ("^FO100,100^A0N,40^FDHHHH^FS", (103, 100, 194, 129)),
+            ("^FO500,100^A0R,40^FDHHHH^FS", (510, 103, 539, 194)),
+            ("^FO100,400^A0I,40^FDHHHH^FS", (102, 410, 193, 439)),
+            ("^FO500,400^A0B,40^FDHHHH^FS", (500, 402, 529, 493)),
+            ("^FO500,700^AFR,52^FDHHHH^FS", (510, 700, 551, 822)),
+            ("^FO500,950^AFB,52^FDHHHH^FS", (500, 954, 541, 1076)),
+            // ^FT: the baseline starts at the origin and turns with the text.
+            ("^FT500,100^A0R,40^FDHHHH^FS", (500, 103, 529, 194)),
+            ("^FT250,400^A0I,40^FDHHHH^FS", (155, 400, 246, 429)),
+            ("^FT500,400^A0B,40^FDHHHH^FS", (470, 305, 499, 396)),
+            ("^FT500,1150^AFB,52^FDHHHH^FS", (458, 1027, 499, 1149)),
+            // ^FB lays the block out along the text and stacks lines across it.
+            ("^FO100,450^A0R,30^FB200,2,0,R^FDHHH\\&HH^FS", (108, 597, 159, 647)),
+            ("^FO100,100^A0I,30^FB200,2,0,L^FDHHH\\&HH^FS", (247, 108, 297, 159)),
+            ("^FO100,100^A0B,30^FB200,2,0,L^FDHHH\\&HH^FS", (100, 247, 151, 297)),
+            ("^FT450,650^A0B,30^FB200,2,0,L^FDHHH\\&HH^FS", (398, 597, 449, 647)),
+            // Right-justified fields move the rotated box left by its width on the page.
+            ("^FO200,900,1^A0N,30^FDHHH^FS", (147, 900, 197, 921)),
+            ("^FO200,900,1^A0R,30^FDHHH^FS", (178, 902, 199, 952)),
+            ("^FO550,900,1^A0N,30^FB200,2,0,L^FDHHH\\&HH^FS", (352, 900, 402, 951)),
+        ]);
+    }
+
+    #[test]
+    fn rotated_barcodes_match_labelary() {
+        // Bars only: ^FO puts the rotated bars' top-left on the origin, ^FT the unrotated
+        // bottom-left corner.
+        assert_matches_labelary(&[
+            ("^BY2^FO100,150^BCN,80,N^FD12345678^FS", (100, 150, 345, 229)),
+            ("^BY2^FO500,150^BCR,80,N^FD12345678^FS", (500, 150, 579, 395)),
+            ("^BY2^FO100,650^BCI,80,N^FD12345678^FS", (100, 650, 345, 729)),
+            ("^BY2^FO500,650^BCB,80,N^FD12345678^FS", (500, 650, 579, 895)),
+            ("^BY2^FT100,150^BCN,80,N^FD12345678^FS", (100, 70, 345, 149)),
+            ("^BY2^FT500,150^BCR,80,N^FD12345678^FS", (500, 150, 579, 395)),
+            ("^BY2^FT400,650^BCI,80,N^FD12345678^FS", (154, 650, 399, 729)),
+            ("^BY2^FT500,650^BCB,80,N^FD12345678^FS", (420, 404, 499, 649)),
+            ("^BY2^FO500,650^B3B,N,80,N^FDAB12^FS", (500, 650, 579, 839)),
+            ("^BY2^FT500,1000^B3B,N,80,N^FDAB12^FS", (420, 810, 499, 999)),
+        ]);
+        // The interpretation line stays below the bars in the symbol's frame: left of
+        // them for R, above for I.
+        assert_matches_labelary(&[
+            ("^BY2^FO500,150^BCR,80,Y^FD12345678^FS", (480, 150, 579, 395)),
+            ("^BY2^FO100,650^BCI,80,Y^FD12345678^FS", (100, 630, 345, 729)),
+        ]);
+    }
+
+    #[test]
+    fn rotated_carrier_label_matches_labelary() {
+        // A carrier label printed sideways with ^FWB; boxes from Labelary's render.
+        let zpl = "^XA^FWB\
+                   ^FO57,57^AF,N,13,26^FB1087,1,0,L,0^FDCart ID^FS\
+                   ^FO165,180^AF,N,40,40^FB640,1,0,R,0^FDCARRIER^FS\
+                   ^FO600,200^BY4^BC,142,Y,N,N,N^FDACME1000002908928^FS^XZ";
+        let close = |got: Option<(u32, u32, u32, u32)>, expected: (u32, u32, u32, u32)| {
+            let got = got.unwrap();
+            assert!(
+                [(got.0, expected.0), (got.1, expected.1), (got.2, expected.2), (got.3, expected.3)]
+                    .iter()
+                    .all(|(a, b)| a.abs_diff(*b) <= 3),
+                "{got:?}, Labelary {expected:?}"
+            );
+        };
+        // Font F 1x1 reading upwards from the bottom of its 1087-dot block (57 + 1087).
+        close(ink_box(zpl, (40, 0, 100, 1218)), (57, 1034, 77, 1143));
+        // Font F 3x3, right-justified: the text ends at the top of its block, y 180.
+        close(ink_box(zpl, (150, 0, 250, 600)), (164, 185, 228, 515));
+        // Bars from y 200 down, the interpretation line to their right.
+        close(ink_box(zpl, (590, 0, 743, 1218)), (600, 200, 741, 1087));
+        let text = ink_box(zpl, (743, 0, 812, 1218)).unwrap();
+        assert!(text.0.abs_diff(748) <= 3 && text.2.abs_diff(776) <= 3, "{text:?}");
+        // ^FO156,-1257 is y 1257: off the label, so "X" prints nowhere.
+        let off_label = "^XA^FWB^FO156,-1257^AF,N,13,26^FB1417,1,0,L,0^FDX^FS^XZ";
+        assert_eq!(ink_box(off_label, (0, 0, 812, 1218)), None);
     }
 }

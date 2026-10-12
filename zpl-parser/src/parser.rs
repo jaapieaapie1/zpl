@@ -209,8 +209,8 @@ impl<'a> Parser<'a> {
     fn parse_field_origin(&self, params: &[&str], span: Span) -> Result<Command, ParseError> {
         // ^FOx,y[,justification]
 
-        let x = self.dim_param(params, 0, "x", span)?;
-        let y = self.dim_param(params, 1, "y", span)?;
+        let x = self.coord_param(params, 0, "x", span)?;
+        let y = self.coord_param(params, 1, "y", span)?;
 
         let justification = if params.len() >= 3 {
             self.parse_justification(params[2], span)?
@@ -228,8 +228,8 @@ impl<'a> Parser<'a> {
     fn parse_field_typeset(&self, params: &[&str], span: Span) -> Result<Command, ParseError> {
         // ^FTx,y (Zebra continues after the previous field when omitted; we use 0)
 
-        let x = self.opt_dim(params, 0, span)?.unwrap_or(0);
-        let y = self.opt_dim(params, 1, span)?.unwrap_or(0);
+        let x = self.opt_coord(params, 0, span)?.unwrap_or(0);
+        let y = self.opt_coord(params, 1, span)?.unwrap_or(0);
 
         let justification = if params.len() >= 3 {
             self.parse_justification(params[2], span)?
@@ -305,17 +305,11 @@ impl<'a> Parser<'a> {
         let (font_name, orientation) =
             self.parse_font_name_orientation(params, 0, "font_orientation", span)?;
 
-        let height = if params.len() > 1 && !params[1].is_empty() {
-            Some(self.dim_param(params, 1, "h", span)?)
-        } else {
-            None
-        };
-
-        let width = if params.len() > 2 && !params[2].is_empty() {
-            Some(self.dim_param(params, 2, "w", span)?)
-        } else {
-            None
-        };
+        // A size that is not a number counts as not given: in `^AF,N,13,26` the comma right
+        // after the font leaves the orientation empty, so `N` lands in the height slot and the
+        // font is sized from the width (13) alone.
+        let height = self.opt_dim(params, 1, span).unwrap_or(None);
+        let width = self.opt_dim(params, 2, span).unwrap_or(None);
 
         Ok(Command::Font {
             font: font_name,
@@ -1197,6 +1191,21 @@ impl<'a> Parser<'a> {
         match params.get(index) {
             Some(s) => self.dim(s, span),
             None => Err(ParseError::MissingRequiredParameter { command: "", parameter: name, span }),
+        }
+    }
+
+    /// ^FO / ^FT coordinate. Printers ignore a minus sign: `-20` is 20.
+    fn coord_param(&self, params: &[&str], index: usize, name: &'static str, span: Span) -> Result<u32, ParseError> {
+        match params.get(index) {
+            Some(s) => self.dim(s.strip_prefix('-').unwrap_or(s), span),
+            None => Err(ParseError::MissingRequiredParameter { command: "", parameter: name, span }),
+        }
+    }
+
+    fn opt_coord(&self, params: &[&str], index: usize, span: Span) -> Result<Option<u32>, ParseError> {
+        match params.get(index) {
+            Some(s) if !s.is_empty() => self.coord_param(params, index, "", span).map(Some),
+            _ => Ok(None),
         }
     }
 

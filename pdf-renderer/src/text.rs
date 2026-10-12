@@ -17,10 +17,6 @@ use zpl_state_manager::{DrawInstruction, TextAnchor, TextBlock};
 /// cap height is taken as 0.75 em.
 const CAP_HEIGHT_EM: f32 = 0.75;
 
-/// Extra width the PNG renderer adds to its text boxes (`estimate_text_width`); kept so
-/// justified/rotated fields land on the same dots.
-const BOX_PAD: f32 = 10.0;
-
 /// Horizontal squeeze for DejaVu Sans Bold fallback glyphs next to the condensed Triumvirate.
 const FALLBACK_CONDENSE: f32 = 0.8;
 
@@ -99,12 +95,10 @@ fn fixed_scalable(font: FontName) -> Option<(u32, u32)> {
 
 /// Integer magnifications (vertical, horizontal) of a `base_h` x `base_w` matrix for a
 /// requested `height` x `width`: each is the nearest multiple of the base, 1 to 10 (^A).
-/// A dimension given alone sets both ("the standard matrix for that font automatically
-/// determines the other value"). The state manager reports an omitted width as equal to
-/// the height, so `width == height` on a non-square matrix counts as "width not given".
+/// A dimension given alone (the other one 0) sets both: ^AF,,40 is 3x3 ("the standard
+/// matrix for that font automatically determines the other value").
 pub(crate) fn magnification(height: u32, width: u32, base_h: u32, base_w: u32) -> (u32, u32) {
     let mag = |v: u32, base: u32| (v > 0).then(|| ((v as f32 / base as f32).round() as u32).clamp(1, 10));
-    let width = if width == height && base_h != base_w { 0 } else { width };
     match (mag(height, base_h), mag(width, base_w)) {
         (Some(h), Some(w)) => (h, w),
         (Some(m), None) | (None, Some(m)) => (m, m),
@@ -142,6 +136,8 @@ struct Field {
     stroke: f32,
     orientation: Orientation,
     anchor: TextAnchor,
+    /// ^FO / ^FT justification: right moves the rotated box left by its page width.
+    justification: Justification,
     /// ^PA default glyph: characters no font has print as the field font's .notdef glyph
     /// (usually a box) instead of a space.
     notdef: bool,
@@ -272,6 +268,22 @@ impl Field {
         }
     }
 
+    /// `frame` moved left on the page by the field's justification: by the rotated box's
+    /// page width (right) or half of it (auto), whatever the orientation.
+    fn placed(&self, w: f32, h: f32) -> [f32; 6] {
+        let page_w = match self.orientation {
+            Orientation::Normal | Orientation::Rotated180 => w,
+            Orientation::Rotated90 | Orientation::Rotated270 => h,
+        };
+        let mut matrix = self.frame(w, h);
+        matrix[4] -= match self.justification {
+            Justification::Left => 0.0,
+            Justification::Right => page_w,
+            Justification::Auto => page_w / 2.0,
+        };
+        matrix
+    }
+
     /// Runs `f` in the local frame given by `matrix`. Unrotated frames are passed as an
     /// offset instead of a `cm` so plain text needs no extra graphics state.
     fn in_frame(&self, ctx: &mut Ctx, matrix: [f32; 6], f: impl FnOnce(&mut Ctx, f32, f32)) {
@@ -389,12 +401,15 @@ fn field_for(
         stroke: 0.0,
         orientation,
         anchor,
+        justification: Justification::Left,
         notdef: false,
     };
+    // Scalable fonts: a size given alone sets both.
+    let em_height = if height == 0 { width } else { height };
 
     // Downloaded TrueType/OpenType font: scalable like font 0.
     if let Some(key) = custom_font.and_then(|data| ctx.fonts.register_custom(data)) {
-        let size_y = height.max(1) as f32;
+        let size_y = em_height.max(1) as f32;
         let size_x = if width == 0 { size_y } else { width as f32 };
         let cap = cap_height(ctx.fonts.face(key));
         return scalable(key, cap, size_y, size_x);
@@ -427,6 +442,7 @@ fn field_for(
             stroke,
             orientation,
             anchor,
+            justification: Justification::Left,
             notdef: false,
         };
     }
@@ -438,7 +454,7 @@ fn field_for(
         }
         // ZPL font sizes are em sizes; width 0 means "same as height".
         None => {
-            let size_y = height as f32;
+            let size_y = em_height as f32;
             (size_y, if width == 0 { size_y } else { width as f32 })
         }
     };
@@ -496,6 +512,7 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
     };
     let text: &str = &text;
     field.notdef = layout.default_glyph;
+    field.justification = *justification;
     let reverse = matches!(direction, FieldDirection::Reverse);
 
     // ^FPV prints one character per line in logical order: there is nothing to reorder or
@@ -520,7 +537,7 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
                         Shown::Shaped(line, reverse)
                     }
                 };
-                render_line(ctx, &field, &line, *justification);
+                render_line(ctx, &field, &line);
             }
         }
         return;
@@ -531,9 +548,9 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
         (_, Some(block)) => render_block(ctx, &field, text, block, reverse, Mode::Classic, layout),
         (FieldDirection::Reverse, None) => {
             let reversed: String = text.chars().rev().collect();
-            render_line(ctx, &field, &Shown::Text(reversed), *justification);
+            render_line(ctx, &field, &Shown::Text(reversed));
         }
-        (FieldDirection::Horizontal, None) => render_line(ctx, &field, &Shown::Plain(text), *justification),
+        (FieldDirection::Horizontal, None) => render_line(ctx, &field, &Shown::Plain(text)),
     }
 }
 
@@ -563,73 +580,15 @@ impl Field {
     }
 }
 
-/// A single unblocked line.
-fn render_line(ctx: &mut Ctx, field: &Field, text: &Shown, justification: Justification) {
-    let (x, y, size_y) = (field.x, field.y, field.size_y);
+/// A single unblocked line: a box as wide as the text and one line high, placed by `frame`.
+fn render_line(ctx: &mut Ctx, field: &Field, text: &Shown) {
     let advance = field.width_of(&ctx.fonts, text);
-    let shift = |w: f32| match justification {
-        Justification::Left => 0.0,
-        Justification::Right => w,
-        Justification::Auto => w / 2.0,
+    let matrix = field.placed(advance, field.line_h);
+    let baseline = match field.anchor {
+        TextAnchor::Top => field.ascent,
+        TextAnchor::Baseline => 0.0,
     };
-
-    if field.anchor == TextAnchor::Baseline {
-        // ^FT: the origin is the start of the baseline in the rotated frame.
-        let matrix = field.frame(0.0, 0.0);
-        let u = -shift(advance);
-        field.in_frame(ctx, matrix, |ctx, ox, oy| field.show_line(ctx, text, ox + u, oy));
-        return;
-    }
-
-    if field.bitmap.is_some() {
-        // Bitmap cells: the rotated cell box (text width x cell height) starts at the origin.
-        let matrix = field.frame(advance, field.line_h);
-        let u = -shift(advance);
-        field.in_frame(ctx, matrix, |ctx, ox, oy| field.show_line(ctx, text, ox + u, oy + field.ascent));
-        return;
-    }
-
-    // Box width as the PNG renderer computes it.
-    let text_width = advance.ceil() + BOX_PAD;
-    // Baseline inside an unrotated box whose top is the field origin.
-    let baseline = field.ascent;
-
-    match field.orientation {
-        Orientation::Normal => {
-            let ax = x - shift(text_width);
-            field.show_line(ctx, text, ax, y + baseline);
-        }
-        Orientation::Rotated90 => {
-            // Text box is `text_width` x `2*height`, rotated 90° clockwise: reads top to
-            // bottom with glyph tops facing right; rotated box width is 2*height.
-            let box_h = 2.0 * size_y;
-            let ax = x - shift(box_h);
-            with_transform(ctx, [0.0, 1.0, -1.0, 0.0, ax + box_h, y], |ctx| {
-                field.show_line(ctx, text, 0.0, baseline);
-            });
-        }
-        Orientation::Rotated180 => {
-            let box_h = 2.0 * size_y;
-            let ax = x - shift(text_width);
-            with_transform(ctx, [-1.0, 0.0, 0.0, -1.0, ax + text_width, y + box_h], |ctx| {
-                field.show_line(ctx, text, 0.0, baseline);
-            });
-        }
-        Orientation::Rotated270 => {
-            // Text box is `text_width` x `height + pad`, rotated 90° counter-clockwise:
-            // reads bottom to top ending above the origin; rotated box sits left of x
-            // for left justification (PNG renderer semantics).
-            let box_h = size_y + BOX_PAD;
-            let ax = match justification {
-                Justification::Left => x - box_h,
-                Justification::Right => x,
-                Justification::Auto => x - box_h / 2.0,
-            };
-            with_transform(ctx, [0.0, -1.0, 1.0, 0.0, ax, y], |ctx| {
-                field.show_line(ctx, text, 0.0, baseline);
-            });
-        }
-    }
+    field.in_frame(ctx, matrix, |ctx, ox, oy| field.show_line(ctx, text, ox, oy + baseline));
 }
 
 /// ^FPV: one character per line, top to bottom, each starting at the origin's x.
@@ -832,7 +791,7 @@ fn render_block(ctx: &mut Ctx, field: &Field, text: &str, block: &TextBlock, rev
         // ^FT: the origin is the baseline of the last line.
         TextAnchor::Baseline => -((rows - 1 - row) as f32 * line_height),
     };
-    let matrix = field.frame(box_w, rows as f32 * line_height);
+    let matrix = field.placed(box_w, rows as f32 * line_height);
 
     field.in_frame(ctx, matrix, |ctx, ox, oy| {
         let mut reversed = String::new();
@@ -1320,6 +1279,40 @@ mod tests {
         assert!(approx(tm[0][5], 30.0) && approx(tm[1][5], 70.0), "{tm:?}");
     }
 
+    /// Operands of every `cm` operator, as [a b c d e f].
+    fn cm_matrices(content: &str) -> Vec<[f32; 6]> {
+        let tokens: Vec<&str> = content.split_whitespace().collect();
+        let at = |i: usize| -> [f32; 6] { std::array::from_fn(|k| tokens[i - 6 + k].parse().unwrap()) };
+        tokens.iter().enumerate().filter(|(_, t)| **t == "cm").map(|(i, _)| at(i)).collect()
+    }
+
+    #[test]
+    fn top_anchor_puts_the_rotated_box_on_the_origin() {
+        // Labelary: ^FO50,60^A0R,40 reads down from y 60 with the tops of the capitals at
+        // x 90; I and B keep the (advance x 40) box at the origin too. Right justification
+        // moves the rotated box left by its page width.
+        let w = em("Hello");
+        let cm = |o, j| {
+            let m = cm_matrices(&content(&draw("Hello", o, j)));
+            assert_eq!(m.len(), 1, "{m:?}");
+            m[0]
+        };
+        let same = |a: [f32; 6], b: [f32; 6]| a.iter().zip(&b).all(|(a, b)| approx(*a, *b));
+        let r = cm(Orientation::Rotated90, Justification::Left);
+        assert!(same(r, [0.0, 1.0, -1.0, 0.0, 90.0, 60.0]), "{r:?}");
+        let r = cm(Orientation::Rotated90, Justification::Right);
+        assert!(same(r, [0.0, 1.0, -1.0, 0.0, 50.0, 60.0]), "{r:?}");
+        let i = cm(Orientation::Rotated180, Justification::Left);
+        assert!(same(i, [-1.0, 0.0, 0.0, -1.0, 50.0 + w, 100.0]), "{i:?}");
+        let b = cm(Orientation::Rotated270, Justification::Left);
+        assert!(same(b, [0.0, -1.0, 1.0, 0.0, 50.0, 60.0 + w]), "{b:?}");
+        let b = cm(Orientation::Rotated270, Justification::Right);
+        assert!(same(b, [0.0, -1.0, 1.0, 0.0, 10.0, 60.0 + w]), "{b:?}");
+        // Unrotated, right-justified: the advance ends on the origin.
+        let tm = text_matrices(&content(&draw("Hello", Orientation::Normal, Justification::Right)));
+        assert!(approx(tm[0][4], 50.0 - w), "{tm:?}");
+    }
+
     #[test]
     fn vertical_direction_stacks_characters() {
         let tm = text_matrices(&content(&field("ABC", |o| {
@@ -1448,10 +1441,13 @@ mod tests {
         assert_eq!(magnification(9, 5, 9, 5), (1, 1));
         assert_eq!(magnification(36, 20, 18, 10), (2, 2));
         assert_eq!(magnification(36, 40, 18, 10), (2, 4));
-        // Only a height (the state manager reports width == height): same magnification.
-        assert_eq!(magnification(30, 30, 9, 5), (3, 3));
-        assert_eq!(magnification(15, 15, 9, 5), (2, 2));
+        // Only a height or only a width (the other 0): same magnification both ways.
+        assert_eq!(magnification(30, 0, 9, 5), (3, 3));
+        assert_eq!(magnification(15, 0, 9, 5), (2, 2));
         assert_eq!(magnification(0, 20, 18, 10), (2, 2));
+        assert_eq!(magnification(0, 40, 26, 13), (3, 3));
+        // Both given, even when equal: each from its own dimension (^AFN,26,26 is 1 x 2).
+        assert_eq!(magnification(26, 26, 26, 13), (1, 2));
         assert_eq!(magnification(0, 0, 18, 10), (1, 1));
         assert_eq!(magnification(4, 1, 18, 10), (1, 1));
         assert_eq!(magnification(1000, 1000, 9, 5), (10, 10));
@@ -1460,7 +1456,7 @@ mod tests {
     #[test]
     fn bitmap_font_uses_fixed_cells() {
         // ^CFA,30: magnification 3 -> 27 x 15 cells, 18-dot pitch, baseline 21 dots down.
-        let ins = with_font("Ab1", FontName::FontA, 30, 30);
+        let ins = with_font("Ab1", FontName::FontA, 30, 0);
         let c = content(&ins);
         assert!(c.contains("/F1 1 Tf") && c.contains("2 Tr"), "{c}");
         let tm = text_matrices(&c);
@@ -1475,7 +1471,7 @@ mod tests {
         let tc = char_spacings(&c)[0];
         assert!(approx((m.advance_m + tc) * tm[0][0], 18.0), "{tc}");
         let mut ctx = Ctx::new();
-        let field = field_for(&mut ctx, FontName::FontA, None, 30, 30, 0.0, 0.0, 0.0, Orientation::Normal, TextAnchor::Top);
+        let field = field_for(&mut ctx, FontName::FontA, None, 30, 0, 0.0, 0.0, 0.0, Orientation::Normal, TextAnchor::Top);
         assert!(approx(field.measure(&ctx.fonts, "Ab1"), 54.0));
         assert!(approx(field.line_h, 27.0) && approx(field.ascent, 21.0));
     }
@@ -1544,6 +1540,7 @@ mod tests {
             stroke: 0.0,
             orientation: Orientation::Normal,
             anchor: TextAnchor::Top,
+            justification: Justification::Left,
             notdef: false,
         };
         let zhe = field.char_width(&fonts, 'Ж');

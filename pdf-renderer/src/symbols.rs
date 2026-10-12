@@ -89,7 +89,7 @@ impl Place {
     /// Transform for a local `w` x `h` frame (y down) at this place.
     fn matrix(&self, w: u32, h: u32) -> [f32; 6] {
         let y = if self.bottom { self.y.saturating_sub(h) } else { self.y };
-        placement(self.orientation, self.x, y, w.max(1), h.max(1), 0)
+        placement(self.orientation, self.x, y, w.max(1), h.max(1))
     }
 }
 

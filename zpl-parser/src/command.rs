@@ -126,7 +126,8 @@ pub enum Command {
         encoding: Encoding,
     },
 
-    PrintQuality {
+    /// ^PQ: print `total` labels, each serial number (^SN / ^SF) `replicate_count` times.
+    PrintQuantity {
         total: u32,
         pause_count: Option<u32>,
         replicate_count: Option<u32>,
@@ -229,9 +230,20 @@ pub enum Command {
         width: Option<u32>,
     },
 
-    /// ^SN: serialized field; rendered with its starting value.
+    /// ^SN: serialized field data. The last run of digits in `start` changes by `increment`
+    /// on each label; `leading_zeros` pads it to its original width.
     SerializationData {
         start: String,
+        increment: i64,
+        leading_zeros: bool,
+    },
+
+    /// ^SF: serializes the field's ^FD data. `mask` and `increment` are right-aligned to the
+    /// data; mask characters are D (decimal), H (hex), O (octal), A (letters), N (0-9A-Z)
+    /// and % (not incremented), upper-cased here.
+    SerializationField {
+        mask: String,
+        increment: String,
     },
 
     /// 1D barcodes other than Code 128 (^B1 ^B2 ^B3 ^B8 ^B9 ^BA ^BE ^BI ^BJ ^BK ^BM ^BP ^BS ^BU).

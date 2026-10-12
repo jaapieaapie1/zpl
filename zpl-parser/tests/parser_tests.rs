@@ -456,7 +456,7 @@ fn test_print_quantity_minimal() {
     let result = parser.parse().unwrap();
     assert_eq!(
         result[0],
-        Command::PrintQuality {
+        Command::PrintQuantity {
             total: 10,
             pause_count: None,
             replicate_count: None,
@@ -471,7 +471,7 @@ fn test_print_quantity_full() {
     let result = parser.parse().unwrap();
     assert_eq!(
         result[0],
-        Command::PrintQuality {
+        Command::PrintQuantity {
             total: 50,
             pause_count: Some(10),
             replicate_count: Some(2),
@@ -900,4 +900,16 @@ fn test_advanced_text() {
         Command::AdvancedText { layout: TextLayout { default_glyph: false, bidi: true, shaping: true, opentype: false } }
     );
     assert_eq!(result[1], Command::AdvancedText { layout: TextLayout::default() });
+}
+
+#[test]
+fn test_serialization() {
+    let result = Parser::new("^SNA007,-2,Y^SN^SFAAdd%d,1%1^SFnnA^SNx,y^SFQX").parse().unwrap();
+    assert_eq!(result[0], Command::SerializationData { start: "A007".into(), increment: -2, leading_zeros: true });
+    assert_eq!(result[1], Command::SerializationData { start: "1".into(), increment: 1, leading_zeros: false });
+    assert_eq!(result[2], Command::SerializationField { mask: "AADD%D".into(), increment: "1%1".into() });
+    assert_eq!(result[3], Command::SerializationField { mask: "NNA".into(), increment: "1".into() });
+    // A bad increment or mask skips the command.
+    assert!(matches!(result[4], Command::Unknown { .. }));
+    assert!(matches!(result[5], Command::Unknown { .. }));
 }

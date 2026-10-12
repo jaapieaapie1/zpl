@@ -3,7 +3,7 @@
 use zpl_parser::command::Command;
 use zpl_parser::Span;
 
-use crate::{DrawInstruction, StateManager};
+use crate::{DrawInstruction, Page, StateManager};
 
 /// Where a draw instruction came from, as byte offsets into the ZPL source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +23,20 @@ impl StateManager {
     /// command that recalled them.
     pub fn process_mapped(&mut self, commands: Vec<Command>, spans: &[Span]) -> (Vec<DrawInstruction>, Vec<Source>) {
         let mut out = Vec::new();
+        let sources = self.run_mapped(commands, spans, &mut out);
+        (out, sources)
+    }
+
+    /// Like [`StateManager::process_pages`], plus the [`Source`] of every instruction on
+    /// each page. Copies (^PQ) map to the same source as the label they repeat.
+    pub fn process_pages_mapped(&mut self, commands: Vec<Command>, spans: &[Span]) -> Vec<(Page, Vec<Source>)> {
+        self.page_log = Some(Default::default());
+        let mut out = Vec::new();
+        let sources = self.run_mapped(commands, spans, &mut out);
+        self.paginate(out, sources)
+    }
+
+    fn run_mapped(&mut self, commands: Vec<Command>, spans: &[Span], out: &mut Vec<DrawInstruction>) -> Vec<Source> {
         let mut sources: Vec<Source> = Vec::new();
         let mut field_start: Option<usize> = None;
         let mut data: Option<Span> = None;
@@ -40,7 +54,7 @@ impl StateManager {
                 _ => {}
             }
 
-            self.process_command(command, &mut out);
+            self.process_command(command, out);
 
             // ^IS can take instructions back out; everything new came from this command.
             sources.truncate(out.len());
@@ -64,7 +78,7 @@ impl StateManager {
             }
         }
 
-        (out, sources)
+        sources
     }
 }
 
@@ -94,6 +108,22 @@ mod tests {
                 ("^FT20,200^A0N,20,20^FDWorld^FS".to_string(), Some("^FDWorld".to_string())),
             ]
         );
+    }
+
+    #[test]
+    fn maps_pages() {
+        let zpl = "^XA^FO1,1^FDa^FS^XZ\n^XA^PQ2^FO1,1^SN1^FS^FO1,1^FDc^FS^XZ";
+        let (commands, spans) = Parser::new(zpl).parse_with_spans().unwrap();
+        let pages = StateManager::new().process_pages_mapped(commands, &spans);
+        let fields: Vec<Vec<&str>> = pages
+            .iter()
+            .map(|(page, sources)| {
+                assert_eq!(page.instructions.len(), sources.len());
+                sources.iter().map(|s| &zpl[s.field.start..s.field.end]).collect()
+            })
+            .collect();
+        assert_eq!(fields, [vec!["^FO1,1^FDa^FS"], vec!["^FO1,1^SN1^FS", "^FO1,1^FDc^FS"], vec!["^FO1,1^SN1^FS", "^FO1,1^FDc^FS"]]);
+        assert!(matches!(&pages[2].0.instructions[0], DrawInstruction::DrawText { text, .. } if text == "2"));
     }
 
     #[test]

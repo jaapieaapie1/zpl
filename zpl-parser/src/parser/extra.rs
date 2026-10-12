@@ -56,7 +56,28 @@ impl Parser<'_> {
             (false, "FN") => Ok(Command::FieldNumber {
                 number: param(params, 0).chars().take_while(char::is_ascii_digit).collect::<String>().parse().unwrap_or(0),
             }),
-            (false, "SN") => Ok(Command::SerializationData { start: param(params, 0).to_string() }),
+            (false, "SN") => Ok(Command::SerializationData {
+                start: match params.first() {
+                    None | Some(&"") => "1".to_string(),
+                    Some(v) => v.to_string(),
+                },
+                increment: match param(params, 1) {
+                    "" => 1,
+                    s => s.parse().ok()?,
+                },
+                leading_zeros: self.yes_no_or(params, 2, false, span).ok()?,
+            }),
+            (false, "SF") => {
+                let mask = param(params, 0).to_ascii_uppercase();
+                if mask.is_empty() || !mask.chars().all(|c| matches!(c, 'D' | 'H' | 'O' | 'A' | 'N' | '%')) {
+                    return None;
+                }
+                let increment = match param(params, 1) {
+                    "" => "1".to_string(),
+                    s => s.to_string(),
+                };
+                Ok(Command::SerializationField { mask, increment })
+            }
             (false, "DF") => Ok(Command::DownloadFormat { name: param(params, 0).to_string() }),
             (false, "XF") => Ok(Command::RecallFormat { name: param(params, 0).to_string() }),
             (true, "DG") => self.parse_download_graphic(params, span),

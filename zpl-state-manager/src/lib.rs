@@ -1,10 +1,14 @@
 mod charset;
 mod clock;
+mod pages;
 #[cfg(feature = "source-map")]
 mod source_map;
 
 #[cfg(feature = "source-map")]
 pub use source_map::Source;
+
+pub use pages::{Page, MAX_PAGES};
+use pages::{PageLog, Serial};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -172,6 +176,30 @@ pub enum DrawInstruction {
     Reverse(Box<DrawInstruction>),
 }
 
+impl DrawInstruction {
+    /// The field data a text, barcode or symbol was drawn from, for swapping in another
+    /// value (^SN / ^SF serialization). Renderers derive everything else, such as barcode
+    /// interpretation lines, from it.
+    pub fn field_data_mut(&mut self) -> Option<&mut String> {
+        match self {
+            DrawInstruction::DrawText { text: data, .. }
+            | DrawInstruction::DrawBarcode { data, .. }
+            | DrawInstruction::DrawLinear { data, .. }
+            | DrawInstruction::DrawQrCode { data, .. }
+            | DrawInstruction::DrawDataMatrix { data, .. }
+            | DrawInstruction::DrawPdf417 { data, .. }
+            | DrawInstruction::DrawAztec { data, .. }
+            | DrawInstruction::DrawSymbol { data, .. } => Some(data),
+            DrawInstruction::Reverse(inner) => inner.field_data_mut(),
+            DrawInstruction::DrawBox { .. }
+            | DrawInstruction::DrawCircle { .. }
+            | DrawInstruction::DrawEllipse { .. }
+            | DrawInstruction::DrawDiagonalLine { .. }
+            | DrawInstruction::DrawGraphicField { .. } => None,
+        }
+    }
+}
+
 /// Symbology and resolved sizes (in dots) for `DrawInstruction::DrawSymbol`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SymbolSpec {
@@ -295,6 +323,8 @@ struct Field {
     clock: Option<(char, Option<char>, Option<char>)>,
     /// ^FE indicator.
     embed: Option<char>,
+    /// ^SN / ^SF: how the data changes from one printed copy to the next.
+    serial: Option<Serial>,
 }
 
 impl Default for Field {
@@ -311,6 +341,7 @@ impl Default for Field {
             orientation: None,
             clock: None,
             embed: None,
+            serial: None,
         }
     }
 }
@@ -379,6 +410,13 @@ pub struct StateManager {
     save_image: Option<(String, bool)>,
     /// Index of this format's first instruction in the output.
     format_start: usize,
+
+    /// ^PQ total labels and replicates of each serial number, for this format.
+    quantity: u32,
+    replicates: u32,
+    /// Where each label ends, recorded only by [`StateManager::process_pages`].
+    page_log: Option<PageLog>,
+    max_pages: usize,
 }
 
 /// ^GS symbols by field data character.
@@ -528,6 +566,11 @@ impl StateManager {
             images: HashMap::new(),
             save_image: None,
             format_start: 0,
+
+            quantity: 1,
+            replicates: 1,
+            page_log: None,
+            max_pages: MAX_PAGES,
         }
     }
 
@@ -539,6 +582,37 @@ impl StateManager {
         }
 
         instructions
+    }
+
+    /// Like [`StateManager::process`], but split into the labels that would be printed: one
+    /// page per ^XA...^XZ format that draws anything, repeated for ^PQ copies with ^SN /
+    /// ^SF fields serialized. Always returns at least one (possibly blank) page and at most
+    /// [`MAX_PAGES`] (see [`StateManager::set_max_pages`]).
+    ///
+    /// Page settings (^PW, ^LL, ^PO, ^PM) carry over from one format to the next, as on a
+    /// printer; each page has the settings in effect at its ^XZ.
+    pub fn process_pages(&mut self, commands: Vec<Command>) -> Vec<Page> {
+        self.page_log = Some(PageLog::default());
+        let mut out = Vec::new();
+        for command in commands {
+            self.process_command(command, &mut out);
+        }
+        let extra = vec![(); out.len()];
+        self.paginate(out, extra).into_iter().map(|(page, _)| page).collect()
+    }
+
+    /// Caps the number of pages [`StateManager::process_pages`] returns, so `^PQ99999999`
+    /// cannot exhaust memory. Defaults to [`MAX_PAGES`].
+    pub fn set_max_pages(&mut self, max_pages: usize) {
+        self.max_pages = max_pages.max(1);
+    }
+
+    /// Ends the page log started by `process_pages`, cutting `out` and the parallel `extra`
+    /// into pages. Anything drawn after the last ^XZ is a final page.
+    fn paginate<T: Clone>(&mut self, out: Vec<DrawInstruction>, extra: Vec<T>) -> Vec<(Page, Vec<T>)> {
+        let mut log = self.page_log.take().unwrap_or_default();
+        log.page_break(out.len(), self.page_setup(), self.quantity, self.replicates);
+        log.paginate(out, extra, self.page_setup(), self.max_pages)
     }
 
     /// Sets the real-time clock used by ^FC fields to `secs` since the Unix epoch, in
@@ -609,7 +683,14 @@ impl StateManager {
                 self.reset_format_state();
                 self.format_start = out.len();
             }
-            Command::EndFormat => self.end_format(out),
+            Command::EndFormat => {
+                self.end_format(out);
+                self.format_start = out.len();
+                let setup = self.page_setup();
+                if let Some(log) = &mut self.page_log {
+                    log.page_break(out.len(), setup, self.quantity, self.replicates);
+                }
+            }
 
             Command::LabelHome { x, y } => {
                 self.label_home_x = x;
@@ -820,7 +901,13 @@ impl StateManager {
                 };
                 self.set_symbol(orientation, spec);
             }
-            Command::SerializationData { start } => self.field.data = Some(start),
+            Command::SerializationData { start, increment, leading_zeros } => {
+                self.field.data = Some(start);
+                self.field.serial = Some(Serial::Number { increment, leading_zeros });
+            }
+            Command::SerializationField { mask, increment } => {
+                self.field.serial = Some(Serial::Mask { mask, increment });
+            }
 
             Command::FieldSeperator => {
                 let field = std::mem::take(&mut self.field);
@@ -939,7 +1026,10 @@ impl StateManager {
             Command::DownloadFormat { name } => self.recording = Some((stored_name(&name), Vec::new())),
             Command::RecallFormat { name } => self.recall = Some(stored_name(&name)),
 
-            Command::PrintQuality { .. } => {}
+            Command::PrintQuantity { total, replicate_count, .. } => {
+                self.quantity = total.max(1);
+                self.replicates = replicate_count.unwrap_or(1).max(1);
+            }
             Command::Comment { .. } => {}
             Command::Unknown { .. } => {}
         }
@@ -983,6 +1073,13 @@ impl StateManager {
         let Some(data) = replayed.or(field.data) else { return };
         if let Some(n) = field.number {
             self.format_values.insert(n, data.clone());
+        }
+
+        if let (Some(serial), Some(log)) = (field.serial, &mut self.page_log) {
+            // ^GS data picks symbols rather than printing; it isn't serialized.
+            if !matches!(field.mode, FieldMode::GraphicSymbol { .. }) {
+                log.serial(out.len(), data.clone(), serial);
+            }
         }
 
         let (x, y) = self.origin();
@@ -1149,6 +1246,8 @@ impl StateManager {
         self.format_values.clear();
         self.save_image = None;
         self.label_reverse = false;
+        self.quantity = 1;
+        self.replicates = 1;
     }
 }
 
@@ -1301,6 +1400,84 @@ mod tests {
     fn bad_parameters_skip_the_command() {
         let ins = run("^XA^FOx,1^GB5,5,1^FS^CI99^FO1,1^FDok^FS^XZ");
         assert_eq!(texts(&ins), ["ok"]);
+    }
+
+    fn pages(zpl: &str) -> Vec<Page> {
+        StateManager::new().process_pages(Parser::new(zpl).parse().unwrap())
+    }
+
+    fn page_texts(pages: &[Page]) -> Vec<Vec<String>> {
+        pages.iter().map(|p| texts(&p.instructions)).collect()
+    }
+
+    #[test]
+    fn one_page_per_label() {
+        let zpl = "^XA^PW400^FO1,1^FDa^FS^XZ^XA^FO1,1^FDb^FS^FO1,1^FDc^FS^XZ^XA^LL300^FO1,1^FDd^FS^XZ";
+        let pages = pages(zpl);
+        assert_eq!(page_texts(&pages), [vec!["a"], vec!["b", "c"], vec!["d"]]);
+        // Page settings carry over to later labels.
+        let sizes: Vec<_> = pages.iter().map(|p| (p.setup.width, p.setup.height)).collect();
+        assert_eq!(sizes, [(400, 1218), (400, 1218), (400, 300)]);
+        // The flat output is unchanged.
+        assert_eq!(texts(&run(zpl)), ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn formats_that_draw_nothing_are_skipped() {
+        let zpl = "~DGR:LOGO.GRF,2,1,FF00^XA^DFR:T.ZPL^FS^FO1,1^FN1^FS^XZ^XA^XZ\
+                   ^XA^FO1,1^FDbg^FS^ISR:BG.GRF,N^XZ^XA^XFR:T.ZPL^FN1^FDhi^FS^XZ^FO1,1^FDafter^FS";
+        assert_eq!(page_texts(&pages(zpl)), [vec!["hi"], vec!["after"]]);
+        // No ^XA / ^XZ at all.
+        assert_eq!(page_texts(&pages("^FO1,1^FDloose^FS")), [vec!["loose"]]);
+    }
+
+    #[test]
+    fn blank_input_gives_one_blank_page() {
+        for zpl in ["", "^XA^XZ", "^XA^PW100^LL50^DFR:T.ZPL^FS^XZ"] {
+            let pages = pages(zpl);
+            assert_eq!(pages.len(), 1, "{zpl}");
+            assert!(pages[0].instructions.is_empty());
+        }
+        assert_eq!(pages("^XA^PW100^LL50^XZ")[0].setup.width, 100);
+    }
+
+    #[test]
+    fn print_quantity_copies() {
+        let pages = pages("^XA^PQ3^FO1,1^FDa^FS^XZ^XA^FO1,1^FDb^FS^XZ");
+        assert_eq!(page_texts(&pages), [vec!["a"], vec!["a"], vec!["a"], vec!["b"]]);
+    }
+
+    #[test]
+    fn serialized_copies() {
+        let zpl = "^XA^PQ4^FO1,1^SNA008,1,Y^FS^FO1,1^FDstatic^FS^FO1,1^FR^BCN,50^SN10,-5^FS^XZ";
+        let pages = pages(zpl);
+        let data = |p: &Page| -> Vec<String> {
+            p.instructions.clone().iter_mut().map(|i| i.field_data_mut().unwrap().clone()).collect()
+        };
+        let all: Vec<_> = pages.iter().map(data).collect();
+        assert_eq!(
+            all,
+            // 10 - 15 wraps around to 95.
+            [["A008", "static", "10"], ["A009", "static", "5"], ["A010", "static", "0"], ["A011", "static", "95"]]
+        );
+        assert!(matches!(&pages[1].instructions[2], DrawInstruction::Reverse(inner) if matches!(**inner, DrawInstruction::DrawBarcode { .. })));
+    }
+
+    #[test]
+    fn serial_replicates() {
+        let pages = pages("^XA^PQ5,0,2^FO1,1^FDLOT-1^SFD^FS^XZ");
+        assert_eq!(page_texts(&pages), [["LOT-1"], ["LOT-1"], ["LOT-2"], ["LOT-2"], ["LOT-3"]]);
+        // ^PQ resets at the next format.
+        assert_eq!(page_texts(&self::pages("^XA^PQ2^FO1,1^SN1^FS^XZ^XA^FO1,1^SN1^FS^XZ")), [["1"], ["2"], ["1"]]);
+    }
+
+    #[test]
+    fn page_count_is_capped() {
+        assert_eq!(pages("^XA^PQ99999999^FO1,1^FDa^FS^XZ").len(), MAX_PAGES);
+        let mut state = StateManager::new();
+        state.set_max_pages(3);
+        let pages = state.process_pages(Parser::new("^XA^PQ2^FO1,1^FDa^FS^XZ^XA^PQ5^FO1,1^FDb^FS^XZ").parse().unwrap());
+        assert_eq!(page_texts(&pages), [["a"], ["a"], ["b"]]);
     }
 
     #[test]

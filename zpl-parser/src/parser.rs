@@ -763,7 +763,7 @@ impl<'a> Parser<'a> {
             self.parse_yes_no(params[3], span)?
         };
 
-        Ok(Command::PrintQuality {
+        Ok(Command::PrintQuantity {
             total,
             pause_count,
             replicate_count,

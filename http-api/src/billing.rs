@@ -74,7 +74,7 @@ impl Billing {
     pub fn from_env() -> Result<Option<(Arc<Billing>, tokio::task::JoinHandle<()>)>, String> {
         let Some(keys) = var("ZPL_KEYS_PUBLIC_KEYS") else { return Ok(None) };
         let verifier = Verifier::from_config(&keys).map_err(|e| format!("ZPL_KEYS_PUBLIC_KEYS: {e}"))?;
-        let console_url = var("ZPL_CONSOLE_URL").unwrap_or_else(|| "https://zpl.jaapelst.nl/console".into());
+        let console_url = var("ZPL_CONSOLE_URL").unwrap_or_else(|| "https://caretly.dev/console".into());
 
         let (usage, publisher) = match var("ZPL_AMQP_URL") {
             Some(url) => {

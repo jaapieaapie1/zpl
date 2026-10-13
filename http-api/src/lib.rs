@@ -23,7 +23,7 @@
 //!   with the duration of each stage, which browser devtools display as well. `read`
 //!   includes decompressing the body.
 //! - With API keys enabled (`ZPL_KEYS_PUBLIC_KEYS`, see [`billing`]), `/render` needs
-//!   `Authorization: Bearer <key>` from https://zpl.jaapelst.nl/console. Responses carry
+//!   `Authorization: Bearer <key>` from https://caretly.dev/console. Responses carry
 //!   `X-Labels-Billed`: the pages billed for a live key, 0 for a test key, whose labels
 //!   get a watermark. Without that setting the API is open, as for local use.
 //! - `GET /health` returns `ok`.

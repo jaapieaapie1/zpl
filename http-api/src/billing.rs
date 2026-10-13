@@ -258,11 +258,16 @@ async fn poll_revocations(billing: std::sync::Weak<Billing>, url: String, token:
 /// is gone and the queue is empty (server shutdown).
 async fn publish(url: String, mut rx: mpsc::Receiver<UsageEvent>) {
     let mut pending: Option<UsageEvent> = None;
+    // Log a failure once, not every retry (DNS is often not ready when a pod starts).
+    let mut failing = false;
     loop {
-        match publish_until_error(&url, &mut rx, &mut pending).await {
+        match publish_until_error(&url, &mut rx, &mut pending, &mut failing).await {
             Ok(()) => return,
             Err(e) => {
-                eprintln!("publishing usage failed, retrying in 2 s: {e}");
+                if !failing {
+                    eprintln!("publishing usage failed, retrying every 2 s: {e}");
+                    failing = true;
+                }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
@@ -273,8 +278,12 @@ async fn publish_until_error(
     url: &str,
     rx: &mut mpsc::Receiver<UsageEvent>,
     pending: &mut Option<UsageEvent>,
+    failing: &mut bool,
 ) -> Result<(), lapin::Error> {
     let connection = Connection::connect(url, ConnectionProperties::default()).await?;
+    if std::mem::take(failing) {
+        eprintln!("connected to RabbitMQ again, publishing usage");
+    }
     let channel = connection.create_channel().await?;
     channel.confirm_select(ConfirmSelectOptions::default()).await?;
     let durable = ExchangeDeclareOptions { durable: true, ..Default::default() };

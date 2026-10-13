@@ -13,18 +13,26 @@
 //!   over) and their pages follow in upload order, so `page`, `X-Page-Count` and the page
 //!   cap count across all files. `X-File-Page-Counts` gives each file's pages (`2, 1`).
 //!   A parse error names the file; the whole request is capped at 16 MiB.
+//! - Request bodies, raw or multipart, may be compressed with `Content-Encoding: gzip` (or
+//!   `deflate`, zlib-wrapped as HTTP has it):
+//!   `gzip -c label.zpl | curl --data-binary @- -H 'Content-Encoding: gzip' 'https://…/render?format=pdf'`.
+//!   The 16 MiB cap applies to the decompressed body, checked while inflating, so a small
+//!   gzip that inflates past it gets 413 without being inflated in full. Corrupt gzip is a
+//!   400 and any other encoding a 415, whose `Accept-Encoding` lists the supported ones.
 //! - Add `timings` (`?timings` or `?format=png&timings=1`) to get a `Server-Timing` header
-//!   with the duration of each stage, which browser devtools display as well.
+//!   with the duration of each stage, which browser devtools display as well. `read`
+//!   includes decompressing the body.
 //! - `GET /health` returns `ok`.
 //! - `GET /playground/` serves the live ZPL editor (`zpl-wasm/www`), which renders in the
 //!   browser with WebAssembly. Files come from `ZPL_PLAYGROUND_DIR`; a `.gz` next to a
 //!   file is sent instead when the client accepts gzip.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use axum::body::to_bytes;
+use axum::body::{to_bytes, Body};
 use axum::extract::multipart::MultipartError;
 use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Query, Request};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -33,6 +41,8 @@ use axum::routing::{get, post};
 use axum::Router;
 use pdf_renderer::PdfRenderer;
 use png_renderer::PngRenderer;
+use tower_http::decompression::RequestDecompressionLayer;
+use tower_http::map_request_body::MapRequestBodyLayer;
 use tower_http::services::ServeDir;
 use zpl_parser::Parser;
 use zpl_state_manager::{StateManager, DEFAULT_DPMM, DPMM_VALUES, MAX_PAGES};
@@ -53,8 +63,16 @@ pub fn router() -> Router {
 
 pub fn router_with_playground(dir: &Path) -> Router {
     Router::new()
-        // The raw body has its own limit; this one is for multipart forms.
-        .route("/render", post(render).layer(DefaultBodyLimit::max(MAX_BODY_BYTES)))
+        // The raw body has its own limit; this one is for multipart forms. Both count the
+        // decompressed bytes, as the body is inflated before the handler reads it. The
+        // chained layers need their (never used) error type spelled out.
+        .route(
+            "/render",
+            post(render)
+                .layer::<_, Infallible>(DefaultBodyLimit::max(MAX_BODY_BYTES))
+                .layer::<_, Infallible>(MapRequestBodyLayer::new(Body::new))
+                .layer::<_, Infallible>(RequestDecompressionLayer::new()),
+        )
         .route("/health", get(|| async { "ok" }))
         // The page loads its scripts relative to itself, so it needs the trailing slash.
         .route("/playground", get(|| async { Redirect::permanent("/playground/") }))
@@ -256,6 +274,9 @@ async fn render(Query(params): Query<HashMap<String, String>>, request: Request)
             Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
                 return error(StatusCode::PAYLOAD_TOO_LARGE, format!("body exceeds {MAX_BODY_BYTES} bytes"))
             }
+            Err(e) if is_decompress_error(&e) => {
+                return error(StatusCode::BAD_REQUEST, format!("invalid compressed body: {}", e.body_text()))
+            }
             Err(e) => return error(e.status(), format!("failed to read form: {}", e.body_text())),
         }
     } else {
@@ -263,6 +284,9 @@ async fn render(Query(params): Query<HashMap<String, String>>, request: Request)
             Ok(body) => Input::Label(zpl_text(body.into())),
             Err(e) if is_length_limit(&e) => {
                 return error(StatusCode::PAYLOAD_TOO_LARGE, format!("body exceeds {MAX_BODY_BYTES} bytes"))
+            }
+            Err(e) if is_decompress_error(&e) => {
+                return error(StatusCode::BAD_REQUEST, format!("invalid compressed body: {e}"))
             }
             Err(e) => return error(StatusCode::BAD_REQUEST, format!("failed to read body: {e}")),
         }
@@ -332,6 +356,19 @@ fn is_length_limit(e: &axum::Error) -> bool {
     false
 }
 
+/// Whether reading the body failed because it does not decompress. The decompressor
+/// reports corrupt or truncated input as an invalid-data or unexpected-EOF I/O error.
+fn is_decompress_error(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(e);
+    while let Some(err) = source {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            return matches!(io.kind(), std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof);
+        }
+        source = err.source();
+    }
+    false
+}
+
 /// `Server-Timing` header value; durations are in milliseconds.
 fn server_timing(stages: &[(&str, Duration)]) -> String {
     stages
@@ -347,6 +384,8 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     const LABEL: &str = "^XA^FO50,50^A0N,40,40^FDhello^FS^FO50,120^BCN,60,Y,N,N^FD12345^FS^XZ";
@@ -611,6 +650,124 @@ mod tests {
         // A multipart content type without a boundary.
         let request = Request::post("/render").header(header::CONTENT_TYPE, "multipart/form-data").body(Body::from(LABEL)).unwrap();
         assert_eq!(router().oneshot(request).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    async fn post_encoded(uri: &str, encoding: &str, content_type: Option<&str>, body: impl Into<Body>) -> Response {
+        let mut request = Request::post(uri).header(header::CONTENT_ENCODING, encoding);
+        if let Some(content_type) = content_type {
+            request = request.header(header::CONTENT_TYPE, content_type);
+        }
+        router().oneshot(request.body(body.into()).unwrap()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn gzip_body_renders_like_plain() {
+        for uri in ["/render?format=png", "/render?format=pdf"] {
+            let plain = post(uri, LABEL).await;
+            let gzipped = post_encoded(uri, "gzip", None, gzip(LABEL.as_bytes())).await;
+            assert_eq!(gzipped.status(), StatusCode::OK, "{uri}");
+            assert_eq!(page_count(&gzipped), page_count(&plain));
+            assert_eq!(body_bytes(gzipped).await, body_bytes(plain).await, "{uri}");
+        }
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, LABEL.as_bytes()).unwrap();
+        let deflated = post_encoded("/render?format=png", "deflate", None, encoder.finish().unwrap()).await;
+        assert_eq!(deflated.status(), StatusCode::OK);
+        assert_eq!(body_bytes(deflated).await, body_bytes(post("/render?format=png", LABEL).await).await);
+
+        // `identity` is the same as no encoding.
+        assert_eq!(post_encoded("/render", "identity", None, LABEL).await.status(), StatusCode::OK);
+
+        // `read` covers inflating the body.
+        let response = post_encoded("/render?timings", "gzip", None, gzip(LABEL.as_bytes())).await;
+        assert!(response.headers()["server-timing"].to_str().unwrap().starts_with("read;dur="));
+    }
+
+    #[tokio::test]
+    async fn gzip_multipart_body() {
+        let parts: &[(&str, Option<&str>, &[u8])] = &[("file", Some("a.zpl"), LABEL.as_bytes()), ("file", Some("b.zpl"), LABEL.as_bytes())];
+        let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
+        let response = post_encoded("/render", "gzip", Some(&content_type), gzip(&form(parts))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-file-page-counts"], "1, 1");
+    }
+
+    /// An endless gzip stream: `prefix`, then zeros forever. Each piece is a raw deflate
+    /// run ended by a full flush, so the pieces concatenate into one valid stream. Counts
+    /// the compressed bytes the server pulls into `pulled`.
+    fn endless_gzip(prefix: &[u8], pulled: Arc<AtomicUsize>) -> Body {
+        let deflate = |data: &[u8]| {
+            let mut compress = flate2::Compress::new(flate2::Compression::best(), false);
+            let mut out = Vec::with_capacity(data.len() + 1024);
+            compress.compress_vec(data, &mut out, flate2::FlushCompress::Full).unwrap();
+            out
+        };
+        let header = [&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff][..], &deflate(prefix)].concat();
+        let zeros = deflate(&[0; 1 << 20]);
+        let chunks = std::iter::once(header).chain(std::iter::repeat(zeros)).map(move |chunk| {
+            pulled.fetch_add(chunk.len(), Ordering::Relaxed);
+            Ok::<_, Infallible>(chunk)
+        });
+        Body::from_stream(futures_util::stream::iter(chunks))
+    }
+
+    #[tokio::test]
+    async fn gzip_limit_counts_decompressed_bytes() {
+        // A 1 MiB run of zeros deflates to about 1 KiB, so 16 MiB is under 20 KiB on the wire.
+        let start = Instant::now();
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let response = post_encoded("/render", "gzip", None, endless_gzip(b"^XA", pulled.clone())).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let pulled = pulled.load(Ordering::Relaxed);
+        assert!(pulled < 64 * 1024, "read {pulled} compressed bytes");
+
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let head = format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"bomb.zpl\"\r\n\r\n");
+        let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
+        let response = post_encoded("/render", "gzip", Some(&content_type), endless_gzip(head.as_bytes(), pulled.clone())).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let pulled = pulled.load(Ordering::Relaxed);
+        assert!(pulled < 64 * 1024, "read {pulled} compressed bytes");
+        assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+
+        // Just under the limit is fine, though it compresses to almost nothing.
+        let mut label = b"^XA^FO1,1^FDok^FS^XZ".to_vec();
+        label.resize(MAX_BODY_BYTES, b' ');
+        assert_eq!(post_encoded("/render", "gzip", None, gzip(&label)).await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rejects_bad_encodings() {
+        let response = post_encoded("/render", "gzip", None, LABEL).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let message = String::from_utf8(body_bytes(response).await).unwrap();
+        assert!(message.starts_with("invalid compressed body"), "{message}");
+
+        let compressed = gzip(LABEL.as_bytes());
+        let truncated = compressed[..compressed.len() - 10].to_vec();
+        let response = post_encoded("/render", "gzip", None, truncated).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let message = String::from_utf8(body_bytes(response).await).unwrap();
+        assert!(message.starts_with("invalid compressed body"), "{message}");
+
+        let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
+        let response = post_encoded("/render", "gzip", Some(&content_type), form(&[("file", Some("a.zpl"), LABEL.as_bytes())])).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let message = String::from_utf8(body_bytes(response).await).unwrap();
+        assert!(message.contains("invalid compressed body"), "{message}");
+
+        for encoding in ["compress", "x-gzip", "gzip, gzip"] {
+            let response = post_encoded("/render", encoding, None, gzip(LABEL.as_bytes())).await;
+            assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{encoding}");
+            assert_eq!(response.headers()[header::ACCEPT_ENCODING], "gzip,deflate");
+        }
     }
 
     #[test]

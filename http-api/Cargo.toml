@@ -15,8 +15,10 @@ pdf-renderer = { path = "../pdf-renderer" }
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 http-body-util = "0.1"
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.6", features = ["fs", "decompression-gzip", "decompression-deflate", "map-request-body"] }
 
 [dev-dependencies]
+flate2 = "1.0"
+futures-util = "0.3"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }

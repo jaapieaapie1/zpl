@@ -30,7 +30,7 @@ bk_codabar 0.01
 bl_logmars 0.33
 bm_msi 0.01
 bp_plessey 0.01
-bq_module_width 34.84
+bq_module_width 32.52
 br_databar_expanded 0.00
 br_databar_omni 0.00
 bs_upc_ean_extension 0.81
@@ -70,7 +70,7 @@ fd_line_breaks 0.03
 fh_barcode_bytes 0.00
 fh_hex 1.06
 fo_justification 0.00
-fo_right_symbols 37.34
+fo_right_symbols 35.93
 font_0_dashes 0.00
 font_0_orientations 1.40
 font_0_sizes 0.33
@@ -102,7 +102,7 @@ fp_reverse_end 0.05
 fp_reverse_rotated 0.00
 fp_vertical 10.15
 fr_field_reverse 0.01
-ft_barcodes 27.91
+ft_barcodes 26.49
 ft_graphics 0.00
 ft_rotated_text 0.00
 ft_vs_fo_text 8.02
@@ -141,13 +141,13 @@ pm_mirror 0.27
 po_inverted 0.27
 pq_copies 0.02
 pw_print_width 0.24
-qr_ecc_levels 24.35
-qr_magnification 46.27
-qr_mixed_mode 35.80
+qr_ecc_levels 8.63
+qr_magnification 30.09
+qr_mixed_mode 19.32
 qr_model1 100.00
-qr_model2 31.32
-qr_orientations 31.46
-qr_placement 23.37
+qr_model2 18.12
+qr_orientations 11.38
+qr_placement 7.76
 sf_serial_field 0.00
 sn_serial_number 0.01
 sn_sf_padding 0.00

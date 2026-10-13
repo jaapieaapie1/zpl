@@ -10,21 +10,27 @@
 
 use qr_core::{BitMatrix, EcLevel};
 use qr_encode::Options;
+use zpl_parser::command::Orientation;
 
 /// The ^BQ mask when none (or one outside 0-7) is given (docs/commands/zpl/BQ.md).
 pub const DEFAULT_MASK: u8 = 7;
 
 /// Top-left corner of a `size` x `size` module QR symbol of `module` dot modules. The
-/// symbol is never turned (^FW has no effect, docs/commands/zpl/BQ.md). ^FO puts its
-/// top-left corner on the origin, ^FT its bottom-left (docs/commands/zpl/FT.md: the origin
-/// of a bar code is its base, at the left edge); right justified (z=1) its right edge.
-/// Labelary instead moves an ^FO symbol 10 dots down (right when rotated 270) and keeps an
-/// ^FT one 3 modules above the origin.
-pub fn top_left(x: u32, y: u32, size: u32, module: u32, bottom: bool, right: bool) -> (u32, u32) {
-    let side = size * module;
-    let x = if right { x.saturating_sub(side) } else { x };
-    let y = if bottom { y.saturating_sub(side) } else { y };
-    (x, y)
+/// symbol is never turned (^FW has no effect, docs/commands/zpl/BQ.md), but placed as Zebra
+/// printers (and Labelary) place it, not on the field origin FO.md / FT.md describe (user
+/// decision 2026-10-14, compat/SPEC_DECISIONS.md): a 10 dot band above it in its own frame
+/// is turned, so ^FO normal moves the symbol down by it, ^FO B (270) right. ^FT puts the
+/// bottom edge 3 modules above the origin, whatever the orientation; right justified (z=1)
+/// its right edge is 3 modules left of it.
+pub fn top_left(x: u32, y: u32, size: u32, module: u32, orientation: Orientation, bottom: bool, right: bool) -> (u32, u32) {
+    const BAND: u32 = 10;
+    let x = if right { x.saturating_sub((size + 3) * module) } else { x };
+    match (bottom, orientation) {
+        (true, _) => (x, y.saturating_sub((size + 3) * module)),
+        (false, Orientation::Normal) => (x, y + BAND),
+        (false, Orientation::Rotated270) => (x + BAND, y),
+        (false, _) => (x, y),
+    }
 }
 
 /// Character mode of the data segment.
@@ -164,12 +170,17 @@ mod tests {
     }
 
     #[test]
-    fn placement_is_the_field_origin() {
-        // ^FO: top-left corner on the origin (FO.md); ^FT: the base at the origin (FT.md).
-        assert_eq!(top_left(100, 200, 21, 4, false, false), (100, 200));
-        assert_eq!(top_left(100, 200, 21, 4, true, false), (100, 200 - 84));
-        // Right justified: the right edge on x.
-        assert_eq!(top_left(400, 200, 21, 4, true, true), (400 - 84, 200 - 84));
+    fn placement_follows_the_printer() {
+        // Printer behaviour, not FO.md / FT.md (user decision 2026-10-14, SPEC_DECISIONS.md):
+        // ^FO adds a 10 dot band (down for N, right for B), ^FT lifts the base 3 modules.
+        let at = |o, bottom| top_left(100, 200, 21, 4, o, bottom, false);
+        assert_eq!(at(Orientation::Normal, false), (100, 210));
+        assert_eq!(at(Orientation::Rotated90, false), (100, 200));
+        assert_eq!(at(Orientation::Rotated180, false), (100, 200));
+        assert_eq!(at(Orientation::Rotated270, false), (110, 200));
+        assert_eq!(at(Orientation::Rotated90, true), (100, 200 - 96));
+        // Right justified: the right edge 3 modules left of x.
+        assert_eq!(top_left(400, 200, 21, 4, Orientation::Normal, true, true), (400 - 96, 200 - 96));
     }
 
     #[test]

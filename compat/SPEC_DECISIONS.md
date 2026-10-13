@@ -86,7 +86,7 @@ Paths are relative to `docs/commands/`.
 | ^B7 grid without rows or columns | `zpl/B7.md`: "Default: 1:2 (row-to-column aspect ratio)", but the example puts 72 code words in 6 columns and 12 rows (2:1) | height:width of about 1:2 at 3-module rows | Labelary's | b: the rule and the example disagree, Labelary matches neither literally. Open question |
 | PDF417 / MicroPDF417 compaction choices | silent | as described | same | b |
 | ^BQ mask | `zpl/BQ.md` e: "mask value 0 - 7, Default: 7" | ignored (lowest penalty) | the given mask, else 7 | c. Cases: `qr_*`, `bq_module_width`, `fo_right_symbols`, `ft_barcodes` |
-| ^BQ position | `zpl/FO.md`: the upper-left corner of the field; `zpl/FT.md` Table 7: a bar code's origin is its base at the left edge; `zpl/BQ.md`: "^FW has no effect on rotation" | ^FO: 10 dots down (right for B); ^FT: base 3 modules above the origin | ^FO: top-left on the origin; ^FT: base on the origin | c: same cases. Labelary's offset may be real printer behaviour; see open questions |
+| ^BQ position | `zpl/FO.md`: the upper-left corner of the field; `zpl/FT.md` Table 7: a bar code's origin is its base at the left edge; `zpl/BQ.md`: "^FW has no effect on rotation" | ^FO: 10 dots down (right for B); ^FT: base 3 modules above the origin | ^FO: 10 dots down (right for B); ^FT: base 3 modules above the origin | printer behaviour (user decision 2026-10-14): 10-dot ^FO offset / 3-module ^FT lift, deviates from FO.md/FT.md. Real Zebra printers shift QR codes this way and Labelary mirrors it, so the cases are not tagged for it |
 | ^BQ sets the ^BY module width of later barcodes | `zpl/BY.md`: "it stays in effect until another ^BY command is encountered" | sets it | leaves it | c. Cases: `bq_module_width` |
 | ^BQ default magnification by resolution | `zpl/BQ.md` c: 1 / 2 / 3 / 6 at 150 / 200 / 300 / 600 dpi | same | same | a |
 | ^BQ error correction raised within the version | `zpl/BQ.md`: silent | raised | raised | b (also a Zebra printer behaviour, kept by earlier decision) |
@@ -109,9 +109,6 @@ Paths are relative to `docs/commands/`.
 
 Decisions above that a printer, not Labelary, should settle:
 
-- ^BQ: the spec places the symbol on the origin and defaults the mask to 7; Labelary (and
-  reportedly Zebra printers) add a 10-dot band above ^FO symbols and pick the mask. We follow
-  the spec.
 - ^B7 h: the spec multiplies by the module width (followed); the heading says "in dots".
 - ^B7 grid without rows or columns: the 1:2 rule and the 72-code-word example disagree.
 - Font 0 with only a height: as wide as tall (Labelary) or 12/15 of it (the default matrix).

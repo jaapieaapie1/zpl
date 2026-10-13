@@ -30,8 +30,8 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
             ctx, (*x, *y, *bottom, *right), *kind, data, *orientation, *height, *module_width, *wide_bar_ratio,
             *print_interpretation_line, *print_interpretation_line_above,
         ),
-        DrawInstruction::DrawQrCode { x, y, data, magnification, mask, bottom, right, .. } => {
-            render_qr_code(ctx, (*x, *y, *bottom, *right), data, *magnification, *mask)
+        DrawInstruction::DrawQrCode { x, y, data, magnification, orientation, mask, bottom, right, .. } => {
+            render_qr_code(ctx, (*x, *y, *bottom, *right), data, *magnification, *orientation, *mask)
         }
         DrawInstruction::DrawDataMatrix { .. }
         | DrawInstruction::DrawPdf417 { .. }
@@ -344,7 +344,9 @@ fn render_linear(
 }
 
 /// ^BQ, module for module as the PNG renderer draws it (`png_renderer::qr`).
-fn render_qr_code(ctx: &mut Ctx, (x, y, bottom, right): Origin, data: &str, magnification: u32, mask: Option<u32>) {
+fn render_qr_code(
+    ctx: &mut Ctx, (x, y, bottom, right): Origin, data: &str, magnification: u32, orientation: Orientation, mask: Option<u32>,
+) {
     let Some(code) = qr::encode(data, mask) else { return };
     let size = code.size;
     let module = magnification.max(1) as f32;
@@ -359,7 +361,7 @@ fn render_qr_code(ctx: &mut Ctx, (x, y, bottom, right): Origin, data: &str, magn
         }
     }
 
-    let (left, top) = qr::top_left(x, y, size, magnification.max(1), bottom, right);
+    let (left, top) = qr::top_left(x, y, size, magnification.max(1), orientation, bottom, right);
     let matrix = [1.0, 0.0, 0.0, 1.0, left as f32, top as f32];
     fill_rects(ctx, matrix, &rects);
 }
@@ -528,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn qr_sits_on_the_origin_and_merges_runs() {
+    fn qr_offsets_and_merges_runs() {
         let c = content_of(DrawInstruction::DrawQrCode {
             x: 30, y: 40, data: "QA,hello".into(), orientation: Orientation::Normal,
             model: zpl_parser::command::QrModel::Model2, magnification: 4,
@@ -536,7 +538,8 @@ mod tests {
             bottom: false,
             right: false,
         });
-        assert!(c.contains("1 0 0 1 30 40 cm"));
+        // Printer placement: 10 dots below the ^FO origin (SPEC_DECISIONS.md).
+        assert!(c.contains("1 0 0 1 30 50 cm"));
         // Top-left finder pattern: first row starts with a 7-module dark run.
         assert!(c.contains("0 0 28 4 re"));
         let code = qr::encode("QA,hello", None).unwrap();

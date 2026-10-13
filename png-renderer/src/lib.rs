@@ -931,8 +931,8 @@ impl PngRenderer {
                     *print_interpretation_line, *print_interpretation_line_above,
                 );
             }
-            DrawInstruction::DrawQrCode { x, y, data, magnification, mask, bottom, right, .. } => {
-                self.render_qr_code(image, (*x, *y, *bottom, *right), data, *magnification, *mask);
+            DrawInstruction::DrawQrCode { x, y, data, magnification, orientation, mask, bottom, right, .. } => {
+                self.render_qr_code(image, (*x, *y, *bottom, *right), data, *magnification, *orientation, *mask);
             }
             DrawInstruction::DrawDataMatrix {
                 x, y, data, orientation, module_height, symbol_height, columns, rows, escape, rectangular, bottom,
@@ -1496,12 +1496,15 @@ impl PngRenderer {
         self.place_bars(image, &temp, at, orientation, (0, 0, w, h));
     }
 
-    /// ^BQ: always upright (see [`qr::top_left`]).
-    fn render_qr_code(&self, image: &mut RgbImage, (x, y, bottom, right): Origin, data: &str, magnification: u32, mask: Option<u32>) {
+    /// ^BQ: always upright; the orientation only moves it (see [`qr::top_left`]).
+    fn render_qr_code(
+        &self, image: &mut RgbImage, (x, y, bottom, right): Origin, data: &str, magnification: u32, orientation: Orientation,
+        mask: Option<u32>,
+    ) {
         let Some(code) = qr::encode(data, mask) else { return };
         let module = magnification.max(1);
         let side = code.size * module;
-        let (x, y) = qr::top_left(x, y, code.size, module, bottom, right);
+        let (x, y) = qr::top_left(x, y, code.size, module, orientation, bottom, right);
         self.note_drawn(x as i64, y as i64, side, side);
         for row in 0..code.size {
             for col in 0..code.size {
@@ -1890,9 +1893,9 @@ mod tests {
         assert_eq!(bounds[1], Some(Bounds { x: 350, y: 250, width: 50, height: 50 }));
         let text = bounds[2].unwrap();
         assert!(text.x >= 40 && text.x <= 60 && text.y >= 90 && text.y <= 110 && text.height >= 20, "{text:?}");
-        // The QR code's top-left on its ^FO origin (docs/commands/zpl/FO.md).
+        // The QR code 10 dots below its ^FO origin, as printers place it (SPEC_DECISIONS.md).
         let qr = bounds[3].unwrap();
-        assert_eq!((qr.x, qr.y), (200, 10));
+        assert_eq!((qr.x, qr.y), (200, 20));
         assert_eq!(bounds[4], Some(Bounds { x: 20, y: 200, width: 30, height: 30 }));
     }
 
@@ -2116,19 +2119,15 @@ mod tests {
             ("^FT150,800^B0I,5,N,0^FDAZTEC ROTATION^FS", (55, 800, 149, 894)),
             ("^FT450,800^B0B,5,N,0^FDAZTEC ROTATION^FS", (355, 705, 449, 799)),
         ]);
-        // QR codes never turn; ^FO puts the top-left on the origin, ^FT the base (FO.md,
-        // FT.md). Labelary moves ^FO symbols down (N) or right (B) by 10 dots and ends ^FT
-        // ones 3 modules above the origin.
-        assert_boxes(
-            &[
-                ("^FO50,50^BQR,2,4^FDQA,ROTATED^FS", (50, 50, 133, 133)),
-                ("^FWB^FO300,400^BQ,2,4^FDQA,FW IGNORED^FS", (300, 400, 383, 483)),
-                ("^FT300,200^BQN,2,2^FDQA,FT MAG2^FS", (300, 158, 341, 199)),
-                ("^FT300,500^BQB,2,4^FDQA,FT B^FS", (300, 416, 383, 499)),
-                ("^FO500,50^BQN,2^FDQA,DEFAULT MAG^FS", (500, 50, 541, 91)),
-            ],
-            "spec",
-        );
+        // QR codes never turn; ^FO R and B only move the 10 dot band, ^FT ends 3 modules up.
+        // Printer behaviour, not FO.md / FT.md (user decision 2026-10-14, SPEC_DECISIONS.md).
+        assert_matches_labelary(&[
+            ("^FO50,50^BQR,2,4^FDQA,ROTATED^FS", (50, 50, 133, 133)),
+            ("^FWB^FO300,400^BQ,2,4^FDQA,FW IGNORED^FS", (310, 400, 393, 483)),
+            ("^FT300,200^BQN,2,2^FDQA,FT MAG2^FS", (300, 152, 341, 193)),
+            ("^FT300,500^BQB,2,4^FDQA,FT B^FS", (300, 404, 383, 487)),
+            ("^FO500,50^BQN,2^FDQA,DEFAULT MAG^FS", (500, 60, 541, 101)),
+        ]);
         // Placed like 1D bars: ^FO puts the rotated symbol's top-left on the origin, ^FT the
         // unrotated bottom-left corner, rotated with the symbol.
         assert_matches_labelary(&[

@@ -2,7 +2,7 @@
 
 use zpl_tokenizer::Span;
 
-use super::Parser;
+use super::{Parser, graphic};
 use crate::{
     command::{Code49Interpretation, Command, FieldDirection, LinearKind, LineColor, MsiCheck, Orientation, PostalKind, TextLayout},
     error::ParseError,
@@ -298,24 +298,25 @@ impl Parser<'_> {
     }
 
     /// Decodes ~DG / ~DY bitmap data: Z64/B64, or (compressed) ASCII hex.
-    fn decode_graphic(&self, raw: &str, bytes_per_row: u32) -> Result<Vec<u8>, ParseError> {
+    /// `size_hint` is the declared byte count.
+    fn decode_graphic(&self, raw: &str, bytes_per_row: u32, size_hint: u32) -> Result<Vec<u8>, ParseError> {
         let raw = raw.trim();
         if raw.starts_with(":Z64:") || raw.starts_with(":B64:") {
-            let compact: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
-            self.decode_z64_data(&compact)
+            self.decode_z64_data(&graphic::without_whitespace(raw))
         } else {
-            Ok(self.decode_hex_data(raw, bytes_per_row))
+            Ok(self.decode_hex_data(raw, bytes_per_row, size_hint))
         }
     }
 
     fn parse_download_graphic(&self, params: &[&str], span: Span) -> Result<Command, ParseError> {
         // ~DGd:o.x,t,w,data
+        let total = self.u32_or(params, 1, 0, span).unwrap_or(0);
         let bytes_per_row = self.u32_or(params, 2, 0, span)?;
-        let raw = params.get(3..).map(|rest| rest.join(",")).unwrap_or_default();
+        let raw = graphic::data_param(params, 3);
         Ok(Command::DownloadGraphic {
             name: param(params, 0).to_string(),
             bytes_per_row,
-            data: self.decode_graphic(&raw, bytes_per_row)?,
+            data: self.decode_graphic(&raw, bytes_per_row, total)?,
         })
     }
 
@@ -323,21 +324,21 @@ impl Parser<'_> {
     /// PNG, ...) are ignored.
     fn parse_download_object(&self, params: &[&str], span: Span) -> Option<Result<Command, ParseError>> {
         let format = param(params, 1).to_ascii_uppercase();
-        let raw = || params.get(5..).map(|rest| rest.join(",")).unwrap_or_default();
+        let raw = || graphic::data_param(params, 5);
         match param(params, 2).to_ascii_uppercase().as_str() {
             "G" => {}
             // TrueType (T), TrueType extension (E) and OpenType (O... firmware dependent).
             "T" | "E" | "O" => {
                 let raw = raw();
                 let data = if raw.trim_start().starts_with(':') {
-                    match self.decode_graphic(&raw, 0) {
+                    match self.decode_graphic(&raw, 0, 0) {
                         Ok(d) => d,
                         Err(e) => return Some(Err(e)),
                     }
                 } else if format == "A" {
                     decode_hex(&raw)
                 } else {
-                    raw.into_bytes()
+                    raw.into_owned().into_bytes()
                 };
                 return Some(Ok(Command::DownloadFont { name: param(params, 0).to_string(), data }));
             }
@@ -347,11 +348,12 @@ impl Parser<'_> {
             Ok(v) => v,
             Err(e) => return Some(Err(e)),
         };
-        let raw = params.get(5..).map(|rest| rest.join(",")).unwrap_or_default();
+        let total = self.u32_or(params, 3, 0, span).unwrap_or(0);
+        let raw = raw();
         let data = if param(params, 1).eq_ignore_ascii_case("A") || raw.trim_start().starts_with(':') {
-            self.decode_graphic(&raw, bytes_per_row)
+            self.decode_graphic(&raw, bytes_per_row, total)
         } else {
-            Ok(raw.into_bytes())
+            Ok(raw.into_owned().into_bytes())
         };
         Some(data.map(|data| Command::DownloadGraphic { name: param(params, 0).to_string(), bytes_per_row, data }))
     }

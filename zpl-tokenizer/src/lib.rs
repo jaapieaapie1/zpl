@@ -207,7 +207,14 @@ impl<'a> Tokenizer<'a> {
     /// data parameter extending to the next `^` or `~`.
     fn raw_command(&mut self, prefix: CommandPrefix, name: &'a str, start: usize, leading: usize) -> Token<'a> {
         let rest = &self.input[self.position..];
-        let end = rest.find([self.caret, self.tilde]).unwrap_or(rest.len());
+        // Graphic data runs to tens of kilobytes: scan bytes rather than chars when the
+        // prefixes are ASCII (as they practically always are).
+        let end = if self.caret.is_ascii() && self.tilde.is_ascii() {
+            find_either(rest.as_bytes(), self.caret as u8, self.tilde as u8)
+        } else {
+            rest.find([self.caret, self.tilde])
+        }
+        .unwrap_or(rest.len());
         self.position += end;
         let params = rest[..end].splitn(leading + 1, self.delimiter).map(str::trim).collect();
         Token::Command { prefix, name, params, span: Span { start, end: self.position } }
@@ -363,6 +370,19 @@ impl<'a> Tokenizer<'a> {
 
         Some(token)
     }
+}
+
+/// Index of the first `a` or `b` in `haystack`. Tests whole 32-byte chunks without
+/// branching, which the compiler vectorises, and only then looks for the exact position.
+fn find_either(haystack: &[u8], a: u8, b: u8) -> Option<usize> {
+    let mut offset = 0;
+    for chunk in haystack.chunks(32) {
+        if chunk.iter().fold(false, |found, &c| found | (c == a) | (c == b)) {
+            return chunk.iter().position(|&c| c == a || c == b).map(|i| offset + i);
+        }
+        offset += chunk.len();
+    }
+    None
 }
 
 impl<'a> Iterator for Tokenizer<'a> {
@@ -790,5 +810,18 @@ mod tests {
         }
 
         assert_eq!(tokens[3], Token::FieldSeparator);
+    }
+
+    #[test]
+    fn find_either_matches_a_plain_search() {
+        for len in [0, 1, 31, 32, 33, 64, 100] {
+            for at in 0..=len {
+                let mut haystack = vec![b'A'; len];
+                if at < len {
+                    haystack[at] = if at % 2 == 0 { b'^' } else { b'~' };
+                }
+                assert_eq!(find_either(&haystack, b'^', b'~'), (at < len).then_some(at));
+            }
+        }
     }
 }

@@ -10,6 +10,8 @@
 //!   on `ZPL_AMQP_URL`, from a background task: the response never waits for RabbitMQ.
 //!   Up to [`QUEUE_LIMIT`] messages wait in memory while RabbitMQ is away.
 //! - Test keys render free, with a watermark on every label.
+//! - Each key is rate limited (`ZPL_RATE_LIMIT_PER_SECOND`, `ZPL_RATE_LIMIT_BURST`), see
+//!   [`crate::rate_limit`]: over it, 429 with `Retry-After`.
 //!
 //! `ZPL_CONSOLE_URL` is the console's public address, named in error messages.
 
@@ -26,6 +28,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::console::{KeyEnv, RevocationList, TokenError, UsageEvent, Verifier, USAGE_EXCHANGE};
+use crate::rate_limit::{Decision, RateLimiter, DEFAULT_BURST, DEFAULT_PER_SECOND};
 
 /// Usage messages kept while RabbitMQ is unreachable; beyond this they are dropped
 /// (unbilled) rather than growing without bound.
@@ -39,6 +42,7 @@ pub struct Billing {
     verifier: Verifier,
     revoked: RwLock<Revoked>,
     usage: Option<mpsc::Sender<UsageEvent>>,
+    rate_limit: Option<RateLimiter>,
     console_url: String,
 }
 
@@ -75,6 +79,10 @@ impl Billing {
         let Some(keys) = var("ZPL_KEYS_PUBLIC_KEYS") else { return Ok(None) };
         let verifier = Verifier::from_config(&keys).map_err(|e| format!("ZPL_KEYS_PUBLIC_KEYS: {e}"))?;
         let console_url = var("ZPL_CONSOLE_URL").unwrap_or_else(|| "https://caretly.dev/console".into());
+        let rate_limit = RateLimiter::from_env()?;
+        if rate_limit.is_none() {
+            eprintln!("ZPL_RATE_LIMIT_PER_SECOND or ZPL_RATE_LIMIT_BURST is 0: API keys are not rate limited");
+        }
 
         let (usage, publisher) = match var("ZPL_AMQP_URL") {
             Some(url) => {
@@ -86,7 +94,7 @@ impl Billing {
                 (None, tokio::spawn(async {}))
             }
         };
-        let billing = Arc::new(Billing { verifier, revoked: RwLock::default(), usage, console_url });
+        let billing = Arc::new(Billing { verifier, revoked: RwLock::default(), usage, rate_limit, console_url });
         match (var("ZPL_CONSOLE_INTERNAL_URL"), var("ZPL_CONSOLE_TOKEN")) {
             (Some(url), Some(token)) => {
                 tokio::spawn(poll_revocations(Arc::downgrade(&billing), url, token));
@@ -96,9 +104,44 @@ impl Billing {
         Ok(Some((billing, publisher)))
     }
 
-    /// For tests: keys only, no console or RabbitMQ.
+    /// For tests: keys only, no console or RabbitMQ, the default rate limit.
     pub fn with_verifier(verifier: Verifier, usage: Option<mpsc::Sender<UsageEvent>>) -> Arc<Billing> {
-        Arc::new(Billing { verifier, revoked: RwLock::default(), usage, console_url: "https://console.test".into() })
+        Self::with_rate_limit(verifier, usage, RateLimiter::new(DEFAULT_PER_SECOND, DEFAULT_BURST))
+    }
+
+    /// For tests: like [`with_verifier`](Self::with_verifier) with the given rate limit.
+    pub fn with_rate_limit(
+        verifier: Verifier,
+        usage: Option<mpsc::Sender<UsageEvent>>,
+        rate_limit: Option<RateLimiter>,
+    ) -> Arc<Billing> {
+        let console_url = "https://console.test".into();
+        Arc::new(Billing { verifier, revoked: RwLock::default(), usage, rate_limit, console_url })
+    }
+
+    /// Takes one request from the caller's rate limit. Gives the `RateLimit-Limit` and
+    /// `RateLimit-Remaining` headers for the response (none without a limit), or the 429
+    /// to send instead.
+    pub fn rate_limit(&self, caller: &Caller) -> Result<HeaderMap, Response> {
+        let mut headers = HeaderMap::new();
+        let Some(limiter) = &self.rate_limit else { return Ok(headers) };
+        let decision = limiter.check(caller.key_id);
+        let remaining = match decision {
+            Decision::Allowed { remaining } => remaining,
+            Decision::Limited { .. } => 0,
+        };
+        headers.insert("ratelimit-limit", HeaderValue::from(limiter.burst()));
+        headers.insert("ratelimit-remaining", HeaderValue::from(remaining));
+        let Decision::Limited { retry_after } = decision else { return Ok(headers) };
+        let (per_second, burst) = (limiter.per_second(), limiter.burst());
+        let message = format!(
+            "Too many requests for this API key: the limit is {per_second} per second, with bursts of {burst}. \
+             Retry after {retry_after} s."
+        );
+        let mut response = (StatusCode::TOO_MANY_REQUESTS, message).into_response();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
+        response.headers_mut().extend(headers);
+        Err(response)
     }
 
     /// Replaces the revocation list (from the console, or in tests).

@@ -26,6 +26,9 @@
 //!   `Authorization: Bearer <key>` from https://caretly.dev/console. Responses carry
 //!   `X-Labels-Billed`: the pages billed for a live key, 0 for a test key, whose labels
 //!   get a watermark. Without that setting the API is open, as for local use.
+//!   Each key is rate limited ([`rate_limit`]; by default 50 requests a second with
+//!   bursts of 200, per replica): over it, `/render` answers 429 with `Retry-After`.
+//!   `RateLimit-Limit` and `RateLimit-Remaining` give the burst and what is left of it.
 //! - `GET /health` returns `ok`.
 //! - `GET /playground/` serves the live ZPL editor (`zpl-wasm/www`), which renders in the
 //!   browser with WebAssembly. Files come from `ZPL_PLAYGROUND_DIR`; a `.gz` next to a
@@ -33,6 +36,7 @@
 
 pub mod billing;
 pub mod console;
+pub mod rate_limit;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -319,13 +323,19 @@ async fn render(
 ) -> Response {
     let start = Instant::now();
 
-    // Check the key before reading a possibly large body.
-    let caller = match &billing {
-        Some(billing) => match billing.authenticate(request.headers()) {
-            Ok(caller) => Some(caller),
-            Err(response) => return response,
-        },
-        None => None,
+    // Check the key and its rate limit before reading a possibly large body.
+    let (caller, limit_headers) = match &billing {
+        Some(billing) => {
+            let caller = match billing.authenticate(request.headers()) {
+                Ok(caller) => caller,
+                Err(response) => return response,
+            };
+            match billing.rate_limit(&caller) {
+                Ok(headers) => (Some(caller), headers),
+                Err(response) => return response,
+            }
+        }
+        None => (None, HeaderMap::new()),
     };
     let watermark = caller.as_ref().filter(|c| c.is_test()).map(|_| TEST_WATERMARK);
 
@@ -420,6 +430,7 @@ async fn render(
     )
         .into_response();
     response.headers_mut().insert("x-page-count", HeaderValue::from(rendered.page_count));
+    response.headers_mut().extend(limit_headers);
     if let (Some(billing), Some(caller)) = (&billing, &caller) {
         // A PNG response is one page, whatever the input holds.
         let (labels, kind) = match format {
@@ -506,6 +517,7 @@ mod tests {
         use super::*;
         use crate::console::tests::{EXPIRED, KEYS, LIVE, TEST};
         use crate::console::{KeyEnv, Revocation, RevocationList, Verifier};
+        use crate::rate_limit::RateLimiter;
         use tokio::sync::mpsc;
 
         fn billing() -> (Arc<Billing>, mpsc::Receiver<crate::console::UsageEvent>) {
@@ -606,6 +618,90 @@ mod tests {
             // File boundaries count: "ab" + "c" is not "a" + "bc".
             let files = |a: &str, b: &str| Input::Files(vec![("f".into(), a.into()), ("f".into(), b.into())]);
             assert_ne!(files("ab", "c").fingerprint(Format::Pdf, 1, 8), files("a", "bc").fingerprint(Format::Pdf, 1, 8));
+        }
+
+        /// A rate limit on a clock that only moves by `advance(ms)`.
+        fn limited(per_second: u32, burst: u32) -> (Arc<Billing>, impl Fn(u64)) {
+            let start = Instant::now();
+            let elapsed = Arc::new(AtomicUsize::new(0));
+            let clock = elapsed.clone();
+            let limiter = RateLimiter::new(per_second, burst)
+                .unwrap()
+                .with_clock(move || start + Duration::from_millis(clock.load(Ordering::Relaxed) as u64));
+            let billing = Billing::with_rate_limit(Verifier::from_config(KEYS).unwrap(), None, Some(limiter));
+            (billing, move |ms: u64| {
+                elapsed.fetch_add(ms as usize, Ordering::Relaxed);
+            })
+        }
+
+        #[tokio::test]
+        async fn rate_limit_burst_then_429() {
+            let (billing, _advance) = limited(1, 3);
+            for remaining in ["2", "1", "0"] {
+                let response = send(&billing, "/render?format=png", Some(LIVE), &[]).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers()["ratelimit-limit"], "3");
+                assert_eq!(response.headers()["ratelimit-remaining"], remaining);
+            }
+            let limited = send(&billing, "/render?format=png", Some(LIVE), &[]).await;
+            assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(limited.headers()[header::RETRY_AFTER], "1");
+            assert_eq!(limited.headers()["ratelimit-remaining"], "0");
+            assert!(text(limited).await.starts_with("Too many requests for this API key"));
+            // The test key has the same key id (0xb), so it shares the bucket.
+            assert_eq!(send(&billing, "/render", Some(TEST), &[]).await.status(), StatusCode::TOO_MANY_REQUESTS);
+            // A bad key is turned away before it counts against anything.
+            assert_eq!(send(&billing, "/render", None, &[]).await.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn rate_limit_refills() {
+            // 2 a second: a token is back after 500 ms.
+            let (billing, advance) = limited(2, 1);
+            assert_eq!(send(&billing, "/render", Some(LIVE), &[]).await.status(), StatusCode::OK);
+            advance(100);
+            let response = send(&billing, "/render", Some(LIVE), &[]).await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers()[header::RETRY_AFTER], "1", "rounded up to a whole second");
+            advance(400);
+            let response = send(&billing, "/render", Some(LIVE), &[]).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["ratelimit-remaining"], "0");
+        }
+
+        #[test]
+        fn rate_limit_buckets() {
+            use crate::rate_limit::Decision::{Allowed, Limited};
+            let limiter = RateLimiter::new(2, 4).unwrap();
+            let (a, b) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+            let start = Instant::now();
+            let at = |ms: u64| start + Duration::from_millis(ms);
+            for remaining in (0..4).rev() {
+                assert_eq!(limiter.check_at(a, at(0)), Allowed { remaining });
+            }
+            assert_eq!(limiter.check_at(a, at(0)), Limited { retry_after: 1 });
+            // Other keys are independent.
+            assert_eq!(limiter.check_at(b, at(0)), Allowed { remaining: 3 });
+            // 2 a second: one token after 500 ms, none spare.
+            assert_eq!(limiter.check_at(a, at(400)), Limited { retry_after: 1 });
+            assert_eq!(limiter.check_at(a, at(500)), Allowed { remaining: 0 });
+            // Refilling stops at the burst.
+            assert_eq!(limiter.check_at(a, at(60_000)), Allowed { remaining: 3 });
+            // At 1 a second with nothing left, the wait rounds up to whole seconds.
+            let slow = RateLimiter::new(1, 1).unwrap();
+            slow.check_at(a, at(0));
+            assert_eq!(slow.check_at(a, at(100)), Limited { retry_after: 1 });
+            assert_eq!(slow.check_at(a, at(1_000)), Allowed { remaining: 0 });
+        }
+
+        #[tokio::test]
+        async fn rate_limit_disabled() {
+            let billing = Billing::with_rate_limit(Verifier::from_config(KEYS).unwrap(), None, RateLimiter::new(0, 1));
+            for _ in 0..5 {
+                let response = send(&billing, "/render", Some(LIVE), &[]).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(response.headers().get("ratelimit-remaining").is_none());
+            }
         }
 
         #[tokio::test]

@@ -6,6 +6,13 @@
 //!   page `?page=N` (1-based, default 1). The `X-Page-Count` header gives the page count.
 //!   `?dpmm=6|8|12|24` sets the printer resolution in dots per millimetre (default 8): it
 //!   sizes ^MU units, the default 4 x 6 inch label, the PDF page and the PNG in dots.
+//! - The same endpoint takes several ZPL files as `multipart/form-data`:
+//!   `curl -F file=@a.zpl -F file=@b.zpl 'https://…/render?format=pdf'`. Every part with a
+//!   filename, or named `file`, `files` or `zpl`, is a ZPL file; other fields are ignored.
+//!   Each file starts from a fresh printer (no ^PW, ^LH, ~DG graphics or ^DF formats carry
+//!   over) and their pages follow in upload order, so `page`, `X-Page-Count` and the page
+//!   cap count across all files. `X-File-Page-Counts` gives each file's pages (`2, 1`).
+//!   A parse error names the file; the whole request is capped at 16 MiB.
 //! - Add `timings` (`?timings` or `?format=png&timings=1`) to get a `Server-Timing` header
 //!   with the duration of each stage, which browser devtools display as well.
 //! - `GET /health` returns `ok`.
@@ -17,9 +24,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use axum::body::{to_bytes, Body};
-use axum::extract::Query;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::body::to_bytes;
+use axum::extract::multipart::MultipartError;
+use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Query, Request};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -27,7 +35,7 @@ use pdf_renderer::PdfRenderer;
 use png_renderer::PngRenderer;
 use tower_http::services::ServeDir;
 use zpl_parser::Parser;
-use zpl_state_manager::{StateManager, DEFAULT_DPMM, DPMM_VALUES};
+use zpl_state_manager::{StateManager, DEFAULT_DPMM, DPMM_VALUES, MAX_PAGES};
 
 /// Largest accepted ZPL body. Labels with big ^GF graphics run to a few megabytes.
 pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -45,7 +53,8 @@ pub fn router() -> Router {
 
 pub fn router_with_playground(dir: &Path) -> Router {
     Router::new()
-        .route("/render", post(render))
+        // The raw body has its own limit; this one is for multipart forms.
+        .route("/render", post(render).layer(DefaultBodyLimit::max(MAX_BODY_BYTES)))
         .route("/health", get(|| async { "ok" }))
         // The page loads its scripts relative to itself, so it needs the trailing slash.
         .route("/playground", get(|| async { Redirect::permanent("/playground/") }))
@@ -72,12 +81,15 @@ pub struct Rendered {
     pub bytes: Vec<u8>,
     /// Labels in the input; a PDF holds all of them, a PNG one.
     pub page_count: usize,
+    /// Pages from each input file, in order (one entry for a single label).
+    pub file_page_counts: Vec<usize>,
     pub timings: Vec<(&'static str, Duration)>,
 }
 
 #[derive(Debug)]
 pub enum RenderError {
-    Parse(String),
+    /// `file` names the uploaded file the error is in, if there were several.
+    Parse { file: Option<String>, message: String },
     Encode(String),
     /// The requested PNG page (1-based) does not exist.
     NoSuchPage { page: usize, page_count: usize },
@@ -86,6 +98,17 @@ pub enum RenderError {
 /// Parses, lays out and renders `zpl` for a `dpmm` dots/mm printer, timing each stage.
 /// Synchronous and CPU-bound. A PDF holds every page; a PNG shows `page` (1-based).
 pub fn render_label(zpl: &str, format: Format, page: usize, dpmm: u32) -> Result<Rendered, RenderError> {
+    render_documents(&[(None, zpl)], format, page, dpmm)
+}
+
+/// Like [`render_label`] for several `(name, zpl)` files, each on a fresh printer, their
+/// pages one after the other. `page` counts across all files, as does the page cap.
+pub fn render_files(files: &[(String, String)], format: Format, page: usize, dpmm: u32) -> Result<Rendered, RenderError> {
+    let documents: Vec<_> = files.iter().map(|(name, zpl)| (Some(name.as_str()), zpl.as_str())).collect();
+    render_documents(&documents, format, page, dpmm)
+}
+
+fn render_documents(documents: &[(Option<&str>, &str)], format: Format, page: usize, dpmm: u32) -> Result<Rendered, RenderError> {
     let mut timings = Vec::new();
     let mut last = Instant::now();
     let mut mark = |stage: &'static str| {
@@ -94,12 +117,33 @@ pub fn render_label(zpl: &str, format: Format, page: usize, dpmm: u32) -> Result
         last = now;
     };
 
-    let commands = Parser::with_dpmm(zpl, dpmm).parse().map_err(|e| RenderError::Parse(format!("{e:?}")))?;
+    // Parse everything first, so a bad file is reported before any layout work.
+    let mut parsed = Vec::with_capacity(documents.len());
+    for &(name, zpl) in documents {
+        let commands = Parser::with_dpmm(zpl, dpmm).parse().map_err(|e| RenderError::Parse {
+            file: name.map(str::to_owned),
+            message: format!("{e:?}"),
+        })?;
+        parsed.push(commands);
+    }
     mark("parse");
 
-    let mut state = StateManager::new();
-    state.set_dpmm(dpmm);
-    let pages = state.process_pages(commands);
+    // A fresh StateManager per file: one file's printer state must not leak into the next.
+    let mut pages = Vec::new();
+    let mut file_page_counts = Vec::with_capacity(parsed.len());
+    for commands in parsed {
+        let remaining = MAX_PAGES - pages.len();
+        if remaining == 0 {
+            file_page_counts.push(0);
+            continue;
+        }
+        let mut state = StateManager::new();
+        state.set_dpmm(dpmm);
+        state.set_max_pages(remaining);
+        let file_pages = state.process_pages(commands);
+        file_page_counts.push(file_pages.len());
+        pages.extend(file_pages);
+    }
     let page_count = pages.len();
     mark("state");
 
@@ -122,7 +166,7 @@ pub fn render_label(zpl: &str, format: Format, page: usize, dpmm: u32) -> Result
         }
     };
 
-    Ok(Rendered { bytes, page_count, timings })
+    Ok(Rendered { bytes, page_count, file_page_counts, timings })
 }
 
 /// Renders a small label touching every font and the QR/barcode/compression code, so the
@@ -146,7 +190,40 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, message.into()).into_response()
 }
 
-async fn render(Query(params): Query<HashMap<String, String>>, body: Body) -> Response {
+/// What a render request carries: one raw ZPL body, or `(name, zpl)` files from a form.
+enum Input {
+    Label(String),
+    Files(Vec<(String, String)>),
+}
+
+fn is_multipart(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim_start().to_ascii_lowercase().starts_with("multipart/form-data"))
+}
+
+/// The ZPL files in a form, in upload order: every part with a filename, or named `file`,
+/// `files` or `zpl`. Other fields are skipped. A file is named after its filename, or else
+/// its field name and position (`zpl #2`), for error messages.
+async fn read_files(mut multipart: Multipart) -> Result<Vec<(String, String)>, MultipartError> {
+    let mut files = Vec::new();
+    let mut index = 0;
+    while let Some(field) = multipart.next_field().await? {
+        index += 1;
+        let field_name = field.name().unwrap_or("");
+        let name = match field.file_name() {
+            Some(file_name) => file_name.to_owned(),
+            None if matches!(field_name, "file" | "files" | "zpl") => format!("{field_name} #{index}"),
+            None => continue,
+        };
+        let bytes = field.bytes().await?;
+        files.push((name, zpl_text(bytes.into())));
+    }
+    Ok(files)
+}
+
+async fn render(Query(params): Query<HashMap<String, String>>, request: Request) -> Response {
     let start = Instant::now();
 
     let format = match params.get("format").map(String::as_str) {
@@ -166,28 +243,52 @@ async fn render(Query(params): Query<HashMap<String, String>>, body: Body) -> Re
     };
     let timings_enabled = params.get("timings").is_some_and(|v| !matches!(v.as_str(), "0" | "false"));
 
-    let body = match to_bytes(body, MAX_BODY_BYTES).await {
-        Ok(body) => body,
-        Err(e) if is_length_limit(&e) => {
-            return error(StatusCode::PAYLOAD_TOO_LARGE, format!("body exceeds {MAX_BODY_BYTES} bytes"))
+    let input = if is_multipart(request.headers()) {
+        let multipart = match Multipart::from_request(request, &()).await {
+            Ok(multipart) => multipart,
+            Err(rejection) => return rejection.into_response(),
+        };
+        match read_files(multipart).await {
+            Ok(files) if files.is_empty() => {
+                return error(StatusCode::BAD_REQUEST, "no ZPL files in the form; send them as `file` parts")
+            }
+            Ok(files) => Input::Files(files),
+            Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                return error(StatusCode::PAYLOAD_TOO_LARGE, format!("body exceeds {MAX_BODY_BYTES} bytes"))
+            }
+            Err(e) => return error(e.status(), format!("failed to read form: {}", e.body_text())),
         }
-        Err(e) => return error(StatusCode::BAD_REQUEST, format!("failed to read body: {e}")),
+    } else {
+        match to_bytes(request.into_body(), MAX_BODY_BYTES).await {
+            Ok(body) => Input::Label(zpl_text(body.into())),
+            Err(e) if is_length_limit(&e) => {
+                return error(StatusCode::PAYLOAD_TOO_LARGE, format!("body exceeds {MAX_BODY_BYTES} bytes"))
+            }
+            Err(e) => return error(StatusCode::BAD_REQUEST, format!("failed to read body: {e}")),
+        }
     };
     let read = start.elapsed();
-
-    let zpl = zpl_text(body.into());
 
     // Rendering is CPU-bound (PNG takes milliseconds), so keep it off the async workers.
     let queued = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
         let queue = queued.elapsed();
-        render_label(&zpl, format, page, dpmm).map(|rendered| (queue, rendered))
+        let rendered = match &input {
+            Input::Label(zpl) => render_label(zpl, format, page, dpmm),
+            Input::Files(files) => render_files(files, format, page, dpmm),
+        };
+        rendered.map(|rendered| (queue, rendered, matches!(input, Input::Files(_))))
     })
     .await;
 
-    let (queue, rendered) = match result {
+    let (queue, rendered, multipart) = match result {
         Ok(Ok(ok)) => ok,
-        Ok(Err(RenderError::Parse(e))) => return error(StatusCode::BAD_REQUEST, format!("parse error: {e}")),
+        Ok(Err(RenderError::Parse { file: None, message })) => {
+            return error(StatusCode::BAD_REQUEST, format!("parse error: {message}"))
+        }
+        Ok(Err(RenderError::Parse { file: Some(file), message })) => {
+            return error(StatusCode::BAD_REQUEST, format!("parse error in {file}: {message}"))
+        }
         Ok(Err(RenderError::Encode(e))) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("encode error: {e}")),
         Ok(Err(RenderError::NoSuchPage { page, page_count })) => {
             return error(StatusCode::BAD_REQUEST, format!("page {page} out of range; the label has {page_count} page(s)"))
@@ -201,6 +302,11 @@ async fn render(Query(params): Query<HashMap<String, String>>, body: Body) -> Re
     )
         .into_response();
     response.headers_mut().insert("x-page-count", HeaderValue::from(rendered.page_count));
+    if multipart {
+        let counts: Vec<_> = rendered.file_page_counts.iter().map(usize::to_string).collect();
+        let value = HeaderValue::from_str(&counts.join(", ")).expect("page counts are ASCII");
+        response.headers_mut().insert("x-file-page-counts", value);
+    }
 
     if timings_enabled {
         let mut stages = vec![("read", read), ("queue", queue)];
@@ -238,6 +344,7 @@ fn server_timing(stages: &[(&str, Duration)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -379,6 +486,131 @@ mod tests {
         assert_eq!(get("/playground/missing.js").await.unwrap().status(), StatusCode::NOT_FOUND);
         assert_eq!(get("/playground/../Cargo.toml").await.unwrap().status(), StatusCode::NOT_FOUND);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const BOUNDARY: &str = "zpl-test-boundary";
+
+    /// A multipart/form-data body of `(field name, filename, contents)` parts.
+    fn form(parts: &[(&str, Option<&str>, &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (name, file_name, contents) in parts {
+            body.extend(format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"").bytes());
+            if let Some(file_name) = file_name {
+                body.extend(format!("; filename=\"{file_name}\"").bytes());
+            }
+            body.extend(b"\r\n\r\n");
+            body.extend(*contents);
+            body.extend(b"\r\n");
+        }
+        body.extend(format!("--{BOUNDARY}--\r\n").bytes());
+        body
+    }
+
+    async fn post_form(uri: &str, parts: &[(&str, Option<&str>, &[u8])]) -> Response {
+        let request = Request::post(uri)
+            .header(header::CONTENT_TYPE, format!("multipart/form-data; boundary={BOUNDARY}"))
+            .body(Body::from(form(parts)))
+            .unwrap();
+        router().oneshot(request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn multipart_files_follow_each_other() {
+        let two = format!("{LABEL}{LABEL}");
+        let parts: &[(&str, Option<&str>, &[u8])] = &[
+            ("file", Some("a.zpl"), two.as_bytes()),
+            ("note", None, b"not a label"),
+            ("file", Some("b.zpl"), LABEL.as_bytes()),
+        ];
+        let response = post_form("/render?format=pdf", parts).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/pdf");
+        assert_eq!(page_count(&response), "3");
+        assert_eq!(response.headers()["x-file-page-counts"], "2, 1");
+        let pdf = body_bytes(response).await;
+        assert_eq!(String::from_utf8_lossy(&pdf).matches("/Type /Page\n").count(), 3);
+
+        // Without a filename the field name decides; non-UTF-8 is Latin-1 as for a raw body.
+        let parts: &[(&str, Option<&str>, &[u8])] = &[("zpl", None, LABEL.as_bytes()), ("files", None, b"^XA^FD\xe9^FS^XZ")];
+        let response = post_form("/render", parts).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(page_count(&response), "2");
+
+        // A raw body is one file and gets no per-file header.
+        assert!(post("/render", LABEL).await.headers().get("x-file-page-counts").is_none());
+    }
+
+    #[tokio::test]
+    async fn multipart_files_get_a_fresh_printer() {
+        // File 1 stores a graphic and sets a 400 dot width; file 2 relies on neither.
+        let first = "~DGR:BOX.GRF,8,1,FFFFFFFFFFFFFFFF^XA^PW400^FO0,0^XGR:BOX.GRF,4,4^FS^XZ";
+        let second = "^XA^FO0,0^XGR:BOX.GRF,4,4^FS^XZ";
+        let width = |png: &[u8]| u32::from_be_bytes(png[16..20].try_into().unwrap());
+        let parts: &[(&str, Option<&str>, &[u8])] =
+            &[("file", Some("first.zpl"), first.as_bytes()), ("file", Some("second.zpl"), second.as_bytes())];
+
+        let response = post_form("/render?format=png", parts).await;
+        assert_eq!(width(&body_bytes(response).await), 400);
+        let response = post_form("/render?format=png&page=2", parts).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let isolated = body_bytes(response).await;
+        assert_eq!(width(&isolated), 812);
+
+        // Page 2 is file 2 on its own, without file 1's graphic...
+        let alone = body_bytes(post("/render?format=png", second).await).await;
+        assert_eq!(isolated, alone);
+        // ...which a single body sharing one printer does draw.
+        let shared = body_bytes(post("/render?format=png&page=2", format!("{first}{second}")).await).await;
+        assert_ne!(isolated, shared);
+    }
+
+    #[tokio::test]
+    async fn multipart_png_page_counts_across_files() {
+        let a = "^XA^PW100^FO1,1^GB10,10,10^FS^XZ";
+        let b = "^XA^PW200^FO1,1^GB10,10,10^FS^XZ^XA^PW300^FO1,1^GB10,10,10^FS^XZ";
+        let parts: &[(&str, Option<&str>, &[u8])] = &[("file", Some("a.zpl"), a.as_bytes()), ("file", Some("b.zpl"), b.as_bytes())];
+        let width = |png: &[u8]| u32::from_be_bytes(png[16..20].try_into().unwrap());
+
+        for (page, dots) in [(1, 100), (2, 200), (3, 300)] {
+            let response = post_form(&format!("/render?format=png&page={page}"), parts).await;
+            assert_eq!(response.status(), StatusCode::OK, "page={page}");
+            assert_eq!(page_count(&response), "3");
+            assert_eq!(width(&body_bytes(response).await), dots, "page={page}");
+        }
+        let response = post_form("/render?format=png&page=4", parts).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn multipart_page_cap_spans_files() {
+        let many = "^XA^PQ999^FO1,1^FDa^FS^XZ";
+        let parts: &[(&str, Option<&str>, &[u8])] = &[
+            ("file", Some("a.zpl"), many.as_bytes()),
+            ("file", Some("b.zpl"), many.as_bytes()),
+            ("file", Some("c.zpl"), many.as_bytes()),
+        ];
+        let response = post_form("/render", parts).await;
+        assert_eq!(page_count(&response), MAX_PAGES.to_string());
+        assert_eq!(response.headers()["x-file-page-counts"], "999, 1, 0");
+    }
+
+    #[tokio::test]
+    async fn multipart_rejects_bad_input() {
+        let response = post_form("/render", &[("note", None, b"hello")]).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&body_bytes(response).await).contains("no ZPL files"));
+        assert_eq!(post_form("/render", &[]).await.status(), StatusCode::BAD_REQUEST);
+
+        // The parser keeps malformed commands as unknown ones rather than failing, so a
+        // "parse error in <file>" cannot be provoked here.
+
+        let huge = vec![b'A'; MAX_BODY_BYTES + 1];
+        let response = post_form("/render", &[("file", Some("huge.zpl"), &huge)]).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // A multipart content type without a boundary.
+        let request = Request::post("/render").header(header::CONTENT_TYPE, "multipart/form-data").body(Body::from(LABEL)).unwrap();
+        assert_eq!(router().oneshot(request).await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

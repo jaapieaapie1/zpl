@@ -54,8 +54,8 @@ const FIXED_EM: (f32, f32) = (0.82, 0.945);
 /// Fonts P–V: fixed-size renditions of the scalable font 0 (H x W in dots at magnification 1).
 fn fixed_scalable(font: FontName) -> Option<(u32, u32)> {
     Some(match font {
-        // The tables say 20 x 18; Labelary draws P as if 17 wide (compat/cases/font_p).
-        FontName::FontP => (20, 17),
+        // docs/commands/other/FONTS.md: 20 x 18 (Labelary draws P as if 17 wide).
+        FontName::FontP => (20, 18),
         FontName::FontQ => (28, 24),
         FontName::FontR => (35, 31),
         FontName::FontS => (40, 35),
@@ -577,6 +577,16 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
     {
         text = Cow::Owned(mapped);
     }
+    // docs/commands/zpl/FB.md: a block narrower than the font's width (or 0, not given)
+    // prints nothing. Fonts P-V count their full matrix width.
+    let char_w = match field.bitmap {
+        Some(b) => b.cell_w,
+        None if custom_font.is_none() && fixed_scalable(*font).is_some() => field.size_x / FIXED_EM.1,
+        None => field.size_x,
+    };
+    if block.as_ref().is_some_and(|b| b.clip_height.is_none() && (b.width as f32) < char_w - 0.01) {
+        return;
+    }
     let text: &str = &text;
     field.notdef = layout.default_glyph;
     field.justification = *justification;
@@ -676,17 +686,17 @@ fn render_line(ctx: &mut Ctx, field: &Field, text: &Shown, back: f32) {
     field.in_frame(ctx, matrix, |ctx, ox, oy| field.show_line(ctx, text, ox - back, oy + baseline));
 }
 
-/// ^FPV: one character per line, top to bottom, each starting at the origin's x. Labelary
-/// ignores the character gap here.
+/// ^FPV: one character per line, top to bottom, each starting at the origin's x, the ^FP
+/// gap between the lines (docs/commands/zpl/FP.md; Labelary ignores the gap here).
 fn render_vertical(ctx: &mut Ctx, field: &Field, text: &str) {
-    let step = field.line_h;
+    let step = field.line_h + field.gap;
     let count = text.chars().count();
     let widest = text.chars().map(|c| field.char_width(&ctx.fonts, c)).fold(0.0, f32::max);
     let first = match field.anchor {
         TextAnchor::Top => field.ascent,
         TextAnchor::Baseline => -field.rise,
     };
-    let matrix = field.frame(widest, step * count as f32);
+    let matrix = field.frame(widest, step * count.saturating_sub(1) as f32 + field.line_h);
     field.in_frame(ctx, matrix, |ctx, ox, oy| {
         let mut buf = [0u8; 4];
         for (i, c) in text.chars().enumerate() {
@@ -704,6 +714,8 @@ struct Line {
     para: usize,
     /// Last line of a paragraph (before `\&` or the end): never stretched when justified.
     para_end: bool,
+    /// Part of a word split over lines, printed with a hyphen after it (^FB).
+    hyphen: bool,
 }
 
 /// Resolves the ^FB escapes: `\\` is a backslash and `\&` a forced line break. Returns the
@@ -738,14 +750,16 @@ fn split_paragraphs(text: &str) -> (Cow<'_, str>, Vec<Range<usize>>) {
 /// Greedy word wrap of `text[para]` (paragraph number `index`) into lines no wider than
 /// `avail(line_index)` dots (`None` = no limit). `width(byte, i, c)` is the width that
 /// character `c` at byte offset `byte` adds as the `i`-th byte of a line, gaps included.
-/// Breaks at spaces; a word wider than a line is broken between characters. The spaces at
-/// a break are dropped.
+/// Breaks at spaces; a word wider than a line is broken between characters, with room for a
+/// hyphen `hyphen` dots wide at the right edge when given (^FB, docs/commands/zpl/FB.md).
+/// The spaces at a break are dropped.
 fn wrap(
     text: &str,
     para: Range<usize>,
     index: usize,
     avail: impl Fn(usize) -> Option<f32>,
     width: impl Fn(usize, usize, char) -> f32,
+    hyphen: Option<f32>,
     lines: &mut Vec<Line>,
 ) {
     let mut start = para.start;
@@ -755,9 +769,14 @@ fn wrap(
         let mut w = 0.0;
         let mut last_space = None;
         let mut cut = None;
+        // Last break inside the line that leaves room for the hyphen.
+        let mut hyphen_cut = None;
         if let Some(limit) = limit {
             for (i, c) in rest.char_indices() {
                 let cw = width(start + i, i, c);
+                if i > 0 && hyphen.is_some_and(|h| w + h <= limit + 0.01) {
+                    hyphen_cut = Some(i);
+                }
                 if c == ' ' {
                     // Only a space after some content is a usable break.
                     if i > 0 {
@@ -771,19 +790,24 @@ fn wrap(
             }
         }
         let Some(cut) = cut else {
-            lines.push(Line { range: start..para.end, para: index, para_end: true });
+            lines.push(Line { range: start..para.end, para: index, para_end: true, hyphen: false });
             return;
         };
-        let end = match last_space {
+        let (end, split) = match last_space {
             Some(sp) => {
                 // Break at the start of the run of spaces before the overflowing word.
                 let line = &rest[..sp];
-                line.trim_end_matches(' ').len()
+                (line.trim_end_matches(' ').len(), false)
             }
-            None => cut,
+            None if hyphen.is_some() => {
+                // At least one character on the line, the hyphen after it.
+                let first = rest.chars().next().map_or(cut, char::len_utf8);
+                (hyphen_cut.unwrap_or(first).max(first), true)
+            }
+            None => (cut, false),
         };
         let end = if end == 0 { cut } else { end };
-        lines.push(Line { range: start..start + end, para: index, para_end: false });
+        lines.push(Line { range: start..start + end, para: index, para_end: false, hyphen: split });
         let next = start + end;
         let skipped = text[next..para.end].len() - text[next..para.end].trim_start_matches(' ').len();
         start = next + skipped;
@@ -835,10 +859,12 @@ fn render_block(
                 let k = b - para.start;
                 adv[k] + if i > 0 && starts[k] { gap } else { 0.0 }
             };
-            wrap(text, para.clone(), index, avail, at, &mut lines);
+            wrap(text, para.clone(), index, avail, at, None, &mut lines);
         } else {
             let at = |_, i: usize, c| field.char_width(fonts, c) + if i > 0 { field.gap } else { 0.0 };
-            wrap(text, para.clone(), index, avail, at, &mut lines);
+            // ^FB (not ^TB, nor ^PA text) hyphenates the words it splits.
+            let hyphen = (block.clip_height.is_none() && mode == Mode::Classic).then(|| field.char_width(fonts, '-') + field.gap);
+            wrap(text, para.clone(), index, avail, at, hyphen, &mut lines);
         }
     }
 
@@ -863,6 +889,7 @@ fn render_block(
     let shown: Vec<Shown> = lines[..keep]
         .iter()
         .map(|l| match mode {
+            Mode::Classic if l.hyphen => Shown::Text(format!("{}-", &text[l.range.clone()])),
             Mode::Classic => Shown::Plain(&text[l.range.clone()]),
             _ => {
                 let para = &paragraphs[l.para];
@@ -890,7 +917,6 @@ fn render_block(
     let box_h = block.clip_height.map_or(nominal as f32 * line_height, |h| h as f32);
     let matrix = field.placed(box_w, box_h);
 
-    let space = field.char_width(&ctx.fonts, ' ') + field.gap;
     field.in_frame(ctx, matrix, |ctx, ox, oy| {
         if let Some(h) = block.clip_height {
             // ^TB: nothing below the block (with room for overhangs on the other sides).
@@ -905,16 +931,8 @@ fn render_block(
             let baseline = oy + baseline_of(row);
             let room = if block.width > 0 { width - indent_of(i) } else { box_w - indent_of(i) };
             let left = ox + indent_of(i);
-            // Labelary justifies wrapped lines as if they still ended in the space they broke
-            // at (on the left of right-to-left lines), and centers the last line as if it
-            // ended in one too.
-            let trailing = match block.justification {
-                _ if rtl(line.para) => 0.0,
-                BlockJustification::Center if !line.para_end || i + 1 == lines.len() => space,
-                BlockJustification::Right if !line.para_end => space,
-                _ => 0.0,
-            };
-            let line_w = line_w + trailing;
+            // The space a line broke at is discarded (docs/commands/zpl/FB.md), so it does not
+            // count when centering or right-justifying; Labelary keeps it.
             let mut s = match shown {
                 Shown::Plain(s) => *s,
                 Shown::Text(s) => s.as_str(),
@@ -1316,14 +1334,18 @@ mod tests {
 
     #[test]
     fn long_word_is_broken_by_characters() {
+        // docs/commands/zpl/FB.md: a hyphen at the right edge, the rest on the next line.
         let w = em("AAA") as u32 + 1;
-        let tm = text_matrices(&content(&field("AAAAAAA", |o| o.block = Some(block(w, 10, BlockJustification::Left)))));
-        assert_eq!(tm.len(), 3, "{tm:?}");
+        let c = content(&field("AAAAAAA", |o| o.block = Some(block(w, 10, BlockJustification::Left))));
+        assert_eq!(text_matrices(&c).len(), 3, "{c}");
+        assert_eq!(c.matches("Tj").count(), 3, "{c}");
+        // A block narrower than the font prints nothing.
+        assert!(text_matrices(&content(&field("AAA", |o| o.block = Some(block(30, 10, BlockJustification::Left))))).is_empty());
     }
 
     #[test]
     fn forced_breaks_and_escaped_backslash() {
-        let c = content(&field(r"A\\B\&C\&\&D", |o| o.block = Some(block(0, 10, BlockJustification::Left))));
+        let c = content(&field(r"A\\B\&C\&\&D", |o| o.block = Some(block(400, 10, BlockJustification::Left))));
         let tm = text_matrices(&c);
         // Lines "A\B", "C", "" (not drawn), "D".
         assert_eq!(tm.len(), 3, "{c}");
@@ -1373,8 +1395,9 @@ mod tests {
     fn block_center_and_right_justification() {
         let line = em("AB");
         let c = text_matrices(&content(&field("AB", |o| o.block = Some(block(200, 1, BlockJustification::Center)))));
-        // Centred as if followed by a space (Labelary).
-        assert!(approx(c[0][4], 50.0 + (200.0 - line - em(" ")) / 2.0), "{c:?}");
+        // Centred on the text alone (FB.md discards break spaces; Labelary centres as if a
+        // space followed).
+        assert!(approx(c[0][4], 50.0 + (200.0 - line) / 2.0), "{c:?}");
         let r = text_matrices(&content(&field("AB", |o| o.block = Some(block(200, 1, BlockJustification::Right)))));
         assert!(approx(r[0][4], 50.0 + 200.0 - line), "{r:?}");
     }
@@ -1445,9 +1468,9 @@ mod tests {
             o.char_gap = 5;
         })));
         assert_eq!(tm.len(), 3);
-        // One line height apart: the gap does not apply (Labelary).
+        // One line height plus the gap apart (FP.md; Labelary ignores the gap).
         for (i, m) in tm.iter().enumerate() {
-            assert!(approx(m[4], 50.0) && approx(m[5], 90.0 + 40.0 * i as f32), "{tm:?}");
+            assert!(approx(m[4], 50.0) && approx(m[5], 90.0 + 45.0 * i as f32), "{tm:?}");
         }
     }
 
@@ -1644,7 +1667,8 @@ mod tests {
     #[test]
     fn fonts_p_to_v_are_fixed_size_font_zero() {
         let tm = text_matrices(&content(&with_font("Hi", FontName::FontP, 0, 0)));
-        assert!(approx(tm[0][0], 17.0 * 0.945) && approx(tm[0][3], -20.0 * 0.82), "{tm:?}");
+        // P is 20 x 18 (docs/commands/other/FONTS.md).
+        assert!(approx(tm[0][0], 18.0 * 0.945) && approx(tm[0][3], -20.0 * 0.82), "{tm:?}");
         let tm = text_matrices(&content(&with_font("Hi", FontName::FontQ, 56, 56)));
         assert!(approx(tm[0][0], 48.0 * 0.945) && approx(tm[0][3], -56.0 * 0.82), "{tm:?}");
     }

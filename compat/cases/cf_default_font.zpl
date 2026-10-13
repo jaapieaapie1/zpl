@@ -1,5 +1,6 @@
 ^XA
 ^FX compat: 4x3^FS
+^FX spec-deviates: CF without sizes keeps the last CF sizes (CF.md), Labelary goes back to the power-up size^FS
 ^CF0,40
 ^FO20,20^FDCF font 0 at 40^FS
 ^CFD

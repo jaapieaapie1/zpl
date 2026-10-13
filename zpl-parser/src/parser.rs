@@ -39,6 +39,18 @@ fn field_text(data: &str) -> String {
 /// Printer resolution assumed by [`Parser::new`]: 8 dots/mm (203 dpi).
 pub const DEFAULT_DPMM: u32 = 8;
 
+/// Nominal dots per inch of a `dpmm` printhead as Zebra rounds them: 152, 203, 300 and 600
+/// rather than the exact 152.4, 203.2, 304.8 and 609.6 (docs/commands/other/FONTS.md).
+pub fn nominal_dpi(dpmm: u32) -> u32 {
+    match dpmm {
+        6 => 152,
+        8 => 203,
+        12 => 300,
+        24 => 600,
+        _ => (dpmm as f32 * 25.4).round() as u32,
+    }
+}
+
 impl<'a> Parser<'a> {
     pub fn new(zpl: &'a str) -> Self {
         Self::with_dpmm(zpl, DEFAULT_DPMM)
@@ -66,8 +78,9 @@ impl<'a> Parser<'a> {
         let format_scale = desired as f32 / base as f32 * if self.half_density.get() { 2.0 } else { 1.0 };
         let per_mm = self.dpmm as f32 / format_scale;
         self.unit_scale.set(match self.units.get() {
-            // Nominal dpi: 8 dots/mm is "203 dpi" but Labelary converts 200 dots per inch.
-            'I' => per_mm * 25.0,
+            // The nominal dpi: docs/commands/zpl/MU.md converts inches at 203 dots on an
+            // 8 dots/mm printer (^MUi^FO.493 is dot 100).
+            'I' => nominal_dpi(self.dpmm) as f32 / format_scale,
             'M' => per_mm,
             _ => 1.0,
         });
@@ -1163,9 +1176,9 @@ impl<'a> Parser<'a> {
         span: Span,
     ) -> Result<DiagonalDirection, ParseError> {
         match s.to_uppercase().as_str() {
-            // Labelary draws '\' right-leaning too (the default), not left-leaning as documented.
-            "R" | "/" | "\\" => Ok(DiagonalDirection::RightToLeft),
-            "L" => Ok(DiagonalDirection::LeftToRight),
+            // docs/commands/zpl/GD.md: R (or /) leans right, L (or \) left.
+            "R" | "/" => Ok(DiagonalDirection::RightToLeft),
+            "L" | "\\" => Ok(DiagonalDirection::LeftToRight),
             _ => Err(ParseError::InvalidNumber {
                 value: s.to_string(),
                 span,

@@ -81,6 +81,8 @@ struct TextFont {
     cap: i32,
     /// Line height in dots (em size, or the bitmap cell height).
     line_h: u32,
+    /// Character width in dots (^A width, or the bitmap cell width), for ^FB's minimum.
+    char_w: u32,
     /// Bitmap fonts: (character pitch, pen offset into the cell) in dots.
     cell: Option<(f32, f32)>,
     /// Uppercase-only bitmap font (B, H).
@@ -261,8 +263,8 @@ const FIXED_EM_W: f32 = 0.945;
 /// Fonts P–V: fixed-size font 0 (H x W).
 fn fixed_scalable(font: FontName) -> Option<(u32, u32)> {
     Some(match font {
-        // The tables say 20 x 18; Labelary draws P as if 17 wide (compat/cases/font_p).
-        FontName::FontP => (20, 17),
+        // docs/commands/other/FONTS.md: 20 x 18 (Labelary draws P as if 17 wide).
+        FontName::FontP => (20, 18),
         FontName::FontQ => (28, 24),
         FontName::FontR => (35, 31),
         FontName::FontS => (40, 35),
@@ -330,6 +332,7 @@ impl TextFont {
                 y_offset,
                 cap: baseline.round() as i32,
                 line_h: cell.height * mh,
+                char_w: cell.width * mw,
                 cell: Some((cell.pitch * mw as f32, ((cell.width * mw) as f32 - advance) / 2.0)),
                 uppercase: cell.uppercase,
                 block_pitch: match name {
@@ -389,7 +392,7 @@ impl TextFont {
         let cap = (height as f32 * cap_em).round() as i32;
         let y_offset = (font.ascent_unscaled() / units_per_em * em_h - height as f32 * cap_em).round() as i32;
         let line_h = height;
-        Self { font, data, cap_em, scale, y_offset, cap, line_h, cell: None, uppercase: false, block_pitch: 1.26 }
+        Self { font, data, cap_em, scale, y_offset, cap, line_h, char_w: width, cell: None, uppercase: false, block_pitch: 1.26 }
     }
 
     /// ^GS `symbol` in the magnified 24 x 24 cell, the cell as the line height: its outline
@@ -415,7 +418,7 @@ impl TextFont {
         let cap = cell_h as i32;
         let cell = Some((cell_w as f32, -x_min / upem * em_w));
         let data = layout::FontData::Static(data);
-        Self { font, data, cap_em: 0.75, scale, y_offset, cap, line_h: cell_h, cell, uppercase: false, block_pitch: 1.26 }
+        Self { font, data, cap_em: 0.75, scale, y_offset, cap, line_h: cell_h, char_w: cell_w, cell, uppercase: false, block_pitch: 1.26 }
     }
 
     fn has_glyph(&self, c: char) -> bool {
@@ -489,7 +492,19 @@ pub(crate) fn line_gap(module: u32, above: bool, guards: bool) -> f32 {
 const GUARD_EXTENSION_ABOVE: u32 = 13;
 pub const GUARD_EXTENSION_BELOW: u32 = 13;
 
-/// EAN/UPC digits below the bars, laid out as Labelary prints them (in OCR-B; measured).
+/// Whether EAN/UPC interpretation lines of `module` dot modules print in OCR-B on a `dpmm`
+/// printhead: from module 2 at 6 dots/mm, 3 at 8, 5 at 12 and 9 at 24; narrower modules
+/// print font A (docs/commands/zpl/BU.md).
+pub fn ean_upc_ocr_b(module: u32, dpmm: u32) -> bool {
+    module >= match dpmm {
+        0..=6 => 2,
+        7..=8 => 3,
+        9..=12 => 5,
+        _ => 9,
+    }
+}
+
+/// EAN/UPC digits below the bars, laid out as Labelary prints them (measured).
 pub struct GuardedLine {
     /// Digit height in dots: 7 per module up to 3 modules, then 21, from 8 modules 42.
     pub digit_height: f32,
@@ -546,27 +561,36 @@ pub(crate) struct Interpretation {
 
 impl Interpretation {
     pub(crate) fn new(bar_width: u32) -> Self {
-        let bar_width = bar_width.min(10);
-        Self::sized(bar_width as f32 * 143.0 / 24.0, (bar_width * 7) as f32)
+        Self::new_in(DEJAVU_SANS_MONO, bar_width)
     }
 
-    /// The font unstretched, its digits `digit_height` dots tall.
-    pub(crate) fn upright(digit_height: f32) -> Self {
+    /// [`Interpretation::new`] in the font `face`.
+    pub(crate) fn new_in(face: &'static [u8], bar_width: u32) -> Self {
+        let bar_width = bar_width.min(10);
+        Self::sized_in(face, bar_width as f32 * 143.0 / 24.0, (bar_width * 7) as f32)
+    }
+
+    /// The font `face` unstretched, its digits `digit_height` dots tall.
+    pub(crate) fn upright(face: &'static [u8], digit_height: f32) -> Self {
         use ab_glyph::Font;
 
-        let font = FontRef::try_from_slice(include_bytes!("../fonts/DejaVuSansMono.ttf")).expect("Error loading font");
+        let font = FontRef::try_from_slice(face).expect("Error loading font");
         let zero = font.glyph_id('0');
         let zero_height = font.outline(zero).map(|o| (o.bounds.max.y - o.bounds.min.y).abs()).unwrap_or(1493.0);
-        Self::sized(digit_height * font.h_advance_unscaled(zero) / zero_height, digit_height)
+        Self::sized_in(face, digit_height * font.h_advance_unscaled(zero) / zero_height, digit_height)
     }
 
-    /// The same font stretched to `char_advance` dots per character and `digit_height`
+    /// DejaVu Sans Mono stretched to `char_advance` dots per character and `digit_height`
     /// dots tall digits.
     pub(crate) fn sized(char_advance: f32, digit_height: f32) -> Self {
+        Self::sized_in(DEJAVU_SANS_MONO, char_advance, digit_height)
+    }
+
+    /// [`Interpretation::sized`] in the font `face`.
+    pub(crate) fn sized_in(face: &'static [u8], char_advance: f32, digit_height: f32) -> Self {
         use ab_glyph::{Font, ScaleFont};
 
-        let font_data: &'static [u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
-        let font = FontRef::try_from_slice(font_data).expect("Error loading font");
+        let font = FontRef::try_from_slice(face).expect("Error loading font");
         let zero = font.glyph_id('0');
         let zero_height_unscaled = font
             .outline(zero)
@@ -657,17 +681,20 @@ fn encode_linear(kind: LinearKind, data: &str) -> Option<LinearSymbol> {
 /// Greedy word wrap of `text` into lines no wider than `width` (the first line) or
 /// `width - indent` (the others). `\&` forces a line break; overlong words are split.
 #[cfg(test)]
-fn wrap_lines(font: &TextFont, text: &str, width: u32, indent: u32) -> Vec<String> {
-    wrap_lines_with(&|s: &str| font.measure(s), text, width, indent).into_iter().map(|(line, _)| line).collect()
+fn wrap_lines(font: &TextFont, text: &str, width: u32, indent: u32, hyphenate: bool) -> Vec<String> {
+    wrap_lines_with(&|s: &str| font.measure(s), text, width, indent, hyphenate).into_iter().map(|(line, _)| line).collect()
 }
 
 /// [`wrap_lines`] with `measure` giving the width of a line; each line is paired with
-/// whether it was broken at a space (Labelary keeps that space when justifying).
-fn wrap_lines_with(measure: &dyn Fn(&str) -> f32, text: &str, width: u32, indent: u32) -> Vec<(String, bool)> {
+/// whether it was broken at a space. The spaces at a break are dropped. A word too long for
+/// a line of its own is split as far right as it fits, with a hyphen at the right edge when
+/// `hyphenate` (^FB, docs/commands/zpl/FB.md).
+fn wrap_lines_with(measure: &dyn Fn(&str) -> f32, text: &str, width: u32, indent: u32, hyphenate: bool) -> Vec<(String, bool)> {
     let mut lines: Vec<(String, bool)> = Vec::new();
     let avail = |lines: &Vec<(String, bool)>| {
         if lines.is_empty() { width as f32 } else { width.saturating_sub(indent).max(1) as f32 }
     };
+    let suffix = if hyphenate { "-" } else { "" };
     for paragraph in text.split("\\&") {
         let mut line = String::new();
         for word in paragraph.split(' ').filter(|w| !w.is_empty()) {
@@ -679,14 +706,23 @@ fn wrap_lines_with(measure: &dyn Fn(&str) -> f32, text: &str, width: u32, indent
             if !line.is_empty() {
                 lines.push((std::mem::take(&mut line), true));
             }
-            // Split a word that does not fit on a line of its own.
-            for c in word.chars() {
-                line.push(c);
-                if measure(&line) > avail(&lines) && line.chars().count() > 1 {
-                    line.pop();
-                    lines.push((std::mem::take(&mut line), false));
-                    line.push(c);
+            // Split a word that does not fit on a line of its own: at least one character
+            // per line, the remainder carried on.
+            let chars: Vec<char> = word.chars().collect();
+            let mut k = 0;
+            while k < chars.len() {
+                let rest: String = chars[k..].iter().collect();
+                if measure(&rest) <= avail(&lines) {
+                    line = rest;
+                    break;
                 }
+                let piece = |n: usize| chars[k..k + n].iter().collect::<String>() + suffix;
+                let mut n = 1;
+                while k + n + 1 < chars.len() && measure(&piece(n + 1)) <= avail(&lines) {
+                    n += 1;
+                }
+                lines.push((piece(n), false));
+                k += n;
             }
         }
         lines.push((line, false));
@@ -895,8 +931,8 @@ impl PngRenderer {
                     *print_interpretation_line, *print_interpretation_line_above,
                 );
             }
-            DrawInstruction::DrawQrCode { x, y, data, magnification, orientation, bottom, right, .. } => {
-                self.render_qr_code(image, (*x, *y, *bottom, *right), data, *magnification, *orientation);
+            DrawInstruction::DrawQrCode { x, y, data, magnification, mask, bottom, right, .. } => {
+                self.render_qr_code(image, (*x, *y, *bottom, *right), data, *magnification, *mask);
             }
             DrawInstruction::DrawDataMatrix {
                 x, y, data, orientation, module_height, symbol_height, columns, rows, escape, rectangular, bottom,
@@ -983,6 +1019,11 @@ impl PngRenderer {
         text_layout: &TextLayout,
     ) {
         let Placement { orientation, justification, anchor } = placement;
+        // docs/commands/zpl/FB.md: a block narrower than the font's width (or 0, not given)
+        // prints nothing.
+        if block.is_some_and(|b| b.clip_height.is_none() && b.width < font.char_w) {
+            return;
+        }
         let height = font.line_h;
         // ^PA bidi/shaping: scalable fonts are laid out as glyph runs (with a fallback font
         // for Hebrew/Arabic); bitmap fonts keep their cells and are only reordered.
@@ -1010,15 +1051,17 @@ impl PngRenderer {
         let per_char = !advanced && (char_gap > 0 || direction != FieldDirection::Horizontal);
         let (box_w, box_h, last_row_top) = match block {
             None if per_char && direction == FieldDirection::Vertical => {
-                // ^FPV: one character per line, left-aligned; Labelary ignores the gap here.
+                // ^FPV: one character per line, left-aligned, the ^FP gap between the lines
+                // (docs/commands/zpl/FP.md; Labelary ignores the gap here).
+                let step = height + char_gap;
                 let mut widest = 0.0f32;
                 for (i, c) in text.chars().enumerate() {
                     let c = c.to_string();
                     widest = widest.max(measure(&c));
-                    rows.push((0, (i as u32 * height) as i32, c));
+                    rows.push((0, (i as u32 * step) as i32, c));
                 }
                 let n = rows.len().max(1) as u32;
-                (widest.ceil() as u32, n * height, ((n - 1) * height) as i32)
+                (widest.ceil() as u32, (n - 1) * step + height, ((n - 1) * step) as i32)
             }
             None if per_char => {
                 // ^FPH / ^FPR with a gap between the characters, drawn one by one.
@@ -1054,7 +1097,7 @@ impl PngRenderer {
                     Some(_) => (row as f32 * pitch).round() as i32,
                     None => row as i32 * line_height,
                 };
-                let mut lines = wrap_lines_with(&measure, text, b.width, b.hanging_indent);
+                let mut lines = wrap_lines_with(&measure, text, b.width, b.hanging_indent, b.clip_height.is_none() && !advanced);
                 if let Some(clip) = b.clip_height {
                     // ^TB: lines starting below the block are dropped; the last one is cut
                     // off at the block's bottom edge.
@@ -1064,7 +1107,6 @@ impl PngRenderer {
                 let max_rows = b.max_lines.max(1) as usize;
                 let mut last_row = 0;
                 let space = measure(" ");
-                let last = lines.len().saturating_sub(1);
                 for (i, (line, wrapped)) in lines.into_iter().enumerate() {
                     // ^FB: lines beyond the maximum overprint the last one.
                     let row = i.min(max_rows - 1);
@@ -1072,15 +1114,9 @@ impl PngRenderer {
                     let top = row_top(row);
                     let indent = if i > 0 { b.hanging_indent as f32 } else { 0.0 };
                     let room = b.width as f32 - indent;
-                    let line_w = measure(&line);
-                    // Labelary justifies wrapped lines as if they still ended in the space
-                    // they broke at, and centers the last line as if it ended in one too.
-                    let free = match b.justification {
-                        BlockJustification::Center if wrapped || i == last => room - line_w - space,
-                        BlockJustification::Right if wrapped => room - line_w - space,
-                        _ => room - line_w,
-                    }
-                    .max(0.0);
+                    // The space a line broke at is discarded (docs/commands/zpl/FB.md), so it
+                    // does not count when centering or right-justifying; Labelary keeps it.
+                    let free = (room - measure(&line)).max(0.0);
                     let gaps = line.matches(' ').count();
                     if b.justification == BlockJustification::Justified && wrapped && gaps > 0 && !advanced {
                         // Words placed one by one with the slack spread over the spaces.
@@ -1350,11 +1386,16 @@ impl PngRenderer {
         // The UPC/EAN add-on keeps its digits close above the bars.
         let add_on = matches!(kind, LinearKind::UpcEanExtension);
         let show_text = print_line && !symbol.text.is_empty();
-        // EAN/UPC digits below the bars: Labelary's own layout, one segment per digit.
+        // EAN/UPC digits below the bars: Labelary's own layout, one segment per digit, in
+        // OCR-B or font A by the module (`ean_upc_ocr_b`).
         let guarded = (show_text && symbol.has_guards && !line_above && !add_on).then(|| guarded_line(&symbol, module));
+        let face = match symbol.has_guards && !add_on && ean_upc_ocr_b(module, self.dpmm) {
+            true => OCR_B,
+            false => DEJAVU_SANS_MONO,
+        };
         let ip = match &guarded {
-            Some(line) => Interpretation::upright(line.digit_height),
-            None => Interpretation::new(module),
+            Some(line) => Interpretation::upright(face, line.digit_height),
+            None => Interpretation::new_in(face, module),
         };
         let text_gap = match &guarded {
             Some(line) => line.gap,
@@ -1455,12 +1496,12 @@ impl PngRenderer {
         self.place_bars(image, &temp, at, orientation, (0, 0, w, h));
     }
 
-    /// ^BQ: always upright; the orientation only moves it (see [`qr::top_left`]).
-    fn render_qr_code(&self, image: &mut RgbImage, (x, y, bottom, right): Origin, data: &str, magnification: u32, orientation: Orientation) {
-        let Some(code) = qr::encode(data) else { return };
+    /// ^BQ: always upright (see [`qr::top_left`]).
+    fn render_qr_code(&self, image: &mut RgbImage, (x, y, bottom, right): Origin, data: &str, magnification: u32, mask: Option<u32>) {
+        let Some(code) = qr::encode(data, mask) else { return };
         let module = magnification.max(1);
         let side = code.size * module;
-        let (x, y) = qr::top_left(x, y, code.size, module, orientation, bottom, right);
+        let (x, y) = qr::top_left(x, y, code.size, module, bottom, right);
         self.note_drawn(x as i64, y as i64, side, side);
         for row in 0..code.size {
             for col in 0..code.size {
@@ -1849,8 +1890,9 @@ mod tests {
         assert_eq!(bounds[1], Some(Bounds { x: 350, y: 250, width: 50, height: 50 }));
         let text = bounds[2].unwrap();
         assert!(text.x >= 40 && text.x <= 60 && text.y >= 90 && text.y <= 110 && text.height >= 20, "{text:?}");
+        // The QR code's top-left on its ^FO origin (docs/commands/zpl/FO.md).
         let qr = bounds[3].unwrap();
-        assert_eq!((qr.x, qr.y), (200, 20));
+        assert_eq!((qr.x, qr.y), (200, 10));
         assert_eq!(bounds[4], Some(Bounds { x: 20, y: 200, width: 30, height: 30 }));
     }
 
@@ -1892,8 +1934,33 @@ mod tests {
     #[test]
     fn wrap_respects_width_and_forced_breaks() {
         let font = TextFont::new(FontName::Font0, None, 30, 30, 8);
-        let lines = wrap_lines(&font, "aaa bbb ccc\\&ddd", font.measure("aaa bbb") as u32 + 1, 0);
+        let lines = wrap_lines(&font, "aaa bbb ccc\\&ddd", font.measure("aaa bbb") as u32 + 1, 0, true);
         assert_eq!(lines, vec!["aaa bbb", "ccc", "ddd"]);
+    }
+
+    #[test]
+    fn font_p_is_the_documented_matrix() {
+        // docs/commands/other/FONTS.md, Table 31: P is 20 x 18 (Labelary draws it 17 wide).
+        assert_eq!(fixed_scalable(FontName::FontP), Some((20, 18)));
+    }
+
+    #[test]
+    fn ean_upc_line_font_follows_the_module() {
+        // docs/commands/zpl/BU.md: OCR-B from a modulus of 2 (6 dpmm), 3 (8), 5 (12), 9 (24).
+        for (dpmm, first) in [(6, 2), (8, 3), (12, 5), (24, 9)] {
+            assert!(!ean_upc_ocr_b(first - 1, dpmm) && ean_upc_ocr_b(first, dpmm), "{dpmm}");
+        }
+    }
+
+    #[test]
+    fn fb_hyphenates_words_longer_than_a_line() {
+        // docs/commands/zpl/FB.md: "a hyphen is automatically placed in the word at the right
+        // edge of the block. The remainder of the word is on the next line."
+        let font = TextFont::new(FontName::FontD, None, 0, 0, 8);
+        let width = font.measure("abcd-") as u32;
+        assert_eq!(wrap_lines(&font, "ab abcdefghij", width, 0, true), vec!["ab", "abcd-", "efgh-", "ij"]);
+        // ^TB breaks the word without one.
+        assert_eq!(wrap_lines(&font, "abcdefghij", width, 0, false), vec!["abcde", "fghij"]);
     }
 
     /// Ink bounding box (x0, y0, x1, y1), inclusive, of a 4x6 inch label at 8 dots/mm,
@@ -1914,14 +1981,23 @@ mod tests {
         found
     }
 
+    /// Ink box (x0, y0, x1, y1), inclusive.
+    type InkBox = (u32, u32, u32, u32);
+
     /// Each field alone on a label; the box is Labelary's (8dpmm, 4x6), within 3 dots.
-    fn assert_matches_labelary(cases: &[(&str, (u32, u32, u32, u32))]) {
+    fn assert_matches_labelary(cases: &[(&str, InkBox)]) {
+        assert_boxes(cases, "Labelary");
+    }
+
+    /// Each field alone on a label (8dpmm, 4x6); its ink box within 3 dots of the expected
+    /// one, from `source`.
+    fn assert_boxes(cases: &[(&str, InkBox)], source: &str) {
         for (field, expected) in cases {
             let got = ink_box(&format!("^XA{field}^XZ"), (0, 0, 812, 1218)).expect(field);
             let close = |a: u32, b: u32| a.abs_diff(b) <= 3;
             assert!(
                 close(got.0, expected.0) && close(got.1, expected.1) && close(got.2, expected.2) && close(got.3, expected.3),
-                "{field}: {got:?}, Labelary {expected:?}"
+                "{field}: {got:?}, {source} {expected:?}"
             );
         }
     }
@@ -1931,10 +2007,7 @@ mod tests {
         assert_matches_labelary(&[
             // ^TB: lines 1.26 heights apart, the last one cut off at the block's bottom.
             ("^FO200,20^A0N,40,40^TBN,200,150^FDHHH HHH HHH HHH HHH HHH HHH HHH HHH^FS", (203, 20, 354, 150)),
-            // ^FB centring counts a space after the last line, not after a forced break.
-            ("^FO20,800^ADN^FB300,5,0,C^FDCC\\&DD^FS", (152, 800, 178, 831)),
             // ^FB is as tall as its maximum lines, used or not: ^FT and rotation see that.
-            ("^FT50,400^A0N,30,30^FB400,3,0,C^FDOne line^FS", (197, 318, 293, 339)),
             (
                 concat!(
                     "^FO100,20^A0R,30,30^FB400,4,0,L",
@@ -1942,12 +2015,32 @@ mod tests {
                 ),
                 (133, 20, 219, 407),
             ),
-            // ^FPV stacks characters one line height apart, ignoring the gap; ^FPH spaces them.
-            ("^FO50,20^FPV,10^A0N,30,30^FDVERT^FS", (50, 20, 66, 131)),
+            // ^FPH spaces the characters by the gap.
             ("^FO250,150^FPH,10^A0N,30,30^FDGap 10^FS", (251, 150, 382, 176)),
             // ^GS: one symbol, in a 24-dot cell magnified to 48.
             ("^FO20,20^GSN,40,40^FDABCDE^FS", (20, 20, 49, 50)),
         ]);
+    }
+
+    #[test]
+    fn text_layout_follows_the_spec_where_labelary_does_not() {
+        assert_boxes(
+            &[
+                // docs/commands/zpl/FB.md: centred lines without a space after them (Labelary
+                // centres "CC" as if followed by one: 152-178).
+                ("^FO20,800^ADN^FB300,5,0,C^FDCC\\&DD^FS", (158, 800, 178, 831)),
+                // As tall as its maximum lines (^FT on the last one's baseline); Labelary 197-293.
+                ("^FT50,400^A0N,30,30^FB400,3,0,C^FDOne line^FS", (201, 317, 298, 339)),
+                // docs/commands/zpl/FP.md: ^FPV puts the gap between the characters (Labelary
+                // ignores it: 50-131).
+                ("^FO50,20^FPV,10^A0N,30,30^FDVERT^FS", (50, 20, 66, 162)),
+            ],
+            "spec",
+        );
+        // docs/commands/zpl/FB.md: a block narrower than the font prints nothing.
+        assert_eq!(ink_box("^XA^FO20,20^A0N,30,30^FB20,3^FDabc^FS^XZ", (0, 0, 812, 1218)), None);
+        assert_eq!(ink_box("^XA^FO20,20^A0N,30,30^FB^FDabc^FS^XZ", (0, 0, 812, 1218)), None);
+        assert!(ink_box("^XA^FO20,20^A0N,30,30^FB30,3^FDabc^FS^XZ", (0, 0, 812, 1218)).is_some());
     }
 
     #[test]
@@ -2023,14 +2116,19 @@ mod tests {
             ("^FT150,800^B0I,5,N,0^FDAZTEC ROTATION^FS", (55, 800, 149, 894)),
             ("^FT450,800^B0B,5,N,0^FDAZTEC ROTATION^FS", (355, 705, 449, 799)),
         ]);
-        // QR codes never turn; ^FO R and B only move the 10 dot band, ^FT ends 3 modules up.
-        assert_matches_labelary(&[
-            ("^FO50,50^BQR,2,4^FDQA,ROTATED^FS", (50, 50, 133, 133)),
-            ("^FWB^FO300,400^BQ,2,4^FDQA,FW IGNORED^FS", (310, 400, 393, 483)),
-            ("^FT300,200^BQN,2,2^FDQA,FT MAG2^FS", (300, 152, 341, 193)),
-            ("^FT300,500^BQB,2,4^FDQA,FT B^FS", (300, 404, 383, 487)),
-            ("^FO500,50^BQN,2^FDQA,DEFAULT MAG^FS", (500, 60, 541, 101)),
-        ]);
+        // QR codes never turn; ^FO puts the top-left on the origin, ^FT the base (FO.md,
+        // FT.md). Labelary moves ^FO symbols down (N) or right (B) by 10 dots and ends ^FT
+        // ones 3 modules above the origin.
+        assert_boxes(
+            &[
+                ("^FO50,50^BQR,2,4^FDQA,ROTATED^FS", (50, 50, 133, 133)),
+                ("^FWB^FO300,400^BQ,2,4^FDQA,FW IGNORED^FS", (300, 400, 383, 483)),
+                ("^FT300,200^BQN,2,2^FDQA,FT MAG2^FS", (300, 158, 341, 199)),
+                ("^FT300,500^BQB,2,4^FDQA,FT B^FS", (300, 416, 383, 499)),
+                ("^FO500,50^BQN,2^FDQA,DEFAULT MAG^FS", (500, 50, 541, 91)),
+            ],
+            "spec",
+        );
         // Placed like 1D bars: ^FO puts the rotated symbol's top-left on the origin, ^FT the
         // unrotated bottom-left corner, rotated with the symbol.
         assert_matches_labelary(&[
@@ -2039,14 +2137,20 @@ mod tests {
             ("^FT550,150^BXR,6,200^FDROTATE DM^FS", (550, 150, 633, 233)),
             ("^FT700,150^BXI,6,200^FDROTATE DM^FS", (616, 150, 699, 233)),
             ("^FT700,400^BXB,6,200^FDROTATE DM^FS", (616, 316, 699, 399)),
-            ("^BY2^FT100,450^B7N,4,0,2,6^FDPDF FT^FS", (100, 426, 305, 449)),
-            ("^BY2^FT500,450^B7I,4,0,2,6^FDPDF FT^FS", (294, 450, 499, 473)),
-            ("^BY2^FT100,900^B7R,4,0,2,6^FDPDF FT^FS", (100, 900, 123, 1105)),
-            ("^BY2^FT400,900^B7B,4,0,2,6^FDPDF FT^FS", (376, 694, 399, 899)),
             // MaxiCode is 200 x 192 dots at 8 dots/mm.
             ("^FO30,30^BD4^FDABC1234567890123XYZ^FS", (30, 31, 229, 222)),
             ("^FT550,1180^BD4^FDFT MAXI^FS", (550, 986, 749, 1177)),
         ]);
+        // PDF417 the same way, its rows h times the module tall (B7.md; Labelary: h dots).
+        assert_boxes(
+            &[
+                ("^BY2^FT100,450^B7N,4,0,2,6^FDPDF FT^FS", (100, 402, 305, 449)),
+                ("^BY2^FT500,450^B7I,4,0,2,6^FDPDF FT^FS", (294, 450, 499, 497)),
+                ("^BY2^FT100,900^B7R,4,0,2,6^FDPDF FT^FS", (100, 900, 147, 1105)),
+                ("^BY2^FT400,900^B7B,4,0,2,6^FDPDF FT^FS", (352, 694, 399, 899)),
+            ],
+            "spec",
+        );
     }
 
     #[test]

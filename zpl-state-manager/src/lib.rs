@@ -113,8 +113,8 @@ pub enum DrawInstruction {
         y: u32,
         data: String,
         orientation: Orientation,
-        /// Row height in dots (Zebra's manual says multiples of `module_width`, but printers
-        /// and Labelary use dots); `None` means rows share `symbol_height`.
+        /// Row height in dots: ^B7 h times the module width (docs/commands/zpl/B7.md);
+        /// `None` means rows share `symbol_height`.
         row_height: Option<u32>,
         module_width: u32,
         symbol_height: u32,
@@ -263,17 +263,8 @@ const DEFAULT_FONT_HEIGHT: u32 = 9;
 /// The printhead resolutions Zebra makes, in dots per millimetre.
 pub const DPMM_VALUES: [u32; 4] = [6, 8, 12, 24];
 
-/// Nominal dots per inch of a `dpmm` printhead as Zebra (and Labelary) round them: 152,
-/// 203, 300 and 600 rather than the exact 152.4, 203.2, 304.8 and 609.6.
-pub fn nominal_dpi(dpmm: u32) -> u32 {
-    match dpmm {
-        6 => 152,
-        8 => 203,
-        12 => 300,
-        24 => 600,
-        _ => (dpmm as f32 * 25.4).round() as u32,
-    }
-}
+/// Nominal dots per inch of a printhead (152, 203, 300, 600).
+pub use zpl_parser::nominal_dpi;
 
 /// Whole-label settings that apply to the page rather than to a field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -861,11 +852,13 @@ impl StateManager {
             }
 
             Command::ChangeFont { font, height, width } => {
-                // ^CF without sizes goes back to the power-up size rather than keeping the
-                // previous ^CF's (Labelary).
+                // ^CF without sizes keeps the previous ^CF's (docs/commands/zpl/CF.md: "the
+                // last ^CF values given or the default ^CF values ... are used").
                 self.default_font = font;
-                self.default_font_height = height.filter(|&h| h > 0);
-                self.default_font_width = width.filter(|&w| w > 0);
+                if height.is_some() || width.is_some() {
+                    self.default_font_height = height.filter(|&h| h > 0);
+                    self.default_font_width = width.filter(|&w| w > 0);
+                }
                 self.restore_default_font();
             }
 
@@ -1102,9 +1095,6 @@ impl StateManager {
             }
 
             Command::QrCode { orientation, model, magnification, error_correction, mask } => {
-                // The magnification becomes the ^BY module width of the barcodes that follow
-                // (checked on Labelary).
-                self.barcode_module_width = magnification;
                 self.field.mode = FieldMode::QrCode {
                     orientation: orientation.unwrap_or(self.default_orientation),
                     model,
@@ -1365,7 +1355,7 @@ impl StateManager {
                     y,
                     data,
                     orientation,
-                    row_height,
+                    row_height: row_height.map(|h| h * self.barcode_module_width),
                     module_width: self.barcode_module_width,
                     symbol_height: self.barcode_height,
                     security,
@@ -1781,8 +1771,9 @@ mod tests {
         use FontName::*;
         // Power-up: 9 dots high, proportional; a size given alone keeps the other proportional.
         assert_eq!(fonts(&run("^XA^FO1,1^A0N,60^FDa^FS^FO1,1^FDb^FS^XZ")), [(Font0, 60, 0), (FontA, 9, 0)]);
-        // ^CF with a font only goes back to the power-up size.
-        assert_eq!(fonts(&run("^XA^CF0,40^CFD^FO1,1^FDa^FS^XZ")), [(FontD, 9, 0)]);
+        // ^CF with a font only keeps the last ^CF sizes (CF.md); without any, the power-up size.
+        assert_eq!(fonts(&run("^XA^CF0,40^CFD^FO1,1^FDa^FS^XZ")), [(FontD, 40, 0)]);
+        assert_eq!(fonts(&run("^XA^CFD^FO1,1^FDa^FS^XZ")), [(FontD, 9, 0)]);
         // A width-only ^CF sizes ^A fields that only give a height.
         assert_eq!(fonts(&run("^XA^CF0,,30^FO1,1^ADN,40^FDa^FS^XZ")), [(FontD, 40, 30)]);
     }
@@ -1808,8 +1799,18 @@ mod tests {
     }
 
     #[test]
-    fn qr_magnification_sets_module_width() {
+    fn pdf417_row_height_is_a_module_multiple() {
+        // docs/commands/zpl/B7.md: "This number multiplied by the module equals the height of
+        // the individual rows in dots."
+        let ins = run("^XA^BY3^FO1,1^B7N,4^FDAB^FS^FO1,200^B7N^FDAB^FS^XZ");
+        assert!(matches!(ins[0], DrawInstruction::DrawPdf417 { row_height: Some(12), module_width: 3, .. }));
+        assert!(matches!(ins[1], DrawInstruction::DrawPdf417 { row_height: None, .. }));
+    }
+
+    #[test]
+    fn qr_magnification_leaves_module_width() {
+        // docs/commands/zpl/BY.md: a ^BY stays in effect until another ^BY.
         let ins = run("^XA^BY2^FO1,1^BQN,2,5^FDQA,X^FS^FO1,200^BCN,50,N^FD12^FS^XZ");
-        assert!(matches!(ins[1], DrawInstruction::DrawBarcode { module_width: 5, .. }));
+        assert!(matches!(ins[1], DrawInstruction::DrawBarcode { module_width: 2, .. }));
     }
 }

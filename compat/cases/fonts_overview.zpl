@@ -1,5 +1,6 @@
 ^XA
 ^FX compat: 4x6 - bitmap fonts A-H, P-V and font 0 side by side^FS
+^FX spec-deviates: font P is 20 x 18 dots (FONTS.md Table 31), Labelary draws it 17 wide^FS
 ^CI28
 ^PW812
 ^LL1218

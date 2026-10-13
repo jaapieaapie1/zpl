@@ -1,5 +1,6 @@
 ^XA
 ^FX compat: 4x6^FS
+^FX spec-deviates: BQ mask 7 and no 10-dot offset (BQ.md, FO.md); B7 rows are h times the module (B7.md)^FS
 ^FX Right-justified (z=1) barcodes and 2D symbols: the origin is their right edge.^FS
 ^BY2
 ^FO400,10^GB1,1190,1^FS

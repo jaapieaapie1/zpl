@@ -1,30 +1,30 @@
 //! ^BQ QR codes: the ^FD switches and the symbol, shared with pdf-renderer so both draw the
 //! same modules.
 //!
-//! Matches Labelary: automatic input encodes the data as one segment of the narrowest mode
-//! that holds all of it (numeric, alphanumeric or byte), the error correction level is then
-//! raised as far as the data still fits in the smallest version for the requested level,
-//! and the mask is always the lowest ISO penalty one (Labelary ignores the ^BQ mask). The
-//! encoding itself is qr-encode's (`single_segment`, `boost_ec`, automatic mask).
+//! Automatic input encodes the data as one segment of the narrowest mode that holds all of
+//! it (numeric, alphanumeric or byte), and the error correction level is then raised as far
+//! as the data still fits in the smallest version for the requested level (as Zebra
+//! printers do). The mask is the ^BQ `e` parameter, 7 unless given
+//! (docs/commands/zpl/BQ.md); Labelary ignores it and picks the lowest ISO penalty mask.
+//! The encoding itself is qr-encode's (`single_segment`, `boost_ec`).
 
 use qr_core::{BitMatrix, EcLevel};
 use qr_encode::Options;
-use zpl_parser::command::Orientation;
+
+/// The ^BQ mask when none (or one outside 0-7) is given (docs/commands/zpl/BQ.md).
+pub const DEFAULT_MASK: u8 = 7;
 
 /// Top-left corner of a `size` x `size` module QR symbol of `module` dot modules. The
-/// symbol is never turned, but Labelary keeps a 10 dot band above it in its own frame and
-/// turns that: ^FO normal moves the symbol down by it, ^FO B (270) right. ^FT puts the bottom
-/// edge 3 modules above the origin, whatever the orientation; right justified (z=1) its
-/// right edge is 3 modules left of it.
-pub fn top_left(x: u32, y: u32, size: u32, module: u32, orientation: Orientation, bottom: bool, right: bool) -> (u32, u32) {
-    const BAND: u32 = 10;
-    let x = if right { x.saturating_sub((size + 3) * module) } else { x };
-    match (bottom, orientation) {
-        (true, _) => (x, y.saturating_sub((size + 3) * module)),
-        (false, Orientation::Normal) => (x, y + BAND),
-        (false, Orientation::Rotated270) => (x + BAND, y),
-        (false, _) => (x, y),
-    }
+/// symbol is never turned (^FW has no effect, docs/commands/zpl/BQ.md). ^FO puts its
+/// top-left corner on the origin, ^FT its bottom-left (docs/commands/zpl/FT.md: the origin
+/// of a bar code is its base, at the left edge); right justified (z=1) its right edge.
+/// Labelary instead moves an ^FO symbol 10 dots down (right when rotated 270) and keeps an
+/// ^FT one 3 modules above the origin.
+pub fn top_left(x: u32, y: u32, size: u32, module: u32, bottom: bool, right: bool) -> (u32, u32) {
+    let side = size * module;
+    let x = if right { x.saturating_sub(side) } else { x };
+    let y = if bottom { y.saturating_sub(side) } else { y };
+    (x, y)
 }
 
 /// Character mode of the data segment.
@@ -99,8 +99,8 @@ impl QrSymbol {
     }
 }
 
-/// The QR symbol for ^FD `data`, `None` if the data does not fit.
-pub fn encode(data: &str) -> Option<QrSymbol> {
+/// The QR symbol for ^FD `data` with ^BQ mask `mask`, `None` if the data does not fit.
+pub fn encode(data: &str, mask: Option<u32>) -> Option<QrSymbol> {
     let field = parse(data);
     // Manual numeric / alphanumeric input keeps only the characters the mode can hold
     // (Labelary encodes `N0123A45` as 012345); Kanji is not supported and goes as bytes.
@@ -118,7 +118,8 @@ pub fn encode(data: &str) -> Option<QrSymbol> {
         }
         Some(Mode::Byte | Mode::Kanji) => (Some(qr_core::Mode::Byte), field.payload),
     };
-    let options = Options { mode, single_segment: true, boost_ec: true, ..Options::new(field.ec) };
+    let mask = mask.filter(|&m| m <= 7).map_or(DEFAULT_MASK, |m| m as u8);
+    let options = Options { mode, single_segment: true, boost_ec: true, mask: Some(mask), ..Options::new(field.ec) };
     let modules = qr_encode::encode(payload, options).ok()?;
     Some(QrSymbol { size: modules.size(), modules })
 }
@@ -148,36 +149,40 @@ mod tests {
     fn level_is_raised_within_the_version() {
         // Labelary: "MAG" asked at Q fits version 1 at H (level bits 10); "ECC LEVEL L" only
         // up to Q (11).
-        let mag = encode("QA,MAG").unwrap();
-        assert_eq!((mag.size, format(&mag)), (21, (0b10, 5)));
-        let l = encode("LA,ECC LEVEL L").unwrap();
+        let mag = encode("QA,MAG", None).unwrap();
+        assert_eq!((mag.size, format(&mag).0), (21, 0b10));
+        let l = encode("LA,ECC LEVEL L", None).unwrap();
         assert_eq!((l.size, format(&l).0), (21, 0b11));
     }
 
     #[test]
-    fn placement_follows_labelary() {
-        let at = |o, bottom| top_left(100, 200, 21, 4, o, bottom, false);
-        assert_eq!(at(Orientation::Normal, false), (100, 210));
-        assert_eq!(at(Orientation::Rotated90, false), (100, 200));
-        assert_eq!(at(Orientation::Rotated180, false), (100, 200));
-        assert_eq!(at(Orientation::Rotated270, false), (110, 200));
-        assert_eq!(at(Orientation::Rotated90, true), (100, 200 - 96));
-        // Right justified: the right edge 3 modules left of x.
-        assert_eq!(top_left(400, 200, 21, 4, Orientation::Normal, true, true), (400 - 96, 200 - 96));
+    fn mask_is_the_bq_parameter() {
+        // docs/commands/zpl/BQ.md: e = mask value 0-7, default 7.
+        assert_eq!(format(&encode("QA,MAG", None).unwrap()).1, 7);
+        assert_eq!(format(&encode("QA,MAG", Some(2)).unwrap()).1, 2);
+        assert_eq!(format(&encode("QA,MAG", Some(9)).unwrap()).1, 7);
+    }
+
+    #[test]
+    fn placement_is_the_field_origin() {
+        // ^FO: top-left corner on the origin (FO.md); ^FT: the base at the origin (FT.md).
+        assert_eq!(top_left(100, 200, 21, 4, false, false), (100, 200));
+        assert_eq!(top_left(100, 200, 21, 4, true, false), (100, 200 - 84));
+        // Right justified: the right edge on x.
+        assert_eq!(top_left(400, 200, 21, 4, true, true), (400 - 84, 200 - 84));
     }
 
     #[test]
     fn manual_input_drops_characters_outside_the_mode() {
         // Labelary encodes only the digits; 12 digits fit version 1 at H.
-        let code = encode("MM,N0123456789A12AABCDEF").unwrap();
-        assert_eq!(code, encode("HM,N012345678912").unwrap());
-        assert_eq!((code.size, format(&code)), (21, (0b10, 3)));
-        assert!(encode("MM,Aabc").is_some());
+        let code = encode("MM,N0123456789A12AABCDEF", None).unwrap();
+        assert_eq!(code, encode("HM,N012345678912", None).unwrap());
+        assert_eq!((code.size, format(&code).0), (21, 0b10));
+        assert!(encode("MM,Aabc", None).is_some());
     }
 
     /// Every ^FD of the qr_* compat cases decodes to its payload. Where the symbol differs
-    /// from Labelary's it is only by mask: Labelary scores the ISO 1:1:3:1:1 rule on a fixed
-    /// 7-module window, qr-encode on whole runs.
+    /// from Labelary's it is only by mask (see the module docs).
     #[test]
     fn compat_symbols_decode() {
         let cases: [(&str, &[u8]); 9] = [
@@ -192,7 +197,7 @@ mod tests {
             ("QA,A LONGER QR CODE AT VERSION THREE", b"A LONGER QR CODE AT VERSION THREE"),
         ];
         for (data, payload) in cases {
-            let decoded = qr_decode::decode(&encode(data).unwrap().modules).unwrap();
+            let decoded = qr_decode::decode(&encode(data, None).unwrap().modules).unwrap();
             assert_eq!(decoded.bytes, payload, "{data}");
         }
     }

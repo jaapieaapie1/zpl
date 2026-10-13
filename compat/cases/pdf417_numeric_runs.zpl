@@ -1,5 +1,6 @@
 ^XA
 ^FX compat: 4x6^FS
+^FX spec-deviates: B7 rows are h times the module tall (B7.md), Labelary makes them h dots^FS
 ^BY2^FO20,20^B7N,4,0,1,,N^FDAB123456CD^FS
 ^BY2^FO420,20^B7N,4,0,1,,N^FDAB1234567CD^FS
 ^BY2^FO20,170^B7N,4,0,1,,N^FDAB12345678CD^FS

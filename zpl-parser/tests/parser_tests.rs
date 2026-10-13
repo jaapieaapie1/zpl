@@ -754,16 +754,17 @@ fn test_qr_error_correction_values() {
 
 #[test]
 fn test_diagonal_direction_values() {
-    let parser = Parser::new("^GD100,50,2,B,R^GD100,50,2,B,L");
+    // docs/commands/zpl/GD.md: R (or /) is the right-leaning diagonal, L (or \) the left-leaning one.
+    let parser = Parser::new(r"^GD100,50,2,B,R^GD100,50,2,B,L^GD100,50,2,B,/^GD100,50,2,B,\");
     let result = parser.parse().unwrap();
-
-    if let Command::GraphicDiagonalLine { direction, .. } = result[0] {
-        assert_eq!(direction, DiagonalDirection::RightToLeft);
-    }
-
-    if let Command::GraphicDiagonalLine { direction, .. } = result[1] {
-        assert_eq!(direction, DiagonalDirection::LeftToRight);
-    }
+    let direction = |i: usize| match result[i] {
+        Command::GraphicDiagonalLine { direction, .. } => direction,
+        ref other => panic!("{other:?}"),
+    };
+    assert_eq!(direction(0), DiagonalDirection::RightToLeft);
+    assert_eq!(direction(1), DiagonalDirection::LeftToRight);
+    assert_eq!(direction(2), DiagonalDirection::RightToLeft);
+    assert_eq!(direction(3), DiagonalDirection::LeftToRight);
 }
 
 #[test]
@@ -934,12 +935,17 @@ fn test_units_follow_printer_resolution() {
         Command::FieldOrigin { x, y, .. } => (x, y),
         ref other => panic!("{other:?}"),
     };
-    // Inches are the nominal 150, 200, 300 and 600 dpi (Labelary), not 25.4 mm.
-    for (dpmm, mm, inch, half_inch) in [(6, (60, 15), 150, 75), (8, (80, 20), 200, 100), (12, (120, 30), 300, 150), (24, (240, 60), 600, 300)] {
+    // Inches are the nominal 152, 203, 300 and 600 dpi, not 25.4 mm (docs/commands/zpl/MU.md).
+    for (dpmm, mm, inch, half_inch) in [(6, (60, 15), 152, 76), (8, (80, 20), 203, 102), (12, (120, 30), 300, 150), (24, (240, 60), 600, 300)] {
         assert_eq!(origin("^MUM^FO10,2.5", dpmm), mm, "{dpmm}");
         assert_eq!(origin("^MUI^FO1,0.5", dpmm), (inch, half_inch), "{dpmm}");
         assert_eq!(origin("^MUD^FO10,20", dpmm), (10, 20), "{dpmm}");
     }
+    // MU.md's own example on an 8 dots/mm (203 dpi) printer: ^MUi^FO.493,.493^GB5.044,.631,.631
+    // is ^FO100,100^GB1024,128,128.
+    let result = Parser::new("^MUi^FO.493,.493^GB5.044,.631,.631").parse().unwrap();
+    assert!(matches!(result[1], Command::FieldOrigin { x: 100, y: 100, .. }), "{:?}", result[1]);
+    assert!(matches!(result[2], Command::GraphicBox { width: 1024, height: 128, thickness: 128, .. }), "{:?}", result[2]);
     // ^BY's module width is a length too.
     let module = |zpl: &str| match Parser::new(zpl).parse().unwrap()[1] {
         Command::BarcodeFieldDefaults { module_width, .. } => module_width,

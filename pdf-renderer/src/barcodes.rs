@@ -30,8 +30,8 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
             ctx, (*x, *y, *bottom, *right), *kind, data, *orientation, *height, *module_width, *wide_bar_ratio,
             *print_interpretation_line, *print_interpretation_line_above,
         ),
-        DrawInstruction::DrawQrCode { x, y, data, magnification, orientation, bottom, right, .. } => {
-            render_qr_code(ctx, (*x, *y, *bottom, *right), data, *magnification, *orientation)
+        DrawInstruction::DrawQrCode { x, y, data, magnification, mask, bottom, right, .. } => {
+            render_qr_code(ctx, (*x, *y, *bottom, *right), data, *magnification, *mask)
         }
         DrawInstruction::DrawDataMatrix { .. }
         | DrawInstruction::DrawPdf417 { .. }
@@ -104,6 +104,7 @@ const GUARD_EXTENSION_ABOVE: u32 = 13;
 
 /// Interpretation line layout for a 1D symbol (all in dots).
 pub(crate) struct Interpretation {
+    pub(crate) font: FontId,
     char_advance: f32,
     pub(crate) digit_height: f32,
     pub(crate) size_x: f32,
@@ -112,24 +113,31 @@ pub(crate) struct Interpretation {
 }
 
 pub(crate) fn interpretation(bar_width: u32) -> Interpretation {
+    interpretation_in(FontId::DejaVuMono, bar_width)
+}
+
+/// [`interpretation`] in `font`.
+fn interpretation_in(font: FontId, bar_width: u32) -> Interpretation {
     // Same constants as the PNG renderer (Labelary-compatible): no larger than at module 10.
     let bar_width = bar_width.min(10);
-    interpretation_sized(bar_width as f32 * 143.0 / 24.0, (bar_width * 7) as f32)
+    interpretation_sized_in(font, bar_width as f32 * 143.0 / 24.0, (bar_width * 7) as f32)
 }
 
-/// The interpretation font unstretched, its digits `digit_height` dots tall.
-fn interpretation_upright(digit_height: f32) -> Interpretation {
-    let font = FontId::DejaVuMono;
+/// The interpretation font `font` unstretched, its digits `digit_height` dots tall.
+fn interpretation_upright(font: FontId, digit_height: f32) -> Interpretation {
     let adv_em = Some(text::char_advance(font, '0')).filter(|v| *v > 0.0).unwrap_or(1233.0 / 2048.0);
     let zero_h_em = Some(text::glyph_height(font, '0')).filter(|v| *v > 0.0).unwrap_or(1493.0 / 2048.0);
-    interpretation_sized(digit_height * adv_em / zero_h_em, digit_height)
+    interpretation_sized_in(font, digit_height * adv_em / zero_h_em, digit_height)
 }
 
-/// The interpretation font stretched to `char_advance` dots per character and `digit_height`
-/// dots tall digits.
+/// DejaVu Sans Mono stretched to `char_advance` dots per character and `digit_height` dots
+/// tall digits.
 pub(crate) fn interpretation_sized(char_advance: f32, digit_height: f32) -> Interpretation {
-    let font = FontId::DejaVuMono;
+    interpretation_sized_in(FontId::DejaVuMono, char_advance, digit_height)
+}
 
+/// [`interpretation_sized`] in `font`.
+fn interpretation_sized_in(font: FontId, char_advance: f32, digit_height: f32) -> Interpretation {
     // DejaVu Sans Mono fallbacks (em units) in case metrics are unavailable.
     let adv_em = Some(text::char_advance(font, '0')).filter(|v| *v > 0.0).unwrap_or(1233.0 / 2048.0);
     let zero_h_em = Some(text::glyph_height(font, '0')).filter(|v| *v > 0.0).unwrap_or(1493.0 / 2048.0);
@@ -137,7 +145,7 @@ pub(crate) fn interpretation_sized(char_advance: f32, digit_height: f32) -> Inte
 
     let size_x = char_advance / adv_em;
     let size_y = digit_height / zero_h_em;
-    Interpretation { char_advance, digit_height, size_x, size_y, descent: descent_em * size_y }
+    Interpretation { font, char_advance, digit_height, size_x, size_y, descent: descent_em * size_y }
 }
 
 impl Interpretation {
@@ -256,7 +264,8 @@ fn encode_linear(kind: LinearKind, data: &str) -> Option<LinearSymbol> {
 }
 
 /// All 1D symbologies except Code 128, placed by their bars (`bars_placement`); the
-/// interpretation line (DejaVu Sans Mono at the Code 128 proportions) goes below, or above
+/// interpretation line (DejaVu Sans Mono at the Code 128 proportions, EAN/UPC from some
+/// module widths OCR-B) goes below, or above
 /// when requested. EAN/UPC digits below the bars follow `png_renderer::guarded_line`.
 #[allow(clippy::too_many_arguments)]
 fn render_linear(
@@ -271,9 +280,14 @@ fn render_linear(
     let add_on = matches!(kind, LinearKind::UpcEanExtension);
     let show_text = print_line && !symbol.text.is_empty();
     let guarded = (show_text && symbol.has_guards && !line_above && !add_on).then(|| guarded_line(&symbol, module));
+    // OCR-B or font A by the module (docs/commands/zpl/BU.md, `png_renderer::ean_upc_ocr_b`).
+    let font = match symbol.has_guards && !add_on && png_renderer::ean_upc_ocr_b(module, ctx.dpmm) {
+        true => FontId::OcrB,
+        false => FontId::DejaVuMono,
+    };
     let ip = match &guarded {
-        Some(line) => interpretation_upright(line.digit_height),
-        None => interpretation(module),
+        Some(line) => interpretation_upright(font, line.digit_height),
+        None => interpretation_in(font, module),
     };
     let text_gap = match &guarded {
         Some(line) => line.gap,
@@ -310,19 +324,19 @@ fn render_linear(
             for &(c, x) in &line.digits {
                 let digit = c.encode_utf8(&mut [0; 4]).to_string();
                 let x = x - ip.char_advance / 2.0;
-                text::show_text(ctx, FontId::DejaVuMono, &digit, x, baseline, ip.size_x, ip.size_y);
+                text::show_text(ctx, ip.font, &digit, x, baseline, ip.size_x, ip.size_y);
             }
         } else if line_above && symbol.has_guards {
             // Above the bars EAN/UPC digits are one line centred over the symbol.
             let text: String = symbol.text.iter().map(|seg| seg.text.as_str()).collect();
             let text_x = (width as f32 - ip.char_advance * text.chars().count() as f32) / 2.0;
-            text::show_text(ctx, FontId::DejaVuMono, &text, text_x, baseline, ip.size_x, ip.size_y);
+            text::show_text(ctx, ip.font, &text, text_x, baseline, ip.size_x, ip.size_y);
         } else {
             for seg in &symbol.text {
                 let (start, end) = symbol.text_extent_dots(seg, module, ratio);
                 let text_w = ip.char_advance * seg.text.chars().count() as f32;
                 let text_x = (start + end - text_w) / 2.0;
-                text::show_text(ctx, FontId::DejaVuMono, &seg.text, text_x, baseline, ip.size_x, ip.size_y);
+                text::show_text(ctx, ip.font, &seg.text, text_x, baseline, ip.size_x, ip.size_y);
             }
         }
         ctx.content.restore_state();
@@ -330,8 +344,8 @@ fn render_linear(
 }
 
 /// ^BQ, module for module as the PNG renderer draws it (`png_renderer::qr`).
-fn render_qr_code(ctx: &mut Ctx, (x, y, bottom, right): Origin, data: &str, magnification: u32, orientation: Orientation) {
-    let Some(code) = qr::encode(data) else { return };
+fn render_qr_code(ctx: &mut Ctx, (x, y, bottom, right): Origin, data: &str, magnification: u32, mask: Option<u32>) {
+    let Some(code) = qr::encode(data, mask) else { return };
     let size = code.size;
     let module = magnification.max(1) as f32;
 
@@ -345,7 +359,7 @@ fn render_qr_code(ctx: &mut Ctx, (x, y, bottom, right): Origin, data: &str, magn
         }
     }
 
-    let (left, top) = qr::top_left(x, y, size, magnification.max(1), orientation, bottom, right);
+    let (left, top) = qr::top_left(x, y, size, magnification.max(1), bottom, right);
     let matrix = [1.0, 0.0, 0.0, 1.0, left as f32, top as f32];
     fill_rects(ctx, matrix, &rects);
 }
@@ -514,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn qr_offsets_and_merges_runs() {
+    fn qr_sits_on_the_origin_and_merges_runs() {
         let c = content_of(DrawInstruction::DrawQrCode {
             x: 30, y: 40, data: "QA,hello".into(), orientation: Orientation::Normal,
             model: zpl_parser::command::QrModel::Model2, magnification: 4,
@@ -522,10 +536,10 @@ mod tests {
             bottom: false,
             right: false,
         });
-        assert!(c.contains("1 0 0 1 30 50 cm"));
+        assert!(c.contains("1 0 0 1 30 40 cm"));
         // Top-left finder pattern: first row starts with a 7-module dark run.
         assert!(c.contains("0 0 28 4 re"));
-        let code = qr::encode("QA,hello").unwrap();
+        let code = qr::encode("QA,hello", None).unwrap();
         let dark = (0..code.size).flat_map(|y| (0..code.size).map(move |x| (x, y))).filter(|&(x, y)| code.get(x, y)).count();
         assert!(count_op(&c, "re") < dark, "runs must be merged");
     }

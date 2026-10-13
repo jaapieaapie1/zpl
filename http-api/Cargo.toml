@@ -13,12 +13,21 @@ zpl-state-manager = { path = "../zpl-state-manager" }
 png-renderer = { path = "../png-renderer" }
 pdf-renderer = { path = "../pdf-renderer" }
 axum = { version = "0.8", features = ["multipart"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 http-body-util = "0.1"
 tower-http = { version = "0.6", features = ["fs", "decompression-gzip", "decompression-deflate", "map-request-body"] }
+# API keys and usage (zpl-console).
+base64 = "0.22"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
+lapin = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 [dev-dependencies]
 flate2 = "1.0"
 futures-util = "0.3"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
+image = { version = "0.25", default-features = false, features = ["png"] }

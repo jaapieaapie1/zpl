@@ -22,13 +22,21 @@
 //! - Add `timings` (`?timings` or `?format=png&timings=1`) to get a `Server-Timing` header
 //!   with the duration of each stage, which browser devtools display as well. `read`
 //!   includes decompressing the body.
+//! - With API keys enabled (`ZPL_KEYS_PUBLIC_KEYS`, see [`billing`]), `/render` needs
+//!   `Authorization: Bearer <key>` from https://zpl.jaapelst.nl/console. Responses carry
+//!   `X-Labels-Billed`: the pages billed for a live key, 0 for a test key, whose labels
+//!   get a watermark. Without that setting the API is open, as for local use.
 //! - `GET /health` returns `ok`.
 //! - `GET /playground/` serves the live ZPL editor (`zpl-wasm/www`), which renders in the
 //!   browser with WebAssembly. Files come from `ZPL_PLAYGROUND_DIR`; a `.gz` next to a
 //!   file is sent instead when the client accepts gzip.
 
+pub mod billing;
+pub mod console;
+
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -38,7 +46,8 @@ use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Query, Request};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{Extension, Router};
+use billing::Billing;
 use pdf_renderer::PdfRenderer;
 use png_renderer::PngRenderer;
 use tower_http::decompression::RequestDecompressionLayer;
@@ -63,6 +72,11 @@ pub fn router() -> Router {
 }
 
 pub fn router_with_playground(dir: &Path) -> Router {
+    router_with(dir, None)
+}
+
+/// The API with the playground in `dir`, requiring API keys when `billing` is given.
+pub fn router_with(dir: &Path, billing: Option<Arc<Billing>>) -> Router {
     Router::new()
         // The raw body has its own limit; this one is for multipart forms. Both count the
         // decompressed bytes, as the body is inflated before the handler reads it. The
@@ -78,6 +92,7 @@ pub fn router_with_playground(dir: &Path) -> Router {
         // The page loads its scripts relative to itself, so it needs the trailing slash.
         .route("/playground", get(|| async { Redirect::permanent("/playground/") }))
         .nest_service("/playground/", ServeDir::new(dir).precompressed_gzip())
+        .layer(Extension(billing))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,17 +132,27 @@ pub enum RenderError {
 /// Parses, lays out and renders `zpl` for a `dpmm` dots/mm printer, timing each stage.
 /// Synchronous and CPU-bound. A PDF holds every page; a PNG shows `page` (1-based).
 pub fn render_label(zpl: &str, format: Format, page: usize, dpmm: u32) -> Result<Rendered, RenderError> {
-    render_documents(&[(None, zpl)], format, page, dpmm)
+    render_documents(&[(None, zpl)], format, page, dpmm, None)
 }
 
 /// Like [`render_label`] for several `(name, zpl)` files, each on a fresh printer, their
 /// pages one after the other. `page` counts across all files, as does the page cap.
 pub fn render_files(files: &[(String, String)], format: Format, page: usize, dpmm: u32) -> Result<Rendered, RenderError> {
     let documents: Vec<_> = files.iter().map(|(name, zpl)| (Some(name.as_str()), zpl.as_str())).collect();
-    render_documents(&documents, format, page, dpmm)
+    render_documents(&documents, format, page, dpmm, None)
 }
 
-fn render_documents(documents: &[(Option<&str>, &str)], format: Format, page: usize, dpmm: u32) -> Result<Rendered, RenderError> {
+/// Text stamped on every page rendered with a test key.
+pub const TEST_WATERMARK: &str = "TEST";
+
+/// Renders `documents`, stamping `watermark` on every page when given.
+fn render_documents(
+    documents: &[(Option<&str>, &str)],
+    format: Format,
+    page: usize,
+    dpmm: u32,
+    watermark: Option<&str>,
+) -> Result<Rendered, RenderError> {
     let mut timings = Vec::new();
     let mut last = Instant::now();
     let mut mark = |stage: &'static str| {
@@ -162,6 +187,9 @@ fn render_documents(documents: &[(Option<&str>, &str)], format: Format, page: us
         let file_pages = state.process_pages(commands);
         file_page_counts.push(file_pages.len());
         pages.extend(file_pages);
+    }
+    if let Some(text) = watermark {
+        pages.iter_mut().for_each(|p| p.add_watermark(text));
     }
     let page_count = pages.len();
     mark("state");
@@ -260,8 +288,22 @@ async fn read_files(mut multipart: Multipart) -> Result<Vec<(String, String)>, M
     Ok(files)
 }
 
-async fn render(Query(params): Query<HashMap<String, String>>, request: Request) -> Response {
+async fn render(
+    Extension(billing): Extension<Option<Arc<Billing>>>,
+    Query(params): Query<HashMap<String, String>>,
+    request: Request,
+) -> Response {
     let start = Instant::now();
+
+    // Check the key before reading a possibly large body.
+    let caller = match &billing {
+        Some(billing) => match billing.authenticate(request.headers()) {
+            Ok(caller) => Some(caller),
+            Err(response) => return response,
+        },
+        None => None,
+    };
+    let watermark = caller.as_ref().filter(|c| c.is_test()).map(|_| TEST_WATERMARK);
 
     let format = match params.get("format").map(String::as_str) {
         None | Some("pdf") => Format::Pdf,
@@ -320,8 +362,11 @@ async fn render(Query(params): Query<HashMap<String, String>>, request: Request)
     let result = tokio::task::spawn_blocking(move || {
         let queue = queued.elapsed();
         let rendered = match &input {
-            Input::Label(zpl) => render_label(zpl, format, page, dpmm),
-            Input::Files(files) => render_files(files, format, page, dpmm),
+            Input::Label(zpl) => render_documents(&[(None, zpl)], format, page, dpmm, watermark),
+            Input::Files(files) => {
+                let documents: Vec<_> = files.iter().map(|(name, zpl)| (Some(name.as_str()), zpl.as_str())).collect();
+                render_documents(&documents, format, page, dpmm, watermark)
+            }
         };
         rendered.map(|rendered| (queue, rendered, matches!(input, Input::Files(_))))
     })
@@ -348,6 +393,15 @@ async fn render(Query(params): Query<HashMap<String, String>>, request: Request)
     )
         .into_response();
     response.headers_mut().insert("x-page-count", HeaderValue::from(rendered.page_count));
+    if let (Some(billing), Some(caller)) = (&billing, &caller) {
+        // A PNG response is one page, whatever the input holds.
+        let (labels, kind) = match format {
+            Format::Pdf => (rendered.page_count, "pdf"),
+            Format::Png => (1, "png"),
+        };
+        let billed = billing.record(caller, labels, kind);
+        response.headers_mut().insert("x-labels-billed", HeaderValue::from(billed));
+    }
     if multipart {
         let counts: Vec<_> = rendered.file_page_counts.iter().map(usize::to_string).collect();
         let value = HeaderValue::from_str(&counts.join(", ")).expect("page counts are ASCII");
@@ -419,6 +473,101 @@ mod tests {
 
     async fn body_bytes(response: Response) -> Vec<u8> {
         response.into_body().collect().await.unwrap().to_bytes().to_vec()
+    }
+
+    mod keys {
+        use super::*;
+        use crate::console::tests::{EXPIRED, KEYS, LIVE, TEST};
+        use crate::console::{KeyEnv, Revocation, RevocationList, Verifier};
+        use tokio::sync::mpsc;
+
+        fn billing() -> (Arc<Billing>, mpsc::Receiver<crate::console::UsageEvent>) {
+            let (tx, rx) = mpsc::channel(16);
+            (Billing::with_verifier(Verifier::from_config(KEYS).unwrap(), Some(tx)), rx)
+        }
+
+        async fn send(billing: &Arc<Billing>, uri: &str, key: Option<&str>, extra: &[(&str, &str)]) -> Response {
+            let mut request = Request::post(uri);
+            if let Some(key) = key {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {key}"));
+            }
+            for (name, value) in extra {
+                request = request.header(*name, *value);
+            }
+            let router = router_with(&playground_dir(), Some(billing.clone()));
+            router.oneshot(request.body(Body::from("^XA^FO50,50^A0N,40^FDhi^FS^PQ3^XZ")).unwrap()).await.unwrap()
+        }
+
+        async fn text(response: Response) -> String {
+            String::from_utf8(body_bytes(response).await).unwrap()
+        }
+
+        #[tokio::test]
+        async fn requires_a_valid_key() {
+            let (billing, _rx) = billing();
+            let missing = send(&billing, "/render", None, &[]).await;
+            assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(missing.headers()[header::WWW_AUTHENTICATE], "Bearer realm=\"zpl\"");
+            assert!(text(missing).await.contains("https://console.test/keys"));
+            let bad = send(&billing, "/render", Some("zpl_live_nonsense"), &[]).await;
+            assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+            let expired = send(&billing, "/render", Some(EXPIRED), &[]).await;
+            assert!(text(expired).await.contains("expired"));
+        }
+
+        #[tokio::test]
+        async fn bills_live_pages_and_reports_usage() {
+            let (billing, mut rx) = billing();
+            let response = send(&billing, "/render?format=pdf", Some(LIVE), &[("idempotency-key", "order-1")]).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["x-labels-billed"], "3");
+            let event = rx.try_recv().unwrap();
+            assert_eq!((event.labels, event.env, event.format), (3, KeyEnv::Live, "pdf"));
+            assert_eq!(event.key_id, uuid::Uuid::from_u128(0xb));
+            // A retry with the same Idempotency-Key gets the same request id.
+            send(&billing, "/render?format=pdf", Some(LIVE), &[("idempotency-key", "order-1")]).await;
+            assert_eq!(rx.try_recv().unwrap().request_id, event.request_id);
+            // A PNG is one page, whatever the label holds.
+            let png = send(&billing, "/render?format=png", Some(LIVE), &[]).await;
+            assert_eq!(png.headers()["x-labels-billed"], "1");
+        }
+
+        #[tokio::test]
+        async fn test_keys_are_free_and_watermarked() {
+            let (billing, mut rx) = billing();
+            let test = send(&billing, "/render?format=png", Some(TEST), &[]).await;
+            assert_eq!(test.headers()["x-labels-billed"], "0");
+            assert_eq!(rx.try_recv().unwrap().env, KeyEnv::Test);
+            let live = send(&billing, "/render?format=png", Some(LIVE), &[]).await;
+            let (test, live) = (body_bytes(test).await, body_bytes(live).await);
+            let ink = |png: &[u8]| {
+                let image = image::load_from_memory(png).unwrap().to_luma8();
+                image.pixels().filter(|p| p.0[0] < 128).count()
+            };
+            assert!(ink(&test) > ink(&live) + 1000, "watermark adds ink");
+        }
+
+        #[tokio::test]
+        async fn revoked_keys_and_suspended_accounts() {
+            let (billing, _rx) = billing();
+            billing.set_revocations(&RevocationList { revoked: vec![], suspended_orgs: vec![uuid::Uuid::from_u128(0xa)] });
+            let live = send(&billing, "/render", Some(LIVE), &[]).await;
+            assert_eq!(live.status(), StatusCode::PAYMENT_REQUIRED);
+            assert!(text(live).await.contains("https://console.test/billing"));
+            assert_eq!(send(&billing, "/render", Some(TEST), &[]).await.status(), StatusCode::OK);
+            billing.set_revocations(&RevocationList {
+                revoked: vec![Revocation { key_id: uuid::Uuid::from_u128(0xb) }],
+                suspended_orgs: vec![],
+            });
+            let revoked = send(&billing, "/render", Some(TEST), &[]).await;
+            assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+            assert!(text(revoked).await.contains("revoked"));
+        }
+
+        #[tokio::test]
+        async fn open_without_keys() {
+            assert_eq!(post("/render", LABEL).await.status(), StatusCode::OK);
+        }
     }
 
     #[tokio::test]

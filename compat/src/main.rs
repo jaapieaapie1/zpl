@@ -45,48 +45,70 @@ fn main() {
     }
 
     results.sort_by(|a, b| b.counts.tolerant().total_cmp(&a.counts.tolerant()).then(a.name.cmp(&b.name)));
-    println!("{:<28} {:>7} {:>8} {:>9} {:>9}  status", "case", "labels", "raw %", "tolerant", "baseline");
-    let mut worse = 0;
+    // Cases following the spec over Labelary come last, apart.
+    results.sort_by_key(|r| r.spec_deviates.is_some());
+    println!("{:<28} {:>7} {:>8} {:>9} {:>9} {:>6}  status", "case", "labels", "raw %", "tolerant", "baseline", "ink %");
+    let (mut worse, mut weight) = (0, 0);
+    let mut apart = false;
     for r in &results {
+        if r.spec_deviates.is_some() && !apart {
+            apart = true;
+            println!("\nFollowing the spec where Labelary deviates (baseline: the spec-correct render):");
+        }
         let tolerant = r.counts.tolerant();
         let baseline = baselines.get(&r.name).copied();
-        let status = match baseline {
-            _ if r.unsupported => "unsupported by Labelary",
-            None => "new",
+        let mut status = match baseline {
+            _ if r.unsupported => "unsupported by Labelary".to_string(),
+            None => "new".to_string(),
             Some(b) if tolerant > b + compat::BASELINE_SLACK => {
                 worse += 1;
-                "WORSE"
+                "WORSE".to_string()
             }
-            Some(b) if tolerant + 0.5 < b => "better",
-            Some(_) => "",
+            Some(b) if tolerant + 0.5 < b => "better".to_string(),
+            Some(_) => String::new(),
         };
+        if r.counts.weight_off() && !r.unsupported {
+            weight += 1;
+            status = format!("{status} WEIGHT").trim().to_string();
+        }
+        if let Some(reason) = &r.spec_deviates {
+            status = format!("{status} ({reason})").trim().to_string();
+        }
         let labels = if r.our_pages == r.their_pages {
             r.our_pages.to_string()
         } else {
             format!("{}/{}", r.our_pages, r.their_pages)
         };
         println!(
-            "{:<28} {:>7} {:>8.3} {:>9.2} {:>9}  {status}",
+            "{:<28} {:>7} {:>8.3} {:>9.2} {:>9} {:>+6.1}  {status}",
             r.name,
             labels,
             r.counts.raw(),
             tolerant,
-            baseline.map(|b| format!("{b:.2}")).unwrap_or_default()
+            baseline.map(|b| format!("{b:.2}")).unwrap_or_default(),
+            100.0 * r.counts.weight(),
         );
     }
 
-    let scores: Vec<f64> = results.iter().filter(|r| !r.unsupported).map(|r| r.counts.tolerant()).collect();
+    let scores: Vec<f64> =
+        results.iter().filter(|r| !r.unsupported && r.spec_deviates.is_none()).map(|r| r.counts.tolerant()).collect();
     if !scores.is_empty() {
         let mut sorted = scores.clone();
         sorted.sort_by(f64::total_cmp);
         let mean = scores.iter().sum::<f64>() / scores.len() as f64;
         let close = scores.iter().filter(|s| **s < 1.0).count();
         println!(
-            "\n{} cases (without unsupported): mean tolerant {:.2}%, median {:.2}%, {} under 1%. Labels: ours/Labelary where they differ.",
+            "\n{} cases (without unsupported and spec deviations): mean tolerant {:.2}%, median {:.2}%, {} under 1%. Labels: ours/Labelary where they differ.",
             scores.len(),
             mean,
             sorted[sorted.len() / 2],
             close
+        );
+    }
+    if weight > 0 {
+        println!(
+            "{weight} case(s) marked WEIGHT: {:.0}% more or less ink than Labelary (stroke weight; the tolerance hides it)",
+            100.0 * compat::WEIGHT_WARN
         );
     }
     if !missing.is_empty() {

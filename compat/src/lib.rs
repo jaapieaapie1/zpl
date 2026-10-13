@@ -5,6 +5,8 @@
 //!   comment gives the label size in inches (optionally `dpmm=N`, default 8). The word
 //!   `labelary-unsupported` marks a feature Labelary does not render (it prints the field
 //!   data as text instead); such cases are scored but left out of the summary.
+//!   `spec-deviates: <reason>` marks a case where we follow the ZPL spec (docs/) and
+//!   Labelary does not: it is reported apart, its baseline is the spec-correct render.
 //! - `cases/<name>.labelary.png` is Labelary's render of label 1, `<name>.labelary.2.png`
 //!   of label 2 and so on. They are fetched once with `compat/fetch.sh` and committed, so
 //!   nothing here needs the network.
@@ -29,6 +31,10 @@ pub const TOLERANCE: usize = 2;
 
 /// Luma below this is black, in both renders.
 pub const THRESHOLD: u8 = 128;
+
+/// Ink (black dots) ours/Labelary beyond which a case's stroke weight is flagged: the
+/// tolerant score forgives a stroke one or two dots too thin or thick, this does not.
+pub const WEIGHT_WARN: f64 = 0.12;
 
 /// How much a tolerant score may exceed its baseline before the regression test fails;
 /// baselines are stored with two decimals.
@@ -57,6 +63,8 @@ pub struct Case {
     pub dpmm: u32,
     /// Labelary does not render this feature, so its reference is not a target.
     pub unsupported: bool,
+    /// Why we follow the spec rather than Labelary here (`spec-deviates: <reason>`).
+    pub spec_deviates: Option<String>,
 }
 
 impl Case {
@@ -68,7 +76,10 @@ impl Case {
         let (width_in, height_in, dpmm) =
             parse_header(&zpl).ok_or_else(|| format!("{}: missing `^FX compat: WxH` header", path.display()))?;
         let unsupported = zpl.contains("labelary-unsupported");
-        Ok(Case { name, path: path.to_path_buf(), zpl, width_in, height_in, dpmm, unsupported })
+        let spec_deviates = zpl
+            .split_once("spec-deviates:")
+            .map(|(_, rest)| rest.split(['^', '~', '\n']).next().unwrap_or_default().trim().to_string());
+        Ok(Case { name, path: path.to_path_buf(), zpl, width_in, height_in, dpmm, unsupported, spec_deviates })
     }
 
     /// Labelary's renders of this case, label 1 first. Empty until fetched.
@@ -212,6 +223,9 @@ pub struct Counts {
     /// Mismatches with no dot of the same colour within [`TOLERANCE`] in the other image.
     pub far_theirs: u64,
     pub far_ours: u64,
+    /// Black dots in our image and in Labelary's.
+    pub ours_ink: u64,
+    pub theirs_ink: u64,
 }
 
 impl Counts {
@@ -222,6 +236,8 @@ impl Counts {
         self.only_ours += other.only_ours;
         self.far_theirs += other.far_theirs;
         self.far_ours += other.far_ours;
+        self.ours_ink += other.ours_ink;
+        self.theirs_ink += other.theirs_ink;
     }
 
     /// Mismatched dots, as a percentage of all dots.
@@ -233,6 +249,18 @@ impl Counts {
     /// image, so a small label element counts as much as a page-filling one.
     pub fn tolerant(&self) -> f64 {
         percent(self.far_theirs + self.far_ours, self.ink)
+    }
+
+    /// How much more (positive) or less ink we print than Labelary, as a fraction: a
+    /// cheap check of stroke weight, which the tolerance hides.
+    pub fn weight(&self) -> f64 {
+        if self.theirs_ink == 0 { 0.0 } else { self.ours_ink as f64 / self.theirs_ink as f64 - 1.0 }
+    }
+
+    /// The weight differs by more than [`WEIGHT_WARN`] in a case that otherwise matches,
+    /// where it is not explained by missing or extra elements.
+    pub fn weight_off(&self) -> bool {
+        self.weight().abs() > WEIGHT_WARN && self.tolerant() < 2.0
     }
 }
 
@@ -279,6 +307,8 @@ pub fn compare(ours: &Bitmap, theirs: &Bitmap) -> (Counts, RgbImage) {
         if o || t {
             counts.ink += 1;
         }
+        counts.ours_ink += o as u64;
+        counts.theirs_ink += t as u64;
         if let Some(c) = colour {
             image.put_pixel((i % ours.width) as u32, (i / ours.width) as u32, Rgb(c));
         }
@@ -291,6 +321,7 @@ pub fn compare(ours: &Bitmap, theirs: &Bitmap) -> (Counts, RgbImage) {
 pub struct CaseResult {
     pub name: String,
     pub unsupported: bool,
+    pub spec_deviates: Option<String>,
     pub our_pages: usize,
     pub their_pages: usize,
     pub counts: Counts,
@@ -325,6 +356,7 @@ pub fn run_case(case: &Case) -> Result<Option<CaseResult>, String> {
     Ok(Some(CaseResult {
         name: case.name.clone(),
         unsupported: case.unsupported,
+        spec_deviates: case.spec_deviates.clone(),
         our_pages: ours.len(), their_pages: theirs.len(), counts, diffs, renders }))
 }
 
@@ -374,6 +406,22 @@ mod tests {
         assert_eq!(parse_header("^XA^FX compat: 4x3^FS"), Some((4.0, 3.0, 8)));
         assert_eq!(parse_header("^XA\n^FX compat: 2.5x1 dpmm=12\n"), Some((2.5, 1.0, 12)));
         assert_eq!(parse_header("^XA^XZ"), None);
+    }
+
+    #[test]
+    fn weight_compares_ink() {
+        let mut thin = Bitmap::blank(20, 20);
+        let mut bold = Bitmap::blank(20, 20);
+        for y in 5..15 {
+            thin.dots[y * 20 + 5] = true;
+            bold.dots[y * 20 + 5] = true;
+            bold.dots[y * 20 + 6] = true;
+        }
+        // Within the tolerance, but half the ink.
+        let (counts, _) = compare(&thin, &bold);
+        assert_eq!(counts.tolerant(), 0.0);
+        assert_eq!(counts.weight(), -0.5);
+        assert!(counts.weight_off());
     }
 
     #[test]

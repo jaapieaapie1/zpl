@@ -160,6 +160,9 @@ fn field_text_start(zpl: &str, data: zpl_parser::Span) -> usize {
     (data.start + prefix + 2).min(data.end)
 }
 
+/// Stamped across every playground label and PDF page.
+const WATERMARK: &str = "PREVIEW";
+
 fn state(clock: f64, dpmm: u32) -> StateManager {
     let mut state = StateManager::new();
     state.set_clock_unix(clock as i64);
@@ -181,7 +184,10 @@ pub fn render_rgba(zpl: &str, clock: f64, debug: bool, page: u32, dpmm: u32) -> 
     let mut pages = state(clock, dpmm).process_pages_mapped(commands, &spans);
     let page_count = pages.len();
     let index = (page as usize).min(page_count - 1);
-    let (Page { instructions, setup }, sources) = pages.swap_remove(index);
+    let (mut page, sources) = pages.swap_remove(index);
+    // The free playground marks its output; clean labels come from the API with a key.
+    page.add_watermark(WATERMARK);
+    let Page { instructions, setup } = page;
     let renderer = PngRenderer::for_page(&setup, debug);
     let (image, bounds) = renderer.render_with_bounds(&instructions);
 
@@ -216,7 +222,8 @@ pub fn render_rgba(zpl: &str, clock: f64, debug: bool, page: u32, dpmm: u32) -> 
 pub fn render_pdf(zpl: &str, clock: f64, dpmm: u32) -> Result<Vec<u8>, ParseFailure> {
     let dpmm = resolution(dpmm);
     let commands = Parser::with_dpmm(zpl, dpmm).parse().map_err(|e| ParseFailure::new(zpl, e))?;
-    let pages = state(clock, dpmm).process_pages(commands);
+    let mut pages = state(clock, dpmm).process_pages(commands);
+    pages.iter_mut().for_each(|p| p.add_watermark(WATERMARK));
     let pages: Vec<_> = pages.iter().map(|p| (p.setup, p.instructions.as_slice())).collect();
     Ok(PdfRenderer::for_page(&pages[0].0).render_pages(&pages))
 }

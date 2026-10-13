@@ -14,6 +14,45 @@ pub struct Page {
     pub setup: PageSetup,
 }
 
+impl Page {
+    /// Stamps `text` across the label at a fifth, half and four fifths of its height, in
+    /// large font 0 reversed (^FR) so it shows over white and black alike: the label stays
+    /// readable for checking but is unusable for shipping. For test API keys and the
+    /// playground.
+    pub fn add_watermark(&mut self, text: &str) {
+        use zpl_parser::command::{BlockJustification, FieldDirection, FontName, Justification, Orientation, TextLayout};
+
+        let (width, height) = (self.setup.width.max(1), self.setup.height.max(1));
+        let size = (width / 4).clamp(20, (height / 3).max(20));
+        for row in [1, 5, 8] {
+            let stamp = DrawInstruction::DrawText {
+                x: 0,
+                y: (height * row / 10).saturating_sub(size / 2),
+                text: text.to_string(),
+                font: FontName::Font0,
+                height: size,
+                width: size,
+                orientation: Orientation::Normal,
+                justification: Justification::Left,
+                anchor: crate::TextAnchor::Top,
+                block: Some(crate::TextBlock {
+                    width,
+                    max_lines: 1,
+                    line_spacing: 0,
+                    justification: BlockJustification::Center,
+                    hanging_indent: 0,
+                    clip_height: None,
+                }),
+                direction: FieldDirection::Horizontal,
+                char_gap: 0,
+                custom_font: None,
+                layout: TextLayout::default(),
+            };
+            self.instructions.push(DrawInstruction::Reverse(Box::new(stamp)));
+        }
+    }
+}
+
 /// How a serialized field's data changes from one serial number to the next.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Serial {

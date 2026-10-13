@@ -31,8 +31,8 @@ use crate::console::{KeyEnv, RevocationList, TokenError, UsageEvent, Verifier, U
 /// (unbilled) rather than growing without bound.
 pub const QUEUE_LIMIT: usize = 10_000;
 const REVOCATION_INTERVAL: Duration = Duration::from_secs(30);
-/// Namespace for request ids derived from `Idempotency-Key`, so a retried request maps
-/// to the same id and the console counts it once.
+/// Namespace for request ids derived from `Idempotency-Key` and the request's content,
+/// so a retried request maps to the same id and the console counts it once.
 const IDEMPOTENCY_NAMESPACE: Uuid = Uuid::from_u128(0x7a3c_51f0_9d6e_4b8a_a2f1_3e5c_7d9b_0c14);
 
 pub struct Billing {
@@ -155,12 +155,17 @@ impl Billing {
     }
 
     /// Reports a rendered request; returns the `X-Labels-Billed` value (0 for test keys).
-    pub fn record(&self, caller: &Caller, labels: usize, format: &'static str) -> usize {
+    /// `fingerprint` hashes the rendered content and settings; with an `Idempotency-Key`
+    /// it goes into the request id, so reusing the key for other labels is billed again.
+    pub fn record(&self, caller: &Caller, labels: usize, format: &'static str, fingerprint: Option<&blake3::Hash>) -> usize {
         let labels = labels.min(u32::MAX as usize);
         if let Some(usage) = &self.usage {
-            let request_id = match &caller.idempotency_key {
-                Some(key) => Uuid::new_v5(&IDEMPOTENCY_NAMESPACE, format!("{}:{key}", caller.key_id).as_bytes()),
-                None => Uuid::new_v4(),
+            let request_id = match (&caller.idempotency_key, fingerprint) {
+                (Some(key), Some(fingerprint)) => {
+                    let name = format!("{}:{key}:{}", caller.key_id, fingerprint.to_hex());
+                    Uuid::new_v5(&IDEMPOTENCY_NAMESPACE, name.as_bytes())
+                }
+                _ => Uuid::new_v4(),
             };
             let event = UsageEvent {
                 request_id,

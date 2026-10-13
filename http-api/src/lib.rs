@@ -252,6 +252,30 @@ impl Input {
         };
         (bytes >> 20) as u32 + 1
     }
+
+    /// BLAKE3 of what gets rendered: the labels (each file's name and contents, length-
+    /// prefixed so boundaries count) and the output settings. Makes an `Idempotency-Key`
+    /// only deduplicate a true retry: different labels, page or format bill again.
+    fn fingerprint(&self, format: Format, page: usize, dpmm: u32) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new();
+        let mut field = |bytes: &[u8]| {
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        };
+        field(format.content_type().as_bytes());
+        field(&(page as u64).to_le_bytes());
+        field(&dpmm.to_le_bytes());
+        match self {
+            Input::Label(zpl) => field(zpl.as_bytes()),
+            Input::Files(files) => {
+                for (name, zpl) in files {
+                    field(name.as_bytes());
+                    field(zpl.as_bytes());
+                }
+            }
+        }
+        hasher.finalize()
+    }
 }
 
 /// Rendering needs roughly 8x its input in memory (a 22 MB batch of bitmap labels peaks
@@ -359,8 +383,11 @@ async fn render(
     let queued = Instant::now();
     let permits = input.permits().min(RENDER_PERMITS as u32);
     let _budget = RENDER_BUDGET.acquire_many(permits).await.expect("the render budget is never closed");
+    let fingerprint_needed = caller.as_ref().is_some_and(|c| c.idempotency_key.is_some());
     let result = tokio::task::spawn_blocking(move || {
         let queue = queued.elapsed();
+        // Only requests with an Idempotency-Key need it; microseconds for a typical label.
+        let fingerprint = fingerprint_needed.then(|| input.fingerprint(format, page, dpmm));
         let rendered = match &input {
             Input::Label(zpl) => render_documents(&[(None, zpl)], format, page, dpmm, watermark),
             Input::Files(files) => {
@@ -368,11 +395,11 @@ async fn render(
                 render_documents(&documents, format, page, dpmm, watermark)
             }
         };
-        rendered.map(|rendered| (queue, rendered, matches!(input, Input::Files(_))))
+        rendered.map(|rendered| (queue, rendered, matches!(input, Input::Files(_)), fingerprint))
     })
     .await;
 
-    let (queue, rendered, multipart) = match result {
+    let (queue, rendered, multipart, fingerprint) = match result {
         Ok(Ok(ok)) => ok,
         Ok(Err(RenderError::Parse { file: None, message })) => {
             return error(StatusCode::BAD_REQUEST, format!("parse error: {message}"))
@@ -399,7 +426,7 @@ async fn render(
             Format::Pdf => (rendered.page_count, "pdf"),
             Format::Png => (1, "png"),
         };
-        let billed = billing.record(caller, labels, kind);
+        let billed = billing.record(caller, labels, kind, fingerprint.as_ref());
         response.headers_mut().insert("x-labels-billed", HeaderValue::from(billed));
     }
     if multipart {
@@ -524,9 +551,12 @@ mod tests {
             let event = rx.try_recv().unwrap();
             assert_eq!((event.labels, event.env, event.format), (3, KeyEnv::Live, "pdf"));
             assert_eq!(event.key_id, uuid::Uuid::from_u128(0xb));
-            // A retry with the same Idempotency-Key gets the same request id.
+            // A retry with the same Idempotency-Key gets the same request id...
             send(&billing, "/render?format=pdf", Some(LIVE), &[("idempotency-key", "order-1")]).await;
             assert_eq!(rx.try_recv().unwrap().request_id, event.request_id);
+            // ...but reusing it for another page or format is a new, billed request.
+            send(&billing, "/render?format=png&page=2", Some(LIVE), &[("idempotency-key", "order-1")]).await;
+            assert_ne!(rx.try_recv().unwrap().request_id, event.request_id);
             // A PNG is one page, whatever the label holds.
             let png = send(&billing, "/render?format=png", Some(LIVE), &[]).await;
             assert_eq!(png.headers()["x-labels-billed"], "1");
@@ -562,6 +592,20 @@ mod tests {
             let revoked = send(&billing, "/render", Some(TEST), &[]).await;
             assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
             assert!(text(revoked).await.contains("revoked"));
+        }
+
+        #[test]
+        fn fingerprint_covers_content_and_settings() {
+            let label = Input::Label("^XA^FDa^FS^XZ".into());
+            let base = label.fingerprint(Format::Pdf, 1, 8);
+            assert_eq!(base, Input::Label("^XA^FDa^FS^XZ".into()).fingerprint(Format::Pdf, 1, 8));
+            assert_ne!(base, Input::Label("^XA^FDb^FS^XZ".into()).fingerprint(Format::Pdf, 1, 8));
+            assert_ne!(base, label.fingerprint(Format::Png, 1, 8));
+            assert_ne!(base, label.fingerprint(Format::Pdf, 2, 8));
+            assert_ne!(base, label.fingerprint(Format::Pdf, 1, 12));
+            // File boundaries count: "ab" + "c" is not "a" + "bc".
+            let files = |a: &str, b: &str| Input::Files(vec![("f".into(), a.into()), ("f".into(), b.into())]);
+            assert_ne!(files("ab", "c").fingerprint(Format::Pdf, 1, 8), files("a", "bc").fingerprint(Format::Pdf, 1, 8));
         }
 
         #[tokio::test]

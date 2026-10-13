@@ -21,7 +21,7 @@ use ttf_parser::{Face, GlyphId, RawFace, Tag};
 /// Fonts built into the renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FontId {
-    /// ATTriumvirate-BoldCd.otf (CFF) — ZPL scalable font 0 / text default.
+    /// ZplSansCn-Bold.otf (CFF, TeX Gyre Heros Cn Bold with font 0 metrics) — ZPL scalable font 0 / text default.
     Triumvirate,
     /// DejaVuSansMono.ttf — barcode interpretation lines and the bitmap fonts A, C, D, F, G.
     DejaVuMono,
@@ -77,7 +77,7 @@ impl FontId {
     /// PostScript name used as /BaseFont.
     fn base_font(self) -> &'static str {
         match self {
-            FontId::Triumvirate => "ATTriumvirate-BoldCd",
+            FontId::Triumvirate => "ZplSansCn-Bold",
             FontId::DejaVuMono => "DejaVuSansMono",
             FontId::DejaVuSansBold => "DejaVuSans-Bold",
             FontId::OcrB => "OCRB",

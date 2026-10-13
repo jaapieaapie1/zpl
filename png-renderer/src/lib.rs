@@ -19,7 +19,8 @@ mod symbols;
 pub use layout::DEJAVU_SANS_BOLD;
 
 /// Font files, shared with pdf-renderer so the binary holds one copy of each.
-pub static TRIUMVIRATE: &[u8] = include_bytes!("../fonts/ATTriumvirate-BoldCd.otf");
+/// Font 0: TeX Gyre Heros Cn Bold with font 0 metrics; see fonts/LICENSE_ZPLSANS.
+pub static TRIUMVIRATE: &[u8] = include_bytes!("../fonts/ZplSansCn-Bold.otf");
 pub static DEJAVU_SANS_MONO: &[u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
 /// Bitmap font B: DejaVu Sans Mono Bold, cut down to the characters B prints (see
 /// [`bitmap_prints`]) and without hinting.

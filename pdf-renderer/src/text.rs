@@ -1769,7 +1769,7 @@ mod tests {
         let c = content(&ins);
         assert!(c.contains("/F0 1 Tf") && !c.contains("/C0"), "{c}");
         let pdf = PdfRenderer::new(400, 300).render(&[ins]);
-        assert!(contains(&pdf, b"ATTriumvirate"));
+        assert!(contains(&pdf, b"ZplSansCn"));
     }
 
     // ^PA advanced text layout.
@@ -1880,19 +1880,19 @@ mod tests {
 
     #[test]
     fn ligatures_only_with_opentype() {
-        let on = shaped("office", layout(false, false, false, true));
-        // o, f, fi, c, e
-        assert_eq!(on.glyphs.len(), 5, "{:?}", on.glyphs);
+        let on = shaped("sofia", layout(false, false, false, true));
+        // s, o, fi, a
+        assert_eq!(on.glyphs.len(), 4, "{:?}", on.glyphs);
         let mut buf = [0u8; 4];
         assert_eq!(on.text_of(&on.glyphs[2], &mut buf), "fi");
-        assert!(!cmap_gids(FontId::Triumvirate, "office").contains(&on.glyphs[2].gid));
-        let off = shaped("office", layout(false, false, true, false));
+        assert!(!cmap_gids(FontId::Triumvirate, "sofia").contains(&on.glyphs[2].gid));
+        let off = shaped("sofia", layout(false, false, true, false));
         let gids: Vec<u16> = off.glyphs.iter().map(|g| g.gid).collect();
-        assert_eq!(gids, cmap_gids(FontId::Triumvirate, "office"));
+        assert_eq!(gids, cmap_gids(FontId::Triumvirate, "sofia"));
         // Shaping without kerning keeps the classic advances.
         let mut ctx = Ctx::new();
         let field = font0_field(&mut ctx, false);
-        assert!(approx(off.width, field.measure(&ctx.fonts, "office")));
+        assert!(approx(off.width, field.measure(&ctx.fonts, "sofia")));
     }
 
     #[test]
@@ -1940,7 +1940,7 @@ mod tests {
 
     #[test]
     fn default_glyph_prints_notdef_else_space() {
-        let missing = '\u{E000}';
+        let missing = '\u{10FFFD}';
         assert!(FALLBACKS.iter().all(|f| f.face().glyph_index(missing).is_none()));
         let mut ctx = Ctx::new();
         let space = FontId::Triumvirate.glyph(' ');
@@ -1950,7 +1950,7 @@ mod tests {
         let field = font0_field(&mut ctx, false);
         assert!(approx(field.char_width(&ctx.fonts, missing), field.char_width(&ctx.fonts, ' ')));
         // Shaped path: same rule.
-        let text = "A\u{E000}B";
+        let text = "A\u{10FFFD}B";
         assert_eq!(shaped(text, layout(false, false, true, false)).glyphs[1].gid, space);
         assert_eq!(shaped(text, layout(true, false, true, false)).glyphs[1].gid, 0);
     }

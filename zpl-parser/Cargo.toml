@@ -11,3 +11,7 @@ source-map = ["zpl-tokenizer/source-map"]
 zpl-tokenizer = { path = "../zpl-tokenizer" }
 base64 = "0.22"
 flate2 = "1.0"
+
+[[bench]]
+name = "graphics"
+harness = false

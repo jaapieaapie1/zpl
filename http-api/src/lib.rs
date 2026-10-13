@@ -12,11 +12,11 @@
 //!   Each file starts from a fresh printer (no ^PW, ^LH, ~DG graphics or ^DF formats carry
 //!   over) and their pages follow in upload order, so `page`, `X-Page-Count` and the page
 //!   cap count across all files. `X-File-Page-Counts` gives each file's pages (`2, 1`).
-//!   A parse error names the file; the whole request is capped at 16 MiB.
+//!   A parse error names the file; the whole request is capped at 100 MiB.
 //! - Request bodies, raw or multipart, may be compressed with `Content-Encoding: gzip` (or
 //!   `deflate`, zlib-wrapped as HTTP has it):
 //!   `gzip -c label.zpl | curl --data-binary @- -H 'Content-Encoding: gzip' 'https://…/render?format=pdf'`.
-//!   The 16 MiB cap applies to the decompressed body, checked while inflating, so a small
+//!   The 100 MiB cap applies to the decompressed body, checked while inflating, so a small
 //!   gzip that inflates past it gets 413 without being inflated in full. Corrupt gzip is a
 //!   400 and any other encoding a 415, whose `Accept-Encoding` lists the supported ones.
 //! - Add `timings` (`?timings` or `?format=png&timings=1`) to get a `Server-Timing` header
@@ -47,8 +47,9 @@ use tower_http::services::ServeDir;
 use zpl_parser::Parser;
 use zpl_state_manager::{StateManager, DEFAULT_DPMM, DPMM_VALUES, MAX_PAGES};
 
-/// Largest accepted ZPL body. Labels with big ^GF graphics run to a few megabytes.
-pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Largest accepted ZPL body, after decompression. A label that is one big ~DG bitmap is
+/// ~40-90 KB, so this fits a batch of about a thousand of them.
+pub const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
 
 /// The playground's files: `ZPL_PLAYGROUND_DIR`, or `zpl-wasm/www` in this repository.
 pub fn playground_dir() -> PathBuf {
@@ -214,6 +215,24 @@ enum Input {
     Files(Vec<(String, String)>),
 }
 
+impl Input {
+    /// Render permits this input takes from [`RENDER_BUDGET`]: one per started MiB.
+    fn permits(&self) -> u32 {
+        let bytes = match self {
+            Input::Label(zpl) => zpl.len(),
+            Input::Files(files) => files.iter().map(|(_, zpl)| zpl.len()).sum(),
+        };
+        (bytes >> 20) as u32 + 1
+    }
+}
+
+/// Rendering needs roughly 8x its input in memory (a 22 MB batch of bitmap labels peaks
+/// near 190 MB), so renders share a budget of one maximum-size body per process: a large
+/// request waits for its share instead of running the pod out of memory, while small ones
+/// (1 permit each) still run side by side.
+static RENDER_BUDGET: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(RENDER_PERMITS);
+const RENDER_PERMITS: usize = MAX_BODY_BYTES >> 20;
+
 fn is_multipart(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
@@ -294,7 +313,10 @@ async fn render(Query(params): Query<HashMap<String, String>>, request: Request)
     let read = start.elapsed();
 
     // Rendering is CPU-bound (PNG takes milliseconds), so keep it off the async workers.
+    // `queue` includes waiting for the memory budget.
     let queued = Instant::now();
+    let permits = input.permits().min(RENDER_PERMITS as u32);
+    let _budget = RENDER_BUDGET.acquire_many(permits).await.expect("the render budget is never closed");
     let result = tokio::task::spawn_blocking(move || {
         let queue = queued.elapsed();
         let rendered = match &input {
@@ -720,13 +742,13 @@ mod tests {
 
     #[tokio::test]
     async fn gzip_limit_counts_decompressed_bytes() {
-        // A 1 MiB run of zeros deflates to about 1 KiB, so 16 MiB is under 20 KiB on the wire.
+        // A 1 MiB run of zeros deflates to about 1 KiB, so 100 MiB is about 100 KiB on the wire.
         let start = Instant::now();
         let pulled = Arc::new(AtomicUsize::new(0));
         let response = post_encoded("/render", "gzip", None, endless_gzip(b"^XA", pulled.clone())).await;
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let pulled = pulled.load(Ordering::Relaxed);
-        assert!(pulled < 64 * 1024, "read {pulled} compressed bytes");
+        assert!(pulled < 256 * 1024, "read {pulled} compressed bytes");
 
         let pulled = Arc::new(AtomicUsize::new(0));
         let head = format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"bomb.zpl\"\r\n\r\n");
@@ -734,7 +756,7 @@ mod tests {
         let response = post_encoded("/render", "gzip", Some(&content_type), endless_gzip(head.as_bytes(), pulled.clone())).await;
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let pulled = pulled.load(Ordering::Relaxed);
-        assert!(pulled < 64 * 1024, "read {pulled} compressed bytes");
+        assert!(pulled < 256 * 1024, "read {pulled} compressed bytes");
         assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
 
         // Just under the limit is fine, though it compresses to almost nothing.
@@ -774,6 +796,14 @@ mod tests {
     fn non_utf8_is_latin1() {
         assert_eq!(zpl_text(b"^FD\xe9^FS".to_vec()), "^FD\u{e9}^FS");
         assert_eq!(zpl_text("é".as_bytes().to_vec()), "é");
+    }
+
+    #[test]
+    fn render_permits_follow_input_size() {
+        assert_eq!(Input::Label(LABEL.to_string()).permits(), 1);
+        let files = vec![("a.zpl".to_string(), "x".repeat(3 << 20)), ("b.zpl".to_string(), "x".repeat(1 << 19))];
+        assert_eq!(Input::Files(files).permits(), 4);
+        assert_eq!(RENDER_PERMITS, 100);
     }
 
     #[test]

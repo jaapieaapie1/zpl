@@ -954,8 +954,18 @@ impl StateManager {
             Command::FieldEmbed { indicator } => self.field.embed = Some(indicator),
             Command::ImageSave { name, print } => self.save_image = Some((stored_name(&name), print)),
             Command::ImageLoad { name } => {
-                if let Some(image) = self.images.get(&stored_name(&name)) {
+                let name = stored_name(&name);
+                if let Some(image) = self.images.get(&name) {
                     out.extend(image.iter().cloned());
+                } else if let Some((bytes_per_row, data)) = self.graphics.get(&name).cloned() {
+                    // ^IS images and ~DG graphics are both .GRF files on a printer, so ^IL
+                    // also loads a downloaded graphic, always at ^FO0,0 (IL.md).
+                    let origin = (self.field_origin_x, self.field_origin_y);
+                    let typeset = std::mem::replace(&mut self.field_typeset, false);
+                    (self.field_origin_x, self.field_origin_y) = (0, 0);
+                    self.emit_graphic(out, bytes_per_row, data, 1, 1);
+                    (self.field_origin_x, self.field_origin_y) = origin;
+                    self.field_typeset = typeset;
                 }
             }
             Command::DownloadFont { name, data } => {
@@ -1581,6 +1591,9 @@ mod tests {
     fn saved_images_and_fonts() {
         let ins = run("^XA^FO1,1^FDbg^FS^ISR:BG.GRF,N^XZ^XA^ILR:BG.GRF^FO1,1^FDfg^FS^XZ");
         assert_eq!(texts(&ins), ["bg", "fg"]);
+        // A ~DG graphic is a .GRF too: ^IL draws it at ^FO0,0, whatever origin is in force.
+        let ins = run("~DGR:LABEL,2,1,FFFF^XA^FO50,60^ILR:LABEL.GRF^XZ");
+        assert!(matches!(ins[..], [DrawInstruction::DrawGraphicField { x: 0, y: 0, bytes_per_row: 1, .. }]));
         let ins = run("~DUR:MYFONT.TTF,2,ABCD^XA^CWQ,R:MYFONT.TTF^FO1,1^AQN,20^FDx^FS^A@N,20,20,R:MYFONT.TTF^FDy^FS^A0N,20^FDz^FS^XZ");
         let fonts: Vec<_> = ins
             .iter()

@@ -12,3 +12,16 @@ Its README reads:
     The license of the outline fonts is the same as for the original fonts,
     i.e. you may freely use, modify, and/or distribute any of these files,
     without limitation.
+
+The METAFONT source (CTAN fonts/ocr-b, ocrbdef.mf) carries the same terms:
+
+    Copyright 1995, 2010 Norbert Schwarz
+    You may freely use, modify and/or distribute this file, without limitation.
+
+Changes made here (fontTools): the conversion named the glyphs at the METAFONT codes 0-31
+and 128-137 after the T1 encoding, so its cmap mapped the national characters to the
+wrong code points (Ä as U+010C, ß as U+0131, ...), ' to nothing and ` to a Gamma. The
+glyphs were renamed after what they draw and the cmap rebuilt: ASCII, Ä Ö Ü ä ö ü ß Æ Ø
+æ ø Œ œ § ¤, and U+2013 / U+2019 / U+201A / U+201D on the hyphen, apostrophe, comma and
+quotation mark. " is the METAFONT's taller second quotation mark (code 137). The font was
+then subset to those characters.

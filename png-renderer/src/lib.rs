@@ -21,6 +21,9 @@ pub use layout::DEJAVU_SANS_BOLD;
 /// Font files, shared with pdf-renderer so the binary holds one copy of each.
 pub static TRIUMVIRATE: &[u8] = include_bytes!("../fonts/ATTriumvirate-BoldCd.otf");
 pub static DEJAVU_SANS_MONO: &[u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
+/// Bitmap font B: DejaVu Sans Mono Bold, cut down to the characters B prints (see
+/// [`bitmap_prints`]) and without hinting.
+pub static DEJAVU_SANS_MONO_BOLD: &[u8] = include_bytes!("../fonts/DejaVuSansMono-Bold.ttf");
 /// Bitmap fonts E (OCR-B) and H (OCR-A); see fonts/LICENSE_OCR.
 pub static OCR_B: &[u8] = include_bytes!("../fonts/OCRB.otf");
 pub static OCR_A: &[u8] = include_bytes!("../fonts/OCRA.ttf");
@@ -154,14 +157,17 @@ pub fn symbol_bytes(data: &str) -> std::borrow::Cow<'_, [u8]> {
     out.into()
 }
 
-/// Whether Labelary prints `c` in bitmap font `font` (compat/cases/ci28_bitmap_*); other
-/// characters are blank. OCR-A (H) has ASCII only, OCR-B (E) ASCII and a few national
-/// characters, the others the Latin-1, Windows-1252 and code page 850 repertoire.
+/// Whether bitmap font `font` prints `c` (compat/cases/ci28_bitmap_*); other characters are
+/// blank. OCR-A (H) has ASCII only, OCR-B (E) ASCII and the national characters of its
+/// METAFONT source (fonts/LICENSE_OCR), plus en dash and closing quotes as their ASCII
+/// forms; the others the Latin-1, Windows-1252 and code page 850 repertoire. Labelary
+/// prints a few code page 850 characters OCR-B lacks as unrelated ASCII ones (¡ as [, É as
+/// @, ƒ as #) and leaves ¤ blank; those follow the spec here (compat/cases/font_e_national).
 pub fn bitmap_prints(font: FontName, c: char) -> bool {
     match font {
         _ if c.is_ascii() => true,
         FontName::FontH => false,
-        FontName::FontE => "ÄÖÜäöüßÆØæø§¤".contains(c),
+        FontName::FontE => "ÄÖÜäöüßÆØæøŒœ§¤\u{2013}\u{2019}\u{201a}\u{201d}".contains(c),
         _ => {
             matches!(c, '\u{a0}'..='\u{ff}' | '\u{2500}'..='\u{25a0}')
                 || "ŒœŠšŽžŸƒˆ˜–—‘’‚“”„†‡•…‰‹›€™ı‗".contains(c)
@@ -196,24 +202,31 @@ pub fn symbol_glyph(c: char) -> (&'static [u8], char) {
 }
 
 /// Outline font Labelary draws bitmap font `font` with: OCR-B for E, OCR-A for H, DejaVu
-/// Sans Mono for the others.
+/// Sans Mono Bold for B and DejaVu Sans Mono for the others.
 pub fn bitmap_face(font: FontName) -> &'static [u8] {
     match font {
+        FontName::FontB => DEJAVU_SANS_MONO_BOLD,
         FontName::FontE => OCR_B,
         FontName::FontH => OCR_A,
         _ => DEJAVU_SANS_MONO,
     }
 }
 
-/// Text in a built-in font as Labelary prints it: soft hyphens not at all, and hyphens and
-/// en dashes as the wide minus sign of a font that has one (Triumvirate, DejaVu Sans Mono).
-pub fn dashes(text: &str, minus: bool) -> std::borrow::Cow<'_, str> {
+/// Text in a built-in font as Labelary prints it: soft hyphens not at all, and hyphens as
+/// the wide minus sign of a font that has one (Triumvirate, DejaVu Sans Mono). En dashes
+/// too in font 0; the bitmap fonts (`bitmap`) draw their own, thinner and lower in DejaVu
+/// Sans Mono (OCR-B's is its hyphen).
+pub fn dashes(text: &str, minus: bool, bitmap: bool) -> std::borrow::Cow<'_, str> {
     if !text.contains(['-', '\u{2013}', '\u{ad}']) {
         return std::borrow::Cow::Borrowed(text);
     }
     text.chars()
         .filter(|&c| c != '\u{ad}')
-        .map(|c| if minus && matches!(c, '-' | '\u{2013}') { '\u{2212}' } else { c })
+        .map(|c| match c {
+            '-' if minus => '\u{2212}',
+            '\u{2013}' if minus && !bitmap => '\u{2212}',
+            _ => c,
+        })
         .collect()
 }
 
@@ -437,8 +450,18 @@ impl TextFont {
         match self.cell {
             None => drawing::draw_text_mut(image, BLACK, x, y, self.scale, &self.font, line),
             Some((pitch, offset)) => {
+                use ab_glyph::{Font, ScaleFont};
+                let scale_x = self.font.as_scaled(self.scale).h_scale_factor();
+                let ocr_b = matches!(self.data, layout::FontData::Static(d) if std::ptr::eq(d, OCR_B));
                 let mut buf = [0u8; 4];
                 for (i, c) in line.chars().enumerate() {
+                    // OCR-B's wide Æ, æ, Œ and œ start at the cell's left edge rather than
+                    // across it (Labelary, compat/cases/font_e_national).
+                    let left = match ocr_b {
+                        true => self.font.outline(self.font.glyph_id(c)).map_or(0.0, |o| o.bounds.min.x * scale_x),
+                        false => f32::INFINITY,
+                    };
+                    let offset = offset.max(-left);
                     let cx = (x as f32 + i as f32 * pitch + offset).round() as i32;
                     drawing::draw_text_mut(image, BLACK, cx, y, self.scale, &self.font, c.encode_utf8(&mut buf));
                 }
@@ -847,7 +870,7 @@ impl PngRenderer {
                     _ => text,
                 };
                 let text = match (custom_font, name) {
-                    (None, n) if n != FontName::Symbol => dashes(&text, font.has_glyph('\u{2212}')).into_owned(),
+                    (None, n) if n != FontName::Symbol => dashes(&text, font.has_glyph('\u{2212}'), font.cell.is_some()).into_owned(),
                     _ => text,
                 };
                 let placement = Placement { orientation: *orientation, justification: *justification, anchor: *anchor };
@@ -1848,6 +1871,22 @@ mod tests {
         assert_eq!(bitmap_cell(FontName::FontE, 24).unwrap().height, 42);
         assert_eq!(bitmap_cell(FontName::FontH, 12).unwrap().width, 22);
         assert_eq!(bitmap_cell(FontName::FontA, 24), bitmap_cell(FontName::FontA, 8));
+    }
+
+    #[test]
+    fn font_e_prints_its_national_characters() {
+        // OCR-B's own Ä and Æ (Æ from the left edge of its cell at 20, not 4 dots across
+        // it), its hyphen for the en dash; É, which it lacks, stays blank.
+        let ink = |text: &str| ink_box(&format!("^XA^CI28^FO20,20^AEN^FD{text}^FS^XZ"), (0, 0, 200, 60));
+        assert!(ink("Ä").is_some() && ink("\u{2013}").is_some() && ink("É").is_none());
+        assert!((20..=21).contains(&ink("Æ").unwrap().0));
+    }
+
+    #[test]
+    fn bitmap_fonts_keep_their_en_dash() {
+        assert_eq!(dashes("a\u{2013}-", true, false), "a\u{2212}\u{2212}");
+        assert_eq!(dashes("a\u{2013}-", true, true), "a\u{2013}\u{2212}");
+        assert_eq!(dashes("a\u{2013}-", false, true), "a\u{2013}-");
     }
 
     #[test]

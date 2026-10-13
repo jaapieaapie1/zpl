@@ -23,7 +23,7 @@ use ttf_parser::{Face, GlyphId, RawFace, Tag};
 pub enum FontId {
     /// ATTriumvirate-BoldCd.otf (CFF) — ZPL scalable font 0 / text default.
     Triumvirate,
-    /// DejaVuSansMono.ttf — barcode interpretation lines and the bitmap fonts A–H.
+    /// DejaVuSansMono.ttf — barcode interpretation lines and the bitmap fonts A, C, D, F, G.
     DejaVuMono,
     /// DejaVuSans-Bold.ttf — per-character fallback for glyphs the other fonts lack
     /// (Greek, Cyrillic, symbols such as ™ ® €, ...).
@@ -32,10 +32,12 @@ pub enum FontId {
     OcrB,
     /// OCRA.ttf — bitmap font H.
     OcrA,
+    /// DejaVuSansMono-Bold.ttf — bitmap font B.
+    DejaVuMonoBold,
 }
 
 /// Number of [`FontId`]s, for the per-font caches.
-pub(crate) const BUILTIN_FONTS: usize = 5;
+pub(crate) const BUILTIN_FONTS: usize = 6;
 
 
 impl FontId {
@@ -50,6 +52,7 @@ impl FontId {
             FontId::DejaVuSansBold => png_renderer::DEJAVU_SANS_BOLD,
             FontId::OcrB => png_renderer::OCR_B,
             FontId::OcrA => png_renderer::OCR_A,
+            FontId::DejaVuMonoBold => png_renderer::DEJAVU_SANS_MONO_BOLD,
         }
     }
 
@@ -67,6 +70,7 @@ impl FontId {
             FontId::DejaVuSansBold => Name(b"F2"),
             FontId::OcrB => Name(b"F3"),
             FontId::OcrA => Name(b"F4"),
+            FontId::DejaVuMonoBold => Name(b"F5"),
         }
     }
 
@@ -78,6 +82,7 @@ impl FontId {
             FontId::DejaVuSansBold => "DejaVuSans-Bold",
             FontId::OcrB => "OCRB",
             FontId::OcrA => "OCRA",
+            FontId::DejaVuMonoBold => "DejaVuSansMono-Bold",
         }
     }
 

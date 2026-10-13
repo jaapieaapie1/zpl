@@ -23,10 +23,11 @@ const FALLBACK_CONDENSE: f32 = 0.7;
 
 /// Outline fonts Labelary draws the bitmap fonts with (see png-renderer's `bitmap_cell`):
 /// DejaVu Sans Mono, the regular face barcode interpretation lines embed anyway (a further
-/// embedded font costs ~60 µs a label), OCR-B for E and OCR-A for H. They are emboldened by
-/// stroking the outlines, see [`BITMAP_STROKE_EM`].
+/// embedded font costs ~60 µs a label), its bold face for B, OCR-B for E and OCR-A for H.
+/// They are emboldened by stroking the outlines, see [`BITMAP_STROKE_EM`].
 fn bitmap_font(font: FontName) -> FontId {
     match font {
+        FontName::FontB => FontId::DejaVuMonoBold,
         FontName::FontE => FontId::OcrB,
         FontName::FontH => FontId::OcrA,
         _ => FontId::DejaVuMono,
@@ -269,6 +270,30 @@ impl Field {
     /// Draws `text` with its first character's cell (or pen position) at `x` and its
     /// baseline at `baseline_y`, switching fonts for characters the field's font lacks.
     fn show(&self, ctx: &mut Ctx, text: &str, x: f32, baseline_y: f32) {
+        // OCR-B's wide Æ, æ, Œ and œ start at the cell's left edge rather than across it
+        // (as png-renderer draws them): each such glyph is shown on its own, moved right.
+        if let (Some(b), FontKey::Builtin(FontId::OcrB)) = (self.bitmap, self.font) {
+            let face = FontId::OcrB.face();
+            let scale = self.size_x / face.units_per_em() as f32;
+            let left = |c: char| face.glyph_index(c).and_then(|g| face.glyph_bounding_box(g)).map(|r| r.x_min);
+            let step = b.pitch + self.gap;
+            let mut start = (0, 0);
+            for (i, (at, c)) in text.char_indices().enumerate() {
+                let shift = left(c).map_or(0.0, |x_min| -(b.offset + x_min as f32 * scale));
+                if shift > 0.0 {
+                    self.show_runs(ctx, &text[start.1..at], x + start.0 as f32 * step, baseline_y);
+                    let end = at + c.len_utf8();
+                    self.show_runs(ctx, &text[at..end], x + i as f32 * step + shift, baseline_y);
+                    start = (i + 1, end);
+                }
+            }
+            return self.show_runs(ctx, &text[start.1..], x + start.0 as f32 * step, baseline_y);
+        }
+        self.show_runs(ctx, text, x, baseline_y)
+    }
+
+    /// [`Field::show`] without moving any glyph out of its cell's place.
+    fn show_runs(&self, ctx: &mut Ctx, text: &str, x: f32, baseline_y: f32) {
         if text.is_empty() {
             return;
         }
@@ -548,7 +573,7 @@ pub(crate) fn render(ctx: &mut Ctx, instruction: &DrawInstruction) {
     }
     // Dashes as Labelary prints them in the built-in fonts (see png-renderer's `dashes`).
     if let (FontKey::Builtin(id), false) = (field.font, *font == FontName::Symbol)
-        && let Cow::Owned(mapped) = png_renderer::dashes(&text, id.face().glyph_index('\u{2212}').is_some())
+        && let Cow::Owned(mapped) = png_renderer::dashes(&text, id.face().glyph_index('\u{2212}').is_some(), field.bitmap.is_some())
     {
         text = Cow::Owned(mapped);
     }
@@ -1657,6 +1682,17 @@ mod tests {
         assert!(approx(field.measure(&fonts, "AЖB"), a + zhe + char_advance(FontId::Triumvirate, 'B') * 40.0));
         let pdf = PdfRenderer::new(400, 300).render(&[draw("AЖB", Orientation::Normal, Justification::Left)]);
         assert!(contains(&pdf, b"DejaVuSans-Bold"));
+    }
+
+    #[test]
+    fn font_b_is_bold_and_ocr_b_wide_glyphs_start_in_their_cell() {
+        assert!(content(&with_font("AB", FontName::FontB, 0, 0)).contains("/F5 1 Tf"));
+        // Æ reaches left of its cell: shown on its own, moved right of the pen.
+        let c = content(&with_font("AÆB", FontName::FontE, 0, 0));
+        let tm = text_matrices(&c);
+        assert_eq!(tm.len(), 3, "{c}");
+        let (pitch, step) = (tm[2][4] - tm[0][4], tm[1][4] - tm[0][4]);
+        assert!(step > pitch / 2.0, "{tm:?}");
     }
 
     #[test]

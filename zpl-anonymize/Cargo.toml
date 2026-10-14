@@ -1,0 +1,9 @@
+[package]
+name = "zpl-anonymize"
+description = "Replaces the text and barcode data in ZPL with random characters, for bug reports"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zpl-tokenizer = { path = "../zpl-tokenizer" }
+sha2 = "0.10"

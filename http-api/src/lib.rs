@@ -29,13 +29,19 @@
 //!   Each key is rate limited ([`rate_limit`]; by default 50 requests a second with
 //!   bursts of 200, per replica): over it, `/render` answers 429 with `Retry-After`.
 //!   `RateLimit-Limit` and `RateLimit-Remaining` give the burst and what is left of it.
-//! - `GET /health` returns `ok`.
+//! - Renders run a few at a time, by default one per available CPU, and a limited number
+//!   of requests wait for their turn ([`admission`]): when that line is full, or a request
+//!   has waited 5 s, `/render` answers 503 with `Retry-After: 1`. Shed requests are not
+//!   billed; with `timings`, their `Server-Timing` names the reason (`shed;desc=…`).
+//! - `GET /health` returns `ok`. It never waits for rendering, so it stays fast under load.
 //! - `GET /playground/` serves the live ZPL editor (`zpl-wasm/www`), which renders in the
 //!   browser with WebAssembly. Files come from `ZPL_PLAYGROUND_DIR`; a `.gz` next to a
 //!   file is sent instead when the client accepts gzip.
 
+pub mod admission;
 pub mod billing;
 pub mod console;
+mod log_every;
 pub mod rate_limit;
 
 use std::collections::HashMap;
@@ -50,6 +56,7 @@ use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Query, Request};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
+use admission::{Admission, Shed};
 use axum::{Extension, Router};
 use billing::Billing;
 use pdf_renderer::PdfRenderer;
@@ -80,8 +87,14 @@ pub fn router_with_playground(dir: &Path) -> Router {
     router_with(dir, None)
 }
 
-/// The API with the playground in `dir`, requiring API keys when `billing` is given.
+/// The API with the playground in `dir`, requiring API keys when `billing` is given, with
+/// the default render concurrency and queue.
 pub fn router_with(dir: &Path, billing: Option<Arc<Billing>>) -> Router {
+    router_with_admission(dir, billing, Arc::new(Admission::with_defaults()))
+}
+
+/// Like [`router_with`], rendering as `admission` allows.
+pub fn router_with_admission(dir: &Path, billing: Option<Arc<Billing>>, admission: Arc<Admission>) -> Router {
     Router::new()
         // The raw body has its own limit; this one is for multipart forms. Both count the
         // decompressed bytes, as the body is inflated before the handler reads it. The
@@ -105,6 +118,7 @@ pub fn router_with(dir: &Path, billing: Option<Arc<Billing>>) -> Router {
             ),
         )
         .layer(Extension(billing))
+        .layer(Extension(admission))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,7 +270,7 @@ enum Input {
 }
 
 impl Input {
-    /// Render permits this input takes from [`RENDER_BUDGET`]: one per started MiB.
+    /// Memory budget this input takes ([`admission::RENDER_PERMITS`]): one per started MiB.
     fn permits(&self) -> u32 {
         let bytes = match self {
             Input::Label(zpl) => zpl.len(),
@@ -290,13 +304,6 @@ impl Input {
     }
 }
 
-/// Rendering needs roughly 8x its input in memory (a 22 MB batch of bitmap labels peaks
-/// near 190 MB), so renders share a budget of one maximum-size body per process: a large
-/// request waits for its share instead of running the pod out of memory, while small ones
-/// (1 permit each) still run side by side.
-static RENDER_BUDGET: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(RENDER_PERMITS);
-const RENDER_PERMITS: usize = MAX_BODY_BYTES >> 20;
-
 fn is_multipart(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
@@ -324,26 +331,56 @@ async fn read_files(mut multipart: Multipart) -> Result<Vec<(String, String)>, M
     Ok(files)
 }
 
+/// 503 for a request turned away under load. With `timings`, `Server-Timing` gives the
+/// stages so far and the reason.
+fn overloaded(shed: Shed, stages: Option<Vec<(&'static str, Duration)>>, start: Instant) -> Response {
+    let (reason, message) = match shed {
+        Shed::QueueFull => ("queue full", "The renderer is busy: too many requests are waiting. Retry after 1 s."),
+        Shed::WaitedTooLong => ("waited too long", "The renderer is busy: the request waited too long. Retry after 1 s."),
+    };
+    let mut response = error(StatusCode::SERVICE_UNAVAILABLE, message);
+    response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    if let Some(mut stages) = stages {
+        stages.push(("total", start.elapsed()));
+        let value = format!("{}, shed;desc=\"{reason}\"", server_timing(&stages));
+        response
+            .headers_mut()
+            .insert("server-timing", HeaderValue::from_str(&value).expect("server-timing is ASCII"));
+    }
+    response
+}
+
 async fn render(
     Extension(billing): Extension<Option<Arc<Billing>>>,
+    Extension(admission): Extension<Arc<Admission>>,
     Query(params): Query<HashMap<String, String>>,
     request: Request,
 ) -> Response {
     let start = Instant::now();
+    let timings_enabled = params.get("timings").is_some_and(|v| !matches!(v.as_str(), "0" | "false"));
 
-    // Check the key and its rate limit before reading a possibly large body.
+    // Check the key, the load and the rate limit before reading a possibly large body.
+    // Shedding comes before the rate limit, so a 503 does not use up the key's tokens.
     let (caller, limit_headers) = match &billing {
         Some(billing) => {
             let caller = match billing.authenticate(request.headers()) {
                 Ok(caller) => caller,
                 Err(response) => return response,
             };
+            if let Err(shed) = admission.check() {
+                return overloaded(shed, timings_enabled.then(Vec::new), start);
+            }
             match billing.rate_limit(&caller) {
                 Ok(headers) => (Some(caller), headers),
                 Err(response) => return response,
             }
         }
-        None => (None, HeaderMap::new()),
+        None => {
+            if let Err(shed) = admission.check() {
+                return overloaded(shed, timings_enabled.then(Vec::new), start);
+            }
+            (None, HeaderMap::new())
+        }
     };
     let watermark = caller.as_ref().filter(|c| c.is_test()).map(|_| TEST_WATERMARK);
 
@@ -362,7 +399,6 @@ async fn render(
         Some(Ok(dpmm)) if DPMM_VALUES.contains(&dpmm) => dpmm,
         Some(_) => return error(StatusCode::BAD_REQUEST, "dpmm must be 6, 8, 12 or 24 (dots per millimetre)"),
     };
-    let timings_enabled = params.get("timings").is_some_and(|v| !matches!(v.as_str(), "0" | "false"));
 
     let input = if is_multipart(request.headers()) {
         let multipart = match Multipart::from_request(request, &()).await {
@@ -396,14 +432,19 @@ async fn render(
     };
     let read = start.elapsed();
 
-    // Rendering is CPU-bound (PNG takes milliseconds), so keep it off the async workers.
-    // `queue` includes waiting for the memory budget.
+    // Rendering is CPU-bound (PNG takes milliseconds), so keep it off the async workers,
+    // a few at a time. `queue` includes waiting for the memory budget.
     let queued = Instant::now();
-    let permits = input.permits().min(RENDER_PERMITS as u32);
-    let _budget = RENDER_BUDGET.acquire_many(permits).await.expect("the render budget is never closed");
+    let ticket = match admission.admit(input.permits()).await {
+        Ok(ticket) => ticket,
+        Err(shed) => return overloaded(shed, timings_enabled.then(|| vec![("read", read), ("queue", queued.elapsed())]), start),
+    };
+    let queue = queued.elapsed();
     let fingerprint_needed = caller.as_ref().is_some_and(|c| c.idempotency_key.is_some());
+    // The ticket goes with the render: if the client hangs up, the render still holds its
+    // slot until it is done.
     let result = tokio::task::spawn_blocking(move || {
-        let queue = queued.elapsed();
+        let _ticket = ticket;
         // Only requests with an Idempotency-Key need it; microseconds for a typical label.
         let fingerprint = fingerprint_needed.then(|| input.fingerprint(format, page, dpmm));
         let rendered = match &input {
@@ -710,6 +751,52 @@ mod tests {
                 assert_eq!(response.status(), StatusCode::OK);
                 assert!(response.headers().get("ratelimit-remaining").is_none());
             }
+        }
+
+        #[tokio::test]
+        async fn overload_is_shed_unbilled() {
+            let (billing, mut rx) = billing();
+            let admission = Arc::new(Admission::new(1, 0, Duration::from_secs(5)));
+            let router = router_with_admission(&playground_dir(), Some(billing), admission.clone());
+            let request = |uri: &str| {
+                Request::post(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {LIVE}"))
+                    .body(Body::from(LABEL))
+                    .unwrap()
+            };
+            // The only render slot is taken and nobody may wait: turned away, before the
+            // body is read, without usage or a rate limit token.
+            let busy = admission.admit(1).await.unwrap();
+            let response = router.clone().oneshot(request("/render?timings")).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+            assert!(response.headers().get("x-labels-billed").is_none());
+            assert!(response.headers().get("ratelimit-remaining").is_none());
+            let timing = response.headers()["server-timing"].to_str().unwrap().to_owned();
+            assert!(timing.starts_with("total;dur=") && timing.ends_with("shed;desc=\"queue full\""), "{timing}");
+            assert!(text(response).await.starts_with("The renderer is busy"));
+            assert!(rx.try_recv().is_err(), "a shed request is not billed");
+
+            // Health checks never wait for rendering.
+            let health = router.clone().oneshot(Request::get("/health").body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(health.status(), StatusCode::OK);
+
+            drop(busy);
+            let response = router.oneshot(request("/render")).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(rx.try_recv().unwrap().labels, 1);
+        }
+
+        #[tokio::test]
+        async fn waiting_too_long_is_shed() {
+            let admission = Arc::new(Admission::new(1, 4, Duration::from_millis(50)));
+            let router = router_with_admission(&playground_dir(), None, admission.clone());
+            let _busy = admission.admit(1).await.unwrap();
+            let response = router.oneshot(Request::post("/render?timings").body(Body::from(LABEL)).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+            let timing = response.headers()["server-timing"].to_str().unwrap();
+            assert!(timing.starts_with("read;dur=") && timing.contains("queue;dur=") && timing.contains("waited too long"));
         }
 
         #[tokio::test]
@@ -1102,7 +1189,7 @@ mod tests {
         assert_eq!(Input::Label(LABEL.to_string()).permits(), 1);
         let files = vec![("a.zpl".to_string(), "x".repeat(3 << 20)), ("b.zpl".to_string(), "x".repeat(1 << 19))];
         assert_eq!(Input::Files(files).permits(), 4);
-        assert_eq!(RENDER_PERMITS, 100);
+        assert_eq!(admission::RENDER_PERMITS, 100);
     }
 
     #[test]

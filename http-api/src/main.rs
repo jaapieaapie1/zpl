@@ -1,5 +1,6 @@
 //! `zpl-server`: serves the rendering API. Listens on `ZPL_API_ADDR` (default
-//! `127.0.0.1:3000`). API keys and usage reporting: see `zpl_http_api::billing`.
+//! `127.0.0.1:3000`). API keys and usage reporting: see `zpl_http_api::billing`; render
+//! concurrency and load shedding: see `zpl_http_api::admission`.
 
 #[tokio::main]
 async fn main() {
@@ -17,6 +18,17 @@ async fn main() {
         }
     };
 
+    let admission = zpl_http_api::admission::Admission::from_env().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    println!(
+        "Rendering {} at once; up to {} requests wait, each at most {} ms",
+        admission.concurrency(),
+        admission.max_queue(),
+        admission.max_wait().as_millis()
+    );
+
     zpl_http_api::warm_up();
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| {
@@ -25,7 +37,8 @@ async fn main() {
     });
     println!("Listening on http://{addr}");
 
-    let router = zpl_http_api::router_with(&zpl_http_api::playground_dir(), billing);
+    let router =
+        zpl_http_api::router_with_admission(&zpl_http_api::playground_dir(), billing, std::sync::Arc::new(admission));
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await

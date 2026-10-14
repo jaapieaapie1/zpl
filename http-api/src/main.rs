@@ -11,7 +11,7 @@ async fn main() {
         std::process::exit(1);
     });
     let (billing, publisher) = match billing {
-        Some((billing, publisher)) => (Some(billing), Some(publisher)),
+        Some((billing, publisher)) => (Some(billing), publisher),
         None => {
             println!("API keys are off (ZPL_KEYS_PUBLIC_KEYS is not set)");
             (None, None)
@@ -44,10 +44,10 @@ async fn main() {
         .await
         .expect("server error");
 
-    // The router (and with it the usage sender) is gone: let the publisher send what is
-    // still queued, within the shutdown grace period.
+    // Every request is done: publish the usage still adding up, within the shutdown grace
+    // period (45 s in Kubernetes, 10 s of it in preStop).
     if let Some(publisher) = publisher {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), publisher).await;
+        publisher.finish(std::time::Duration::from_secs(20)).await;
     }
 }
 

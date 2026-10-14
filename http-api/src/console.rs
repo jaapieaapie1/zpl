@@ -22,7 +22,7 @@ pub const USAGE_EXCHANGE: &str = "zpl.usage";
 const LEEWAY: i64 = 60;
 
 /// Billed (`live`) or free with watermarked labels (`test`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyEnv {
     Live,
@@ -128,18 +128,41 @@ fn decode_json<T: for<'de> Deserialize<'de>>(part: &str) -> Result<T, TokenError
     serde_json::from_slice(&bytes).map_err(|_| TokenError::Malformed)
 }
 
-/// One billable request, published to [`USAGE_EXCHANGE`].
+/// `kind` of [`UsageAggregate`], and its AMQP `type` property. Consumers tell it from the
+/// older one-message-per-request format, which has no `kind`, by this field.
+pub const AGGREGATE_KIND: &str = "aggregate";
+
+/// Usage of one key in one format over a short window (`ZPL_USAGE_WINDOW_MS`), published to
+/// [`USAGE_EXCHANGE`]. Requests with an `Idempotency-Key` are listed one by one in
+/// `idempotent` (not in `labels` and `requests`), so consumers count each `request_id` once
+/// however often it is retried, on whichever renderer. `at` and `until` (RFC 3339) are the
+/// times of the first and last request counted, always on the same UTC day.
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct UsageEvent {
-    pub request_id: Uuid,
+pub struct UsageAggregate {
+    /// Always [`AGGREGATE_KIND`].
+    pub kind: &'static str,
+    /// Unique (UUIDv7); a redelivered message keeps it, so consumers store it once.
+    pub id: Uuid,
     pub key_id: Uuid,
     pub org_id: Uuid,
     pub env: KeyEnv,
-    pub labels: u32,
     pub format: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub idempotency_key: Option<String>,
-    /// RFC 3339.
+    /// Labels and requests without an `Idempotency-Key`.
+    pub labels: u32,
+    pub requests: u32,
+    pub at: String,
+    pub until: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub idempotent: Vec<IdempotentRequest>,
+}
+
+/// A request with an `Idempotency-Key`: its id is derived from the key and the rendered
+/// content, so a retry has the same id and is counted once.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct IdempotentRequest {
+    pub request_id: Uuid,
+    pub labels: u32,
+    pub idempotency_key: String,
     pub at: String,
 }
 

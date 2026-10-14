@@ -43,6 +43,7 @@ pub mod billing;
 pub mod console;
 mod log_every;
 pub mod rate_limit;
+pub mod usage;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -486,7 +487,7 @@ async fn render(
             Format::Pdf => (rendered.page_count, "pdf"),
             Format::Png => (1, "png"),
         };
-        let billed = billing.record(caller, labels, kind, fingerprint.as_ref()).await;
+        let billed = billing.record(caller, labels, kind, fingerprint.as_ref());
         response.headers_mut().insert("x-labels-billed", HeaderValue::from(billed));
     }
     if multipart {
@@ -567,11 +568,18 @@ mod tests {
         use crate::console::tests::{EXPIRED, KEYS, LIVE, TEST};
         use crate::console::{KeyEnv, Revocation, RevocationList, Verifier};
         use crate::rate_limit::RateLimiter;
-        use tokio::sync::mpsc;
+        use crate::usage::Usage;
 
-        fn billing() -> (Arc<Billing>, mpsc::Receiver<crate::console::UsageEvent>) {
-            let (tx, rx) = mpsc::channel(16);
-            (Billing::with_verifier(Verifier::from_config(KEYS).unwrap(), Some(tx)), rx)
+        fn billing() -> (Arc<Billing>, Arc<Usage>) {
+            let usage = Usage::new();
+            (Billing::with_verifier(Verifier::from_config(KEYS).unwrap(), Some(usage.clone())), usage)
+        }
+
+        /// The one message for the usage recorded since the last cut.
+        fn one_message(usage: &Usage) -> crate::console::UsageAggregate {
+            let mut messages = usage.cut();
+            assert_eq!(messages.len(), 1, "{messages:?}");
+            messages.pop().unwrap()
         }
 
         async fn send(billing: &Arc<Billing>, uri: &str, key: Option<&str>, extra: &[(&str, &str)]) -> Response {
@@ -605,30 +613,40 @@ mod tests {
 
         #[tokio::test]
         async fn bills_live_pages_and_reports_usage() {
-            let (billing, mut rx) = billing();
+            let (billing, usage) = billing();
             let response = send(&billing, "/render?format=pdf", Some(LIVE), &[("idempotency-key", "order-1")]).await;
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response.headers()["x-labels-billed"], "3");
-            let event = rx.try_recv().unwrap();
-            assert_eq!((event.labels, event.env, event.format), (3, KeyEnv::Live, "pdf"));
-            assert_eq!(event.key_id, uuid::Uuid::from_u128(0xb));
-            // A retry with the same Idempotency-Key gets the same request id...
+            let message = one_message(&usage);
+            assert_eq!((message.env, message.format, message.labels, message.requests), (KeyEnv::Live, "pdf", 0, 0));
+            assert_eq!((message.key_id, message.org_id), (uuid::Uuid::from_u128(0xb), uuid::Uuid::from_u128(0xa)));
+            let request = &message.idempotent[0];
+            assert_eq!((request.labels, request.idempotency_key.as_str()), (3, "order-1"));
+            // A retry with the same Idempotency-Key gets the same request id, in the same
+            // window or a later one...
             send(&billing, "/render?format=pdf", Some(LIVE), &[("idempotency-key", "order-1")]).await;
-            assert_eq!(rx.try_recv().unwrap().request_id, event.request_id);
+            send(&billing, "/render?format=pdf", Some(LIVE), &[("idempotency-key", "order-1")]).await;
+            let retried = one_message(&usage);
+            assert_eq!(retried.idempotent.len(), 1, "listed once per window");
+            assert_eq!(retried.idempotent[0].request_id, request.request_id);
+            assert_ne!(retried.id, message.id);
             // ...but reusing it for another page or format is a new, billed request.
             send(&billing, "/render?format=png&page=2", Some(LIVE), &[("idempotency-key", "order-1")]).await;
-            assert_ne!(rx.try_recv().unwrap().request_id, event.request_id);
-            // A PNG is one page, whatever the label holds.
+            assert_ne!(one_message(&usage).idempotent[0].request_id, request.request_id);
+            // A PNG is one page, whatever the label holds; requests without a key add up.
             let png = send(&billing, "/render?format=png", Some(LIVE), &[]).await;
             assert_eq!(png.headers()["x-labels-billed"], "1");
+            send(&billing, "/render?format=png", Some(LIVE), &[]).await;
+            let pngs = one_message(&usage);
+            assert_eq!((pngs.format, pngs.labels, pngs.requests, pngs.idempotent.len()), ("png", 2, 2, 0));
         }
 
         #[tokio::test]
         async fn test_keys_are_free_and_watermarked() {
-            let (billing, mut rx) = billing();
+            let (billing, usage) = billing();
             let test = send(&billing, "/render?format=png", Some(TEST), &[]).await;
             assert_eq!(test.headers()["x-labels-billed"], "0");
-            assert_eq!(rx.try_recv().unwrap().env, KeyEnv::Test);
+            assert_eq!(one_message(&usage).env, KeyEnv::Test);
             let live = send(&billing, "/render?format=png", Some(LIVE), &[]).await;
             let (test, live) = (body_bytes(test).await, body_bytes(live).await);
             let ink = |png: &[u8]| {
@@ -755,7 +773,7 @@ mod tests {
 
         #[tokio::test]
         async fn overload_is_shed_unbilled() {
-            let (billing, mut rx) = billing();
+            let (billing, usage) = billing();
             let admission = Arc::new(Admission::new(1, 0, Duration::from_secs(5)));
             let router = router_with_admission(&playground_dir(), Some(billing), admission.clone());
             let request = |uri: &str| {
@@ -775,7 +793,7 @@ mod tests {
             let timing = response.headers()["server-timing"].to_str().unwrap().to_owned();
             assert!(timing.starts_with("total;dur=") && timing.ends_with("shed;desc=\"queue full\""), "{timing}");
             assert!(text(response).await.starts_with("The renderer is busy"));
-            assert!(rx.try_recv().is_err(), "a shed request is not billed");
+            assert!(usage.is_empty(), "a shed request is not billed");
 
             // Health checks never wait for rendering.
             let health = router.clone().oneshot(Request::get("/health").body(Body::empty()).unwrap()).await.unwrap();
@@ -784,7 +802,7 @@ mod tests {
             drop(busy);
             let response = router.oneshot(request("/render")).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(rx.try_recv().unwrap().labels, 1);
+            assert_eq!(one_message(&usage).labels, 1);
         }
 
         #[tokio::test]

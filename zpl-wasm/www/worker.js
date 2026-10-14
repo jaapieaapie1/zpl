@@ -1,10 +1,11 @@
-// Renders labels off the main thread. Messages in: { id, kind: "rgba" | "pdf", zpl, debug, page,
-// dpmm } (dpmm: printer resolution in dots/mm, 6, 8, 12 or 24).
+// Renders labels off the main thread. Messages in: { id, kind: "rgba" | "pdf" | "units", zpl,
+// debug, page, dpmm, at } (dpmm: printer resolution in dots/mm, 6, 8, 12 or 24; at: source
+// offset of a ^FO/^FT for "units", answered with fieldUnits in zpl-wasm/src/lib.rs).
 // Messages out: { id, kind, ok, ...result } or { id, crashed } after a Rust panic, which
 // leaves the wasm instance unusable; the page then starts a fresh worker. "rgba" results
 // carry `elements`, laid out as described at Frame.takeElements in zpl-wasm/src/lib.rs, and
 // `page` (0-based, clamped to the last page) and `pageCount`.
-import init, { renderRgba, renderPdf } from "./pkg/zpl_wasm.js";
+import init, { renderRgba, renderPdf, fieldUnits } from "./pkg/zpl_wasm.js";
 
 const ready = init();
 
@@ -14,11 +15,14 @@ function localClock() {
   return Math.floor(now.getTime() / 1000) - now.getTimezoneOffset() * 60;
 }
 
-self.onmessage = async ({ data: { id, kind, zpl, debug, page, dpmm } }) => {
+self.onmessage = async ({ data: { id, kind, zpl, debug, page, dpmm, at } }) => {
   await ready;
   const start = performance.now();
   try {
-    if (kind === "pdf") {
+    if (kind === "units") {
+      const [dots, format] = fieldUnits(zpl, at, dpmm);
+      self.postMessage({ id, kind, ok: true, dots, format });
+    } else if (kind === "pdf") {
       const bytes = renderPdf(zpl, localClock(), dpmm);
       self.postMessage({ id, kind, ok: true, bytes, ms: performance.now() - start }, [bytes.buffer]);
     } else {

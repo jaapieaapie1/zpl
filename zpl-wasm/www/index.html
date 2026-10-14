@@ -121,6 +121,8 @@
   }
   #preview-pane.pixelated canvas { image-rendering: pixelated; }
   #preview-pane.stale canvas { opacity: .55; transition: opacity .2s; }
+  #stage canvas { touch-action: none; }
+  #preview-pane.dragging canvas { opacity: 1; transition: none; cursor: move; }
   .outline {
     position: absolute;
     display: none;

@@ -87,6 +87,12 @@ impl<'a> Parser<'a> {
         });
     }
 
+    /// Format dots per ^MU unit for the commands parsed so far: 1 in dots, else fractional
+    /// values are allowed.
+    pub fn unit_scale(&self) -> f32 {
+        self.unit_scale.get()
+    }
+
     pub fn parse(mut self) -> Result<Vec<Command>, ParseError> {
         let mut commands = Vec::new();
 

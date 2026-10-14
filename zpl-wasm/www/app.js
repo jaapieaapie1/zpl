@@ -2,7 +2,8 @@
 // is rendered; edits made while a render runs collapse into one follow-up render.
 //
 // Clicking an element on the label selects its source in the editor, and moving the
-// editor cursor into a field outlines it on the label. Input with several labels (or ^PQ
+// editor cursor into a field outlines it on the label. Dragging a field placed by ^FO/^FT
+// moves it: the preview follows the drag and the drop rewrites the command's coordinates. Input with several labels (or ^PQ
 // copies) shows one page at a time, picked in the header.
 
 const SAMPLE = `^XA
@@ -86,7 +87,8 @@ let worker;
 let nextId = 1;
 let inflight = null; // id of the preview render running in the worker
 let dirty = false; // an edit arrived while `inflight` was running
-const pdfRequests = new Map(); // id -> resolve
+const requests = new Map(); // id -> resolve, for "pdf" and "units" requests
+let draft = null; // the source with a dragged field moved; previewed instead of the editor's
 
 function startWorker() {
   worker = new Worker(new URL("worker.js", import.meta.url), { type: "module" });
@@ -101,8 +103,8 @@ function startWorker() {
 function restartWorker(reason) {
   worker.terminate();
   inflight = null;
-  for (const resolve of pdfRequests.values()) resolve({ ok: false, message: `Renderer crashed: ${reason}` });
-  pdfRequests.clear();
+  for (const resolve of requests.values()) resolve({ ok: false, message: `Renderer crashed: ${reason}` });
+  requests.clear();
   showProblem({ message: `Renderer crashed: ${reason}` });
   status.textContent = "Renderer crashed — restarted";
   pane.classList.remove("stale");
@@ -117,21 +119,22 @@ function requestPreview() {
   dirty = false;
   inflight = nextId++;
   pane.classList.add("stale");
-  worker.postMessage({ id: inflight, kind: "rgba", zpl: editor.value, debug: debug.checked, page, dpmm: Number(dpmm.value) });
+  const zpl = draft ?? editor.value;
+  worker.postMessage({ id: inflight, kind: "rgba", zpl, debug: debug.checked, page, dpmm: Number(dpmm.value) });
 }
 
-function requestPdf() {
+function request(kind, message) {
   const id = nextId++;
   return new Promise((resolve) => {
-    pdfRequests.set(id, resolve);
-    worker.postMessage({ id, kind: "pdf", zpl: editor.value, dpmm: Number(dpmm.value) });
+    requests.set(id, resolve);
+    worker.postMessage({ id, kind, zpl: editor.value, dpmm: Number(dpmm.value), ...message });
   });
 }
 
 function onResult(data) {
-  if (data.kind === "pdf") {
-    const resolve = pdfRequests.get(data.id);
-    pdfRequests.delete(data.id);
+  if (data.kind !== "rgba") {
+    const resolve = requests.get(data.id);
+    requests.delete(data.id);
     if (data.crashed) return restartWorker(data.crashed);
     return resolve?.(data);
   }
@@ -206,7 +209,9 @@ function applyZoom() {
   canvas.style.width = `${canvas.width * scale}px`;
   canvas.style.height = `${canvas.height * scale}px`;
   placeOutline(hoverBox, hoverField);
-  placeOutline(selectedBox, selectedField);
+  // The draft's elements have moved spans; a dragged field keeps the area it was grabbed by.
+  if (drag?.moved) placeArea(selectedBox, drag.area, [drag.dx, drag.dy]);
+  else placeOutline(selectedBox, selectedField);
 }
 
 new ResizeObserver(() => { if (zoom.value === "fit") applyZoom(); }).observe(pane);
@@ -228,7 +233,8 @@ function setElements(flat) {
     });
   }
   // Source offsets moved if the edit was before the selection; re-find it from the editor.
-  if (selectedField) selectFromEditor(selectedFrom === "click");
+  // While dragging, the elements belong to the draft, not the editor.
+  if (selectedField && !drag) selectFromEditor(selectedFrom === "click");
 }
 
 // A field is identified by its source span; every element it drew shares it.
@@ -255,11 +261,15 @@ function fieldArea(field) {
 }
 
 function placeOutline(box, field) {
-  const area = field && fieldArea(field);
+  placeArea(box, field && fieldArea(field));
+}
+
+// `offset` shifts the area by [dx, dy] dots, for a field being dragged.
+function placeArea(box, area, [dx, dy] = [0, 0]) {
   box.classList.toggle("visible", Boolean(area));
   if (!area) return;
-  box.style.left = `${area.x * scale}px`;
-  box.style.top = `${area.y * scale}px`;
+  box.style.left = `${(area.x + dx) * scale}px`;
+  box.style.top = `${(area.y + dy) * scale}px`;
   box.style.width = `${(area.right - area.x) * scale}px`;
   box.style.height = `${(area.bottom - area.y) * scale}px`;
 }
@@ -282,9 +292,10 @@ function pointerDots(event) {
 }
 
 canvas.addEventListener("mousemove", (event) => {
+  if (drag) return;
   const element = elementAt(...pointerDots(event));
   hoverField = element?.field ?? null;
-  canvas.style.cursor = element ? "pointer" : "default";
+  canvas.style.cursor = !element ? "default" : originCommand(element.field) ? "move" : "pointer";
   placeOutline(hoverBox, sameField(hoverField, selectedField) ? null : hoverField);
 });
 
@@ -294,6 +305,10 @@ canvas.addEventListener("mouseleave", () => {
 });
 
 canvas.addEventListener("click", (event) => {
+  if (dragged) {
+    dragged = false;
+    return;
+  }
   const element = elementAt(...pointerDots(event));
   if (!element) {
     select(null, null);
@@ -337,6 +352,114 @@ function selectFromEditor(keepClick = false) {
   const clicked = keepClick || (selectedFrom === "click" && sameField(field, selectedField));
   select(field, clicked ? "click" : "editor");
 }
+
+// --- Dragging fields --------------------------------------------------------------
+
+let drag = null; // { field, area, origin: [start, end], text, command, units, x, y, dx, dy, moved }
+let dragged = false; // the last pointer press moved a field; swallows its click
+
+// The ^FO/^FT command that opens `field`, as [start, end] in the source, or null when the
+// field has none (it then sits where the previous one did, or comes from a recalled format).
+function originCommand([start, end]) {
+  const source = editor.value;
+  if (!/^F[OT]$/i.test(source.slice(start + 1, start + 3))) return null;
+  // Parameters run to the next command, which starts with the same prefix (^, or a ^CC one).
+  const next = source.indexOf(source[start], start + 3);
+  return [start, next === -1 || next > end ? end : next];
+}
+
+// `text` (a ^FO/^FT command) with its x and y moved by [dx, dy] printer dots. `units` is
+// fieldUnits' answer: printer dots and format dots per parameter unit.
+function moveCommand(text, [dx, dy], { dots, format }) {
+  const [, head, x = "", y = "", rest = ""] = /^(.{3})([^,]*)(?:,([^,]*))?(.*)$/s.exec(text);
+  const shift = (param, delta) => {
+    const [, number, tail] = /^(\S*)(.*)$/s.exec(param);
+    const value = Math.max(0, (Number(number) || 0) + delta / dots);
+    return (format === 1 ? Math.round(value) : Math.round(value * 1000) / 1000) + tail;
+  };
+  return `${head}${shift(x, dx)},${shift(y, dy)}${rest}`;
+}
+
+function cancelDrag() {
+  if (!drag) return;
+  dragged = drag.moved;
+  drag = null;
+  draft = null;
+  pane.classList.remove("dragging");
+  placeOutline(selectedBox, selectedField);
+  requestPreview();
+}
+
+function updateDraft() {
+  if (!drag.units) return; // applied once fieldUnits answers
+  const command = moveCommand(drag.text, [drag.dx, drag.dy], drag.units);
+  const [start, end] = drag.origin;
+  draft = editor.value.slice(0, start) + command + editor.value.slice(end);
+  drag.command = command;
+  status.textContent = command.trim();
+  requestPreview();
+}
+
+canvas.addEventListener("pointerdown", (event) => {
+  dragged = false;
+  if (event.button !== 0) return;
+  const element = elementAt(...pointerDots(event));
+  const origin = element && originCommand(element.field);
+  if (!origin) return;
+  event.preventDefault();
+  canvas.setPointerCapture(event.pointerId);
+  const text = editor.value.slice(...origin);
+  const area = fieldArea(element.field);
+  drag = { field: element.field, area, origin, text, command: null, units: null, x: event.clientX, y: event.clientY, dx: 0, dy: 0, moved: false };
+  const current = drag;
+  request("units", { at: origin[0] }).then((units) => {
+    if (drag !== current) return;
+    drag.units = units.ok ? units : { dots: 1, format: 1 };
+    if (drag.moved) updateDraft();
+  });
+});
+
+canvas.addEventListener("pointermove", (event) => {
+  if (!drag) return;
+  const moveX = event.clientX - drag.x;
+  const moveY = event.clientY - drag.y;
+  if (!drag.moved && Math.hypot(moveX, moveY) < 4) return;
+  if (!drag.moved) {
+    drag.moved = true;
+    pane.classList.add("dragging");
+    select(drag.field, "click");
+    placeOutline(hoverBox, null);
+  }
+  const dx = Math.round(moveX / scale);
+  const dy = Math.round(moveY / scale);
+  if (dx === drag.dx && dy === drag.dy) return;
+  Object.assign(drag, { dx, dy });
+  placeArea(selectedBox, drag.area, [dx, dy]);
+  updateDraft();
+});
+
+canvas.addEventListener("pointerup", () => {
+  if (!drag) return;
+  const { field, origin: [start, end], command, moved } = drag;
+  drag = null;
+  draft = null;
+  pane.classList.remove("dragging");
+  if (!moved) return; // a click: the click handler selects the field
+  dragged = true;
+  if (!command) return requestPreview(); // dropped before fieldUnits answered
+  // One undoable edit for the whole drag.
+  editor.focus({ preventScroll: true });
+  editor.setSelectionRange(start, end);
+  if (!document.execCommand("insertText", false, command)) {
+    editor.setRangeText(command, start, end);
+    editor.dispatchEvent(new Event("input"));
+  }
+  // Still the clicked field, at its new span.
+  select([field[0], field[1] + command.length - (end - start)], "click");
+  revealInEditor([start, start + command.length]);
+});
+
+canvas.addEventListener("pointercancel", cancelDrag);
 
 // --- Problems ---------------------------------------------------------------------
 
@@ -401,7 +524,8 @@ editor.addEventListener("keydown", (e) => {
 });
 
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && document.activeElement !== editor) select(null, null);
+  if (e.key === "Escape" && drag) cancelDrag();
+  else if (e.key === "Escape" && document.activeElement !== editor) select(null, null);
 });
 
 debug.addEventListener("change", requestPreview);
@@ -424,7 +548,7 @@ document.getElementById("png").addEventListener("click", () => {
 });
 
 document.getElementById("pdf").addEventListener("click", async () => {
-  const result = await requestPdf();
+  const result = await request("pdf");
   if (result.ok) download(new Blob([result.bytes], { type: "application/pdf" }), "label.pdf");
   else showProblem(result);
 });

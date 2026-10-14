@@ -4,6 +4,8 @@
 //!   pixels for a `<canvas>`, plus its elements: where each one is drawn and which source
 //!   text produced it. Every label (^XA...^XZ, times its ^PQ copies) is a page.
 //! - `renderPdf(zpl, clock, dpmm)` renders all pages to PDF file bytes.
+//! - `fieldUnits(zpl, at, dpmm)` says how ^FO/^FT parameters at `at` map to printer dots,
+//!   so the editor can move a dragged field.
 //!
 //! `dpmm` is the printer resolution in dots per millimetre: 6, 8, 12 or 24 (anything else
 //! means 8). Pixels and element positions are printer dots.
@@ -228,6 +230,37 @@ pub fn render_pdf(zpl: &str, clock: f64, dpmm: u32) -> Result<Vec<u8>, ParseFail
     Ok(PdfRenderer::for_page(&pages[0].0).render_pages(&pages))
 }
 
+/// For a ^FO/^FT command starting at UTF-16 offset `at`: `[printer dots per parameter
+/// unit, format dots per unit]`. The second is 1 when parameters are whole dots; anything
+/// else (^MU millimetres or inches, dpi conversion) takes fractional values.
+#[wasm_bindgen(js_name = fieldUnits)]
+pub fn field_units(zpl: &str, at: u32, dpmm: u32) -> Vec<f64> {
+    let dpmm = resolution(dpmm);
+    let before = &zpl[..byte_offset(zpl, at as usize)];
+    let mut parser = Parser::with_dpmm(before, dpmm);
+    let mut commands = Vec::new();
+    while let Ok(Some(command)) = parser.parse_next() {
+        commands.push(command);
+    }
+    let mut state = state(0.0, dpmm);
+    state.process(commands);
+    let (num, den) = state.page_setup().scale;
+    let unit = parser.unit_scale() as f64;
+    vec![unit * num as f64 / den as f64, unit]
+}
+
+/// Byte offset of UTF-16 offset `utf16` in `text`, clamped to its length.
+fn byte_offset(text: &str, utf16: usize) -> usize {
+    let mut units = 0;
+    for (i, c) in text.char_indices() {
+        if units >= utf16 {
+            return i;
+        }
+        units += c.len_utf16();
+    }
+    text.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +349,16 @@ mod tests {
         let frame = render_rgba("^XA^JMB^PW100^LL50^FO10,10^GB20,10,10^FS^XZ", 0.0, false, 0, 8).ok().unwrap();
         assert_eq!((frame.width, frame.height), (200, 100));
         assert_eq!(&frame.elements[..4], &[20, 20, 40, 20]);
+    }
+
+    #[test]
+    fn field_units_follow_mu_and_jm() {
+        assert_eq!(field_units("^XA^FO10,10^FS^XZ", 3, 8), [1.0, 1.0]);
+        assert_eq!(field_units("^XA^JMB^FO10,10^FS^XZ", 7, 8), [2.0, 1.0]);
+        assert_eq!(field_units("^XA^MUm^FO1,1^FS^XZ", 7, 12), [12.0, 12.0]);
+        // Only commands before the field count.
+        assert_eq!(field_units("^XA^FO1,1^FS^MUm^XZ", 3, 8), [1.0, 1.0]);
+        assert_eq!(byte_offset("é^FO", 1), 2);
     }
 
     #[test]

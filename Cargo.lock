@@ -4276,6 +4276,7 @@ dependencies = [
  "http-body-util",
  "image",
  "lapin",
+ "libc",
  "pdf-renderer",
  "png-renderer",
  "reqwest",

@@ -4,6 +4,7 @@
 
 #[tokio::main]
 async fn main() {
+    raise_open_files_limit();
     let addr = std::env::var("ZPL_API_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
 
     let billing = zpl_http_api::billing::Billing::from_env().unwrap_or_else(|e| {
@@ -73,3 +74,32 @@ async fn shutdown_signal() {
         _ = terminate => {}
     }
 }
+
+/// Every connection is a file descriptor, and containers start with a soft limit of 1024
+/// open files. Under load (ingress keep-alive pools plus new connections) the server
+/// reached it: accept() failed with "too many open files", so new connections, the
+/// health checks included, hung while CPU sat idle. Raise the soft limit to the hard one.
+#[cfg(unix)]
+fn raise_open_files_limit() {
+    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit/setrlimit only read and write the struct passed in.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            eprintln!("Could not read the open-files limit: {}", std::io::Error::last_os_error());
+            return;
+        }
+        if limit.rlim_cur >= limit.rlim_max {
+            return;
+        }
+        let soft = limit.rlim_cur;
+        limit.rlim_cur = limit.rlim_max;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 {
+            println!("Open-files limit raised from {soft} to {}", limit.rlim_max);
+        } else {
+            eprintln!("Could not raise the open-files limit from {soft}: {}", std::io::Error::last_os_error());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_open_files_limit() {}

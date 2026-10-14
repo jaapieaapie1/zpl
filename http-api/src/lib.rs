@@ -486,7 +486,7 @@ async fn render(
             Format::Pdf => (rendered.page_count, "pdf"),
             Format::Png => (1, "png"),
         };
-        let billed = billing.record(caller, labels, kind, fingerprint.as_ref());
+        let billed = billing.record(caller, labels, kind, fingerprint.as_ref()).await;
         response.headers_mut().insert("x-labels-billed", HeaderValue::from(billed));
     }
     if multipart {

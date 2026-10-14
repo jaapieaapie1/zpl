@@ -414,7 +414,8 @@ canvas.addEventListener("pointerdown", (event) => {
   const current = drag;
   request("units", { at: origin[0] }).then((units) => {
     if (drag !== current) return;
-    drag.units = units.ok ? units : { dots: 1, format: 1 };
+    // A failed answer (or one from an outdated worker) leaves whole printer dots.
+    drag.units = units.ok && units.dots > 0 && units.format > 0 ? units : { dots: 1, format: 1 };
     if (drag.moved) updateDraft();
   });
 });

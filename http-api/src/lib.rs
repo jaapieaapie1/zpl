@@ -57,6 +57,7 @@ use png_renderer::PngRenderer;
 use tower_http::decompression::RequestDecompressionLayer;
 use tower_http::map_request_body::MapRequestBodyLayer;
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 use zpl_parser::Parser;
 use zpl_state_manager::{StateManager, DEFAULT_DPMM, DPMM_VALUES, MAX_PAGES};
 
@@ -95,7 +96,14 @@ pub fn router_with(dir: &Path, billing: Option<Arc<Billing>>) -> Router {
         .route("/health", get(|| async { "ok" }))
         // The page loads its scripts relative to itself, so it needs the trailing slash.
         .route("/playground", get(|| async { Redirect::permanent("/playground/") }))
-        .nest_service("/playground/", ServeDir::new(dir).precompressed_gzip())
+        // Revalidate on every load: the page, worker and wasm change together on deploy, and
+        // a cached worker from the previous release breaks a fresh page.
+        .nest_service(
+            "/playground/",
+            Router::new().fallback_service(ServeDir::new(dir).precompressed_gzip()).layer(
+                SetResponseHeaderLayer::overriding(header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+            ),
+        )
         .layer(Extension(billing))
 }
 
@@ -832,6 +840,8 @@ mod tests {
 
         let response = get("/playground/pkg/zpl_wasm_bg.wasm").await.unwrap();
         assert_eq!(response.headers()[header::CONTENT_TYPE], "application/wasm");
+        // Revalidated, so a deploy never mixes a cached worker with a new page.
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
 
         assert_eq!(get("/playground/missing.js").await.unwrap().status(), StatusCode::NOT_FOUND);
         assert_eq!(get("/playground/../Cargo.toml").await.unwrap().status(), StatusCode::NOT_FOUND);

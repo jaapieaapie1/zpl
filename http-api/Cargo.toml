@@ -15,7 +15,7 @@ pdf-renderer = { path = "../pdf-renderer" }
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 http-body-util = "0.1"
-tower-http = { version = "0.6", features = ["fs", "decompression-gzip", "decompression-deflate", "map-request-body"] }
+tower-http = { version = "0.6", features = ["fs", "decompression-gzip", "decompression-deflate", "map-request-body", "set-header"] }
 # API keys and usage (zpl-console).
 base64 = "0.22"
 blake3 = "1"

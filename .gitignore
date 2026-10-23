@@ -3,3 +3,4 @@
 CLAUDE.md
 !compat/cases/*.png
 compat/out/
+.DS_Store

@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.0;net8.0</TargetFrameworks>
+    <RootNamespace>Caretly</RootNamespace>
+    <AssemblyName>Caretly</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IsPackable>true</IsPackable>
+
+    <PackageId>Caretly</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Jaap Elst</Authors>
+    <Copyright>Copyright (c) 2026 Jaap Elst</Copyright>
+    <Description>Client for the Caretly API: render ZPL labels to PDF or PNG.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://caretly.dev</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/jaapieaapie1/zpl</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>zpl;zebra;label;labels;pdf;png;render;printing;caretly</PackageTags>
+    <PackageReleaseNotes>https://github.com/jaapieaapie1/zpl/blob/main/clients/csharp/CHANGELOG.md</PackageReleaseNotes>
+
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\LICENSE" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Caretly.Tests" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,62 @@
+{
+    "name": "caretly/caretly",
+    "description": "Client for the Caretly API: render ZPL labels to PDF or PNG.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["zpl", "zebra", "label", "labels", "pdf", "png", "render", "caretly", "psr-18"],
+    "homepage": "https://caretly.dev",
+    "authors": [
+        {
+            "name": "Jaap Elst",
+            "email": "jaapelst@gmail.com"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/jaapieaapie1/zpl/issues",
+        "source": "https://github.com/jaapieaapie1/caretly-php"
+    },
+    "require": {
+        "php": ">=8.1",
+        "php-http/discovery": "^1.19",
+        "psr/http-client": "^1.0",
+        "psr/http-client-implementation": "^1.0",
+        "psr/http-factory": "^1.0",
+        "psr/http-factory-implementation": "^1.0",
+        "psr/http-message": "^1.1 || ^2.0"
+    },
+    "require-dev": {
+        "guzzlehttp/guzzle": "^7.8",
+        "php-http/mock-client": "^1.6",
+        "phpstan/phpstan": "^2.0",
+        "phpstan/phpstan-phpunit": "^2.0",
+        "phpunit/phpunit": "^10.5 || ^11.0",
+        "symfony/http-client": "^6.4 || ^7.0"
+    },
+    "suggest": {
+        "guzzlehttp/guzzle": "A PSR-18 HTTP client; the timeout option is applied automatically.",
+        "symfony/http-client": "A PSR-18 HTTP client (with nyholm/psr7); the timeout option is applied automatically.",
+        "ext-zlib": "Needed for the compress option (gzip request bodies)."
+    },
+    "autoload": {
+        "psr-4": {
+            "Caretly\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Caretly\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit",
+        "analyse": "phpstan analyse"
+    },
+    "config": {
+        "sort-packages": true,
+        "allow-plugins": {
+            "php-http/discovery": false
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

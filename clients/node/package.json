@@ -1,0 +1,72 @@
+{
+  "name": "@caretly/caretly",
+  "version": "0.1.0",
+  "description": "Client for the Caretly API: render ZPL labels to PDF or PNG.",
+  "keywords": [
+    "caretly",
+    "zpl",
+    "zebra",
+    "label",
+    "labels",
+    "printer",
+    "pdf",
+    "png",
+    "render",
+    "shipping-label",
+    "api-client"
+  ],
+  "license": "MIT",
+  "author": "Jaap Elst <jaapelst@gmail.com>",
+  "homepage": "https://caretly.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jaapieaapie1/zpl.git",
+    "directory": "clients/node"
+  },
+  "bugs": {
+    "url": "https://github.com/jaapieaapie1/zpl/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.cts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/client.test.mjs test/cjs.test.cjs",
+    "lint:package": "publint && attw --pack .",
+    "prepublishOnly": "npm run typecheck && npm test && npm run lint:package"
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
+    "@types/node": "^18.19.130",
+    "publint": "^0.3.25",
+    "tsup": "^9.0.0",
+    "typescript": "^5.9.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

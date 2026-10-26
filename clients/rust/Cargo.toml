@@ -1,0 +1,64 @@
+[package]
+name = "caretly"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Jaap Elst <jaapelst@gmail.com>"]
+description = "Client for the Caretly API: render ZPL labels to PDF or PNG."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/jaapieaapie1/zpl"
+homepage = "https://caretly.dev"
+documentation = "https://docs.rs/caretly"
+keywords = ["zpl", "zebra", "label", "pdf", "api-client"]
+categories = ["api-bindings", "web-programming::http-client", "rendering"]
+include = ["src/**/*", "examples/**/*", "tests/**/*", "Cargo.toml", "README.md", "CHANGELOG.md", "LICENSE"]
+
+# Standalone crate: keep it out of the workspace at the repository root.
+# Resolver 3 picks dependency versions that support `rust-version`.
+[workspace]
+resolver = "3"
+
+[features]
+default = ["async", "rustls-tls"]
+## Asynchronous client (`caretly::Client`) for the tokio runtime.
+async = ["dep:tokio"]
+## Blocking client (`caretly::blocking::Client`); no async runtime needed.
+blocking = ["reqwest/blocking"]
+## HTTPS through rustls (pure Rust, the default).
+rustls-tls = ["reqwest/rustls"]
+## HTTPS through the platform's native TLS (OpenSSL, Secure Transport, SChannel).
+native-tls = ["reqwest/native-tls"]
+## The `compress` render option: gzip the request body.
+gzip = ["dep:flate2"]
+
+[dependencies]
+bytes = "1.6"
+flate2 = { version = "1.0.30", optional = true }
+reqwest = { version = "0.13", default-features = false }
+thiserror = "2"
+tokio = { version = "1.38", default-features = false, features = ["time"], optional = true }
+uuid = { version = "1.8", features = ["v4"] }
+
+[dev-dependencies]
+flate2 = "1.0.30"
+tokio = { version = "1.38", features = ["macros", "rt-multi-thread", "time"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }
+
+[[example]]
+name = "render_pdf"
+required-features = ["async"]
+
+[[example]]
+name = "render_files"
+required-features = ["async"]
+
+[[example]]
+name = "blocking"
+required-features = ["blocking"]

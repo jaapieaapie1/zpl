@@ -1,0 +1,42 @@
+name: Publish Node client
+
+# Publishes clients/node to npm as @caretly/caretly when a tag `clients/node/vX.Y.Z` is
+# pushed. Authenticates with npm trusted publishing (OIDC), so no npm token is stored;
+# npm also attaches provenance. The trusted publisher on npmjs.com must name this
+# repository and this workflow file.
+
+on:
+  push:
+    tags: ["clients/node/v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/node
+    steps:
+      - uses: actions/checkout@v5
+
+      # Trusted publishing needs npm 11.5.1 or newer, which Node 24 ships.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+
+      - name: Check the tag matches package.json
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          test "clients/node/v$version" = "$GITHUB_REF_NAME" || {
+            echo "tag $GITHUB_REF_NAME does not match package.json version $version"
+            exit 1
+          }
+
+      # prepublishOnly runs the typecheck, the tests and the package lint.
+      - run: npm publish

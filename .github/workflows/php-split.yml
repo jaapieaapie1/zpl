@@ -1,0 +1,52 @@
+name: Split PHP client
+
+# Packagist needs composer.json at the root of a repository, so clients/php is mirrored to
+# the read-only repository jaapieaapie1/caretly-php, which Packagist watches. Pushes to main
+# update its main branch; a tag `clients/php/v1.2.3` here becomes tag `v1.2.3` there, which
+# Packagist publishes. The mirror trusts this workflow through a deploy key with write
+# access to that repository only (secret PHP_SPLIT_DEPLOY_KEY).
+
+on:
+  push:
+    branches: [main]
+    paths: ["clients/php/**"]
+    tags: ["clients/php/v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: php-split
+  cancel-in-progress: false
+
+env:
+  MIRROR: git@github.com:jaapieaapie1/caretly-php.git
+
+jobs:
+  split:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Load deploy key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.PHP_SPLIT_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      # The split is deterministic: the same history always gives the same commits, so the
+      # mirror only ever fast-forwards.
+      - name: Split clients/php
+        run: git subtree split --prefix=clients/php -b php-split
+
+      - name: Push main
+        if: github.ref == 'refs/heads/main'
+        run: git push "$MIRROR" php-split:refs/heads/main
+
+      - name: Push tag
+        if: startsWith(github.ref, 'refs/tags/clients/php/v')
+        run: git push "$MIRROR" "php-split:refs/tags/${GITHUB_REF#refs/tags/clients/php/}"

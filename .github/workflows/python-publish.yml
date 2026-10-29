@@ -1,0 +1,70 @@
+name: Publish Python client
+
+# Publishes clients/python to PyPI as caretly when a tag `clients/python/vX.Y.Z` is pushed.
+# Authenticates with PyPI trusted publishing (OIDC), so no PyPI token is stored. The
+# trusted publisher on pypi.org must name this repository, this workflow file and the
+# `pypi` environment.
+
+on:
+  push:
+    tags: ["clients/python/v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/python
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Check the tag matches the package version
+        run: |
+          version="$(python -c 'exec(open("src/caretly/_version.py").read()); print(__version__)')"
+          test "clients/python/v$version" = "$GITHUB_REF_NAME" || {
+            echo "tag $GITHUB_REF_NAME does not match package version $version"
+            exit 1
+          }
+
+      - name: Test
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . --group dev
+          pytest -q
+          mypy --strict src
+          ruff check .
+          ruff format --check .
+
+      - name: Build
+        run: |
+          python -m build
+          twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: clients/python/dist/
+
+  # Publishing runs in its own job, the only one that can get a PyPI token.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/caretly/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

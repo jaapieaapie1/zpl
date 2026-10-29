@@ -1,0 +1,56 @@
+name: Publish C# client
+
+# Publishes clients/csharp to nuget.org as Caretly when a tag `clients/csharp/vX.Y.Z` is
+# pushed. Authenticates with NuGet trusted publishing: NuGet/login trades the job's OIDC
+# token for an API key that lives about an hour, so no NuGet key is stored. The trusted
+# publishing policy on nuget.org must name this repository and this workflow file; the
+# repository variable NUGET_USER holds the nuget.org user name that owns the policy.
+
+on:
+  push:
+    tags: ["clients/csharp/v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: nuget
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: clients/csharp
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Check the tag matches the package version
+        run: |
+          version="$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' src/Caretly/Caretly.csproj)"
+          test "clients/csharp/v$version" = "$GITHUB_REF_NAME" || {
+            echo "tag $GITHUB_REF_NAME does not match package version $version"
+            exit 1
+          }
+
+      - run: dotnet test -c Release
+
+      - run: dotnet pack src/Caretly -c Release -o artifacts
+
+      - id: login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
+
+      - name: Push
+        run: >
+          dotnet nuget push "artifacts/*.nupkg"
+          --api-key "${{ steps.login.outputs.NUGET_API_KEY }}"
+          --source https://api.nuget.org/v3/index.json

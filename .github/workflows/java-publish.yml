@@ -1,0 +1,79 @@
+name: Publish Java client
+
+# Publishes clients/java to Maven Central as dev.caretly:caretly when a tag
+# `clients/java/vX.Y.Z` is pushed. Maven Central has no trusted publishing, so this uses
+# secrets: a Central Portal user token (MAVEN_CENTRAL_USERNAME / MAVEN_CENTRAL_PASSWORD)
+# and an ASCII-armored release signing key (MAVEN_SIGNING_KEY / MAVEN_SIGNING_PASSWORD)
+# whose public key is on keyserver.ubuntu.com.
+
+on:
+  push:
+    tags: ["clients/java/v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: maven-central
+    defaults:
+      run:
+        working-directory: clients/java
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v5
+
+      - name: Check the tag matches the project version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' build.gradle.kts)"
+          test "clients/java/v$version" = "$GITHUB_REF_NAME" || {
+            echo "tag $GITHUB_REF_NAME does not match project version $version"
+            exit 1
+          }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build, test and bundle
+        env:
+          ORG_GRADLE_PROJECT_signingKey: ${{ secrets.MAVEN_SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingPassword: ${{ secrets.MAVEN_SIGNING_PASSWORD }}
+        run: ./gradlew build centralBundle
+
+      # AUTOMATIC publishes as soon as the Central Portal has validated the bundle.
+      - name: Upload to the Central Portal
+        env:
+          CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+        run: |
+          token="$(printf '%s:%s' "$CENTRAL_USERNAME" "$CENTRAL_PASSWORD" | base64 -w0)"
+          echo "::add-mask::$token"
+          echo "CENTRAL_TOKEN=$token" >> "$GITHUB_ENV"
+          id="$(curl --fail-with-body -sS -X POST \
+            -H "Authorization: Bearer $token" \
+            -F "bundle=@build/central/caretly-$VERSION-bundle.zip" \
+            "https://central.sonatype.com/api/v1/publisher/upload?publishingType=AUTOMATIC&name=caretly-$VERSION")"
+          echo "deployment $id"
+          echo "DEPLOYMENT=$id" >> "$GITHUB_ENV"
+
+      - name: Wait for validation
+        run: |
+          for _ in $(seq 60); do
+            status="$(curl --fail-with-body -sS -X POST \
+              -H "Authorization: Bearer $CENTRAL_TOKEN" \
+              "https://central.sonatype.com/api/v1/publisher/status?id=$DEPLOYMENT")"
+            state="$(jq -r .deploymentState <<<"$status")"
+            echo "state $state"
+            case "$state" in
+              PUBLISHING|PUBLISHED) exit 0 ;;
+              FAILED) jq . <<<"$status"; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "still not validated after 10 minutes; check https://central.sonatype.com/publishing/deployments"
+          exit 1

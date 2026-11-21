@@ -258,8 +258,8 @@ pub fn soft_hyphens(text: &str) -> std::borrow::Cow<'_, str> {
 const MIN_SCALABLE: u32 = 10;
 
 /// Fonts P–V: glyph size against the H x W matrix (see `TextFont::new`).
-const FIXED_EM_H: f32 = 0.82;
-const FIXED_EM_W: f32 = 0.945;
+const FIXED_EM_H: f32 = 0.825;
+const FIXED_EM_W: f32 = 0.95;
 
 /// Fonts P–V: fixed-size font 0 (H x W).
 fn fixed_scalable(font: FontName) -> Option<(u32, u32)> {
@@ -381,8 +381,8 @@ impl TextFont {
             None => (height.max(MIN_SCALABLE), width.max(MIN_SCALABLE)),
             Some(_) => (height, width),
         };
-        // Fonts P–V: Labelary draws font 0 smaller than the matrix (its glyphs about 82% as
-        // tall and 94.5% as wide) on the baseline of a full-size one.
+        // Fonts P–V: font 0 drawn smaller than the matrix (its glyphs about 82.5% as tall
+        // and 95% as wide) on the baseline of a full-size one.
         let (em_h, em_w) = match fixed {
             Some(_) => (height as f32 * FIXED_EM_H, width as f32 * FIXED_EM_W),
             None => (height as f32, width as f32),

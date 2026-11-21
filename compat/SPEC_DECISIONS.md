@@ -29,6 +29,7 @@ Paths are relative to `docs/commands/`.
 | ^A applies to one field; omitted sizes come from ^CF | `zpl/A.md`: "used only once for that ^FD entry"; h, w "Default: last accepted ^CF" | same | same | a |
 | ^CF without sizes | `zpl/CF.md`: "If neither value is defined, the last ^CF values given or the default ^CF values ... are used" | back to the power-up size | keeps the last ^CF sizes | c. Cases: `cf_default_font` |
 | ^A orientation defaults to the ^FW in force | `zpl/A.md`: "Default: the last accepted ^FW value" | same | same | a |
+| A ^FW after the field's ^A replaces that ^A's rotation (`^A0N,20^FWB^FD...` prints rotated); a barcode keeps its own | `zpl/FW.md`: "If a command has a specific rotation parameter, that value is used"; "affects only fields that follow it" | the later of ^A and ^FW wins, even a ^FW after ^FD | same | printer behaviour: labels in the field put `^A0N,13,18^FWB` text along the label edge, where it only fits rotated. Deviates from FW.md. Cases: `fw_after_font` |
 | `^AF,N,13,26`: the comma after the font leaves the orientation empty | `zpl/A.md`: format `^Afo,h,w` | N lands in the height slot, ignored | same | a for the positions; b for a non-numeric size counting as not given |
 | A width without a height magnifies bitmap fonts by the width's factor | `zpl/A.md`: "If you specify only the height or width value, the standard matrix for that font automatically determines the other value"; `zpl/CF.md`: "forces the magnification to be proportional" | same | same | a |
 | Font 0 with only one size is as wide as tall | `zpl/A.md` (as above); `other/FONTS.md`: font 0 "DEFAULT: 15 x 12", "setting the height and width equally produces characters that appear the most balanced" | equal | equal | b: whether font 0's 15 x 12 default is a "standard matrix" ratio is unclear. Open question |
@@ -36,7 +37,7 @@ Paths are relative to `docs/commands/`.
 | Bitmap font faces: E is OCR-B, H is OCR-A | `other/FONTS.md` Table 29 type column | OCR-B / OCR-A outlines | same faces | a |
 | Font E and H pitch and baseline at 6, 12 and 24 dots/mm | `other/FONTS.md` Tables 30-33 give the matrices (which we use); Table 29 gives gap and baseline only for the 8 dots/mm matrices | own values | Labelary's | b: undocumented |
 | Font P width | `other/FONTS.md` Table 31: P is 20 x 18 | 17 dots wide | 18 | c. Cases: `font_p`, `fonts_overview` |
-| Fonts P-V glyphs drawn at about 82% x 94.5% of the matrix | `other/FONTS.md`: matrices only | smaller glyphs | same | b |
+| Fonts P-V glyphs drawn at about 82.5% x 95% of the matrix | `other/FONTS.md`: matrices only | smaller glyphs | same | b |
 | Characters a bitmap font lacks print blank | `other/FONTS.md`: "Unidentified characters should default to a space" | blank | blank | a |
 | Font H prints lowercase blank | `other/FONTS.md`: H type "OCR-A" (not "U") | blank | blank | b: the repertoire is not listed; blank is the documented fallback |
 | Font B prints lowercase as capitals | `other/FONTS.md`: B type "U" (uppercase) | capitals | capitals | b: whether lowercase is "unidentified" (a space) is not said. Open question |

@@ -81,7 +81,7 @@ Paths are relative to `docs/commands/`.
 
 | Behaviour | Spec reference | Labelary | Ours | Class, reason |
 |---|---|---|---|---|
-| ^B7 row height h | `zpl/B7.md` h: "This number multiplied by the module equals the height of the individual rows in dots" (the heading says "in dots"; ^BB uses the same wording and we multiply there too) | h dots | h x module dots | c. Cases: `pdf417_*`, `symbol_ft_orientations`, `fo_right_symbols`, `ft_barcodes`, `bq_module_width` |
+| ^B7 and ^BB row height h | `zpl/B7.md`, `zpl/BB.md`: h is the "bar code height for individual rows (in dots)", though the description adds "This number multiplied by the module equals the height of the individual rows in dots" | h dots (^BB unsupported) | h dots | b: the guide contradicts itself. Real carrier labels size their PDF417 for h dots and overflow their section at h x module. ^B4 calls h a "height multiplier" and still multiplies |
 | ^B7 default security level | `zpl/B7.md` s: "Default: 0 (error detection only)" | 0 | 0 | a |
 | ^B7 grid without rows or columns | `zpl/B7.md`: "Default: 1:2 (row-to-column aspect ratio)", but the example puts 72 code words in 6 columns and 12 rows (2:1) | height:width of about 1:2 at 3-module rows | Labelary's | b: the rule and the example disagree, Labelary matches neither literally. Open question |
 | PDF417 / MicroPDF417 compaction choices | silent | as described | same | b |
@@ -109,7 +109,6 @@ Paths are relative to `docs/commands/`.
 
 Decisions above that a printer, not Labelary, should settle:
 
-- ^B7 h: the spec multiplies by the module width (followed); the heading says "in dots".
 - ^B7 grid without rows or columns: the 1:2 rule and the 72-code-word example disagree.
 - Font 0 with only a height: as wide as tall (Labelary) or 12/15 of it (the default matrix).
 - Font B lowercase: capitals (Labelary) or spaces ("unidentified characters").

@@ -1,6 +1,6 @@
 ^XA
 ^FX compat: 4x3^FS
-^FX spec-deviates: BQ mask 7 (BQ.md); B7 rows are h times the module (B7.md)^FS
+^FX spec-deviates: BQ mask 7 (BQ.md)^FS
 ^BY2
 ^FO20,200^GB780,1,1^FS
 ^FT20,200^BCN,80,Y,N,N^FDFT128^FS

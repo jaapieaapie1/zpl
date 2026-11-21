@@ -113,7 +113,7 @@ pub enum DrawInstruction {
         y: u32,
         data: String,
         orientation: Orientation,
-        /// Row height in dots: ^B7 h times the module width (docs/commands/zpl/B7.md);
+        /// Row height in dots: ^B7 h, "bar code height for individual rows (in dots)";
         /// `None` means rows share `symbol_height`.
         row_height: Option<u32>,
         module_width: u32,
@@ -1019,10 +1019,9 @@ impl StateManager {
                 self.set_symbol(orientation, spec);
             }
             Command::Codablock { orientation, row_height, security, columns, rows, mode } => {
-                let module_width = self.barcode_module_width;
                 let spec = SymbolSpec::Codablock {
-                    module_width,
-                    row_height: row_height * module_width,
+                    module_width: self.barcode_module_width,
+                    row_height,
                     security,
                     columns,
                     rows,
@@ -1365,7 +1364,7 @@ impl StateManager {
                     y,
                     data,
                     orientation,
-                    row_height: row_height.map(|h| h * self.barcode_module_width),
+                    row_height,
                     module_width: self.barcode_module_width,
                     symbol_height: self.barcode_height,
                     security,
@@ -1613,7 +1612,7 @@ mod tests {
             ins[1],
             DrawInstruction::DrawSymbol { spec: SymbolSpec::DataBar { kind: 6, module_width: 4, height: 50, segments_per_row: 10, .. }, .. }
         ));
-        assert!(matches!(ins[2], DrawInstruction::DrawSymbol { spec: SymbolSpec::Codablock { row_height: 12, mode: 'F', .. }, .. }));
+        assert!(matches!(ins[2], DrawInstruction::DrawSymbol { spec: SymbolSpec::Codablock { row_height: 4, mode: 'F', .. }, .. }));
     }
 
     #[test]
@@ -1812,11 +1811,10 @@ mod tests {
     }
 
     #[test]
-    fn pdf417_row_height_is_a_module_multiple() {
-        // docs/commands/zpl/B7.md: "This number multiplied by the module equals the height of
-        // the individual rows in dots."
+    fn pdf417_row_height_is_in_dots() {
+        // docs/commands/zpl/B7.md: h is the "bar code height for individual rows (in dots)".
         let ins = run("^XA^BY3^FO1,1^B7N,4^FDAB^FS^FO1,200^B7N^FDAB^FS^XZ");
-        assert!(matches!(ins[0], DrawInstruction::DrawPdf417 { row_height: Some(12), module_width: 3, .. }));
+        assert!(matches!(ins[0], DrawInstruction::DrawPdf417 { row_height: Some(4), module_width: 3, .. }));
         assert!(matches!(ins[1], DrawInstruction::DrawPdf417 { row_height: None, .. }));
     }
 

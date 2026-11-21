@@ -13,7 +13,7 @@ b8_ean8 0.00
 b9_upce 0.00
 ba_code93 0.69
 barcode_orientations 0.00
-bb_codablock 99.02
+bb_codablock 98.17
 bc_code128_basic 0.01
 bc_code128_check 0.01
 bc_code128_gs1 5.44
@@ -30,7 +30,7 @@ bk_codabar 0.01
 bl_logmars 0.33
 bm_msi 0.01
 bp_plessey 0.01
-bq_module_width 32.52
+bq_module_width 30.69
 br_databar_expanded 0.00
 br_databar_omni 0.00
 bs_upc_ean_extension 0.81
@@ -70,7 +70,7 @@ fd_line_breaks 0.07
 fh_barcode_bytes 0.00
 fh_hex 2.44
 fo_justification 0.04
-fo_right_symbols 35.93
+fo_right_symbols 32.52
 font_0_dashes 1.11
 font_0_orientations 3.13
 font_0_sizes 6.77
@@ -102,7 +102,7 @@ fp_reverse_end 1.44
 fp_reverse_rotated 0.00
 fp_vertical 10.37
 fr_field_reverse 0.32
-ft_barcodes 26.49
+ft_barcodes 18.80
 ft_graphics 0.00
 ft_rotated_text 0.72
 ft_vs_fo_text 8.57
@@ -129,14 +129,14 @@ lt_label_top 0.41
 maxicode 0.08
 mu_inches 43.64
 mu_millimetres 4.15
-pdf417_auto_columns 48.16
-pdf417_auto_grid 47.38
-pdf417_columns_rows 48.26
-pdf417_default 50.16
-pdf417_numeric_ends 47.26
-pdf417_numeric_runs 48.23
-pdf417_security 47.73
-pdf417_truncated 65.27
+pdf417_auto_columns 0.00
+pdf417_auto_grid 0.00
+pdf417_columns_rows 0.00
+pdf417_default 0.00
+pdf417_numeric_ends 0.15
+pdf417_numeric_runs 0.00
+pdf417_security 0.00
+pdf417_truncated 0.00
 pm_mirror 0.41
 po_inverted 0.41
 pq_copies 0.48
@@ -151,7 +151,7 @@ qr_placement 7.76
 sf_serial_field 2.15
 sn_serial_number 1.30
 sn_sf_padding 0.00
-symbol_ft_orientations 16.22
+symbol_ft_orientations 0.23
 tb_rotated 0.09
 tb_text_block 0.14
 two_formats 0.24

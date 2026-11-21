@@ -29,6 +29,7 @@ Paths are relative to `docs/commands/`.
 | ^A applies to one field; omitted sizes come from ^CF | `zpl/A.md`: "used only once for that ^FD entry"; h, w "Default: last accepted ^CF" | same | same | a |
 | ^CF without sizes | `zpl/CF.md`: "If neither value is defined, the last ^CF values given or the default ^CF values ... are used" | back to the power-up size | keeps the last ^CF sizes | c. Cases: `cf_default_font` |
 | ^A orientation defaults to the ^FW in force | `zpl/A.md`: "Default: the last accepted ^FW value" | same | same | a |
+| A ^FW after the field's ^A replaces that ^A's rotation (`^A0N,20^FWB^FD...` prints rotated); a barcode keeps its own | `zpl/FW.md`: "If a command has a specific rotation parameter, that value is used"; "affects only fields that follow it" | the later of ^A and ^FW wins, even a ^FW after ^FD | same | printer behaviour: carrier labels (FedEx) put `^A0N,13,18^FWB` text along the label edge, where it only fits rotated. Deviates from FW.md; Labelary agrees, so the case is not tagged. Cases: `fw_after_font` |
 | `^AF,N,13,26`: the comma after the font leaves the orientation empty | `zpl/A.md`: format `^Afo,h,w` | N lands in the height slot, ignored | same | a for the positions; b for a non-numeric size counting as not given |
 | A width without a height magnifies bitmap fonts by the width's factor | `zpl/A.md`: "If you specify only the height or width value, the standard matrix for that font automatically determines the other value"; `zpl/CF.md`: "forces the magnification to be proportional" | same | same | a |
 | Font 0 with only one size is as wide as tall | `zpl/A.md` (as above); `other/FONTS.md`: font 0 "DEFAULT: 15 x 12", "setting the height and width equally produces characters that appear the most balanced" | equal | equal | b: whether font 0's 15 x 12 default is a "standard matrix" ratio is unclear. Open question |
@@ -81,7 +82,7 @@ Paths are relative to `docs/commands/`.
 
 | Behaviour | Spec reference | Labelary | Ours | Class, reason |
 |---|---|---|---|---|
-| ^B7 row height h | `zpl/B7.md` h: "This number multiplied by the module equals the height of the individual rows in dots" (the heading says "in dots"; ^BB uses the same wording and we multiply there too) | h dots | h x module dots | c. Cases: `pdf417_*`, `symbol_ft_orientations`, `fo_right_symbols`, `ft_barcodes`, `bq_module_width` |
+| ^B7 row height h | `zpl/B7.md` h: heading "bar code height for individual rows (in dots)", then "This number multiplied by the module equals the height of the individual rows in dots" | h dots | h dots | printer behaviour: the guide contradicts itself, and carrier labels made for Zebra printers (a FedEx label with `^BY2,2^B7N,10,5,14` between two rules 289 dots apart) only fit with rows of h dots. Was h x module until 2026-11-21. Cases: `pdf417_*` |
 | ^B7 default security level | `zpl/B7.md` s: "Default: 0 (error detection only)" | 0 | 0 | a |
 | ^B7 grid without rows or columns | `zpl/B7.md`: "Default: 1:2 (row-to-column aspect ratio)", but the example puts 72 code words in 6 columns and 12 rows (2:1) | height:width of about 1:2 at 3-module rows | Labelary's | b: the rule and the example disagree, Labelary matches neither literally. Open question |
 | PDF417 / MicroPDF417 compaction choices | silent | as described | same | b |
@@ -109,7 +110,6 @@ Paths are relative to `docs/commands/`.
 
 Decisions above that a printer, not Labelary, should settle:
 
-- ^B7 h: the spec multiplies by the module width (followed); the heading says "in dots".
 - ^B7 grid without rows or columns: the 1:2 rule and the 72-code-word example disagree.
 - Font 0 with only a height: as wide as tall (Labelary) or 12/15 of it (the default matrix).
 - Font B lowercase: capitals (Labelary) or spaces ("unidentified characters").

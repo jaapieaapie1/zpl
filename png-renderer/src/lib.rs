@@ -258,8 +258,8 @@ pub fn soft_hyphens(text: &str) -> std::borrow::Cow<'_, str> {
 const MIN_SCALABLE: u32 = 10;
 
 /// Fonts P–V: glyph size against the H x W matrix (see `TextFont::new`).
-const FIXED_EM_H: f32 = 0.82;
-const FIXED_EM_W: f32 = 0.945;
+const FIXED_EM_H: f32 = 0.825;
+const FIXED_EM_W: f32 = 0.95;
 
 /// Fonts P–V: fixed-size font 0 (H x W).
 fn fixed_scalable(font: FontName) -> Option<(u32, u32)> {
@@ -381,8 +381,8 @@ impl TextFont {
             None => (height.max(MIN_SCALABLE), width.max(MIN_SCALABLE)),
             Some(_) => (height, width),
         };
-        // Fonts P–V: Labelary draws font 0 smaller than the matrix (its glyphs about 82% as
-        // tall and 94.5% as wide) on the baseline of a full-size one.
+        // Fonts P–V: font 0 drawn smaller than the matrix (its glyphs about 82.5% as tall
+        // and 95% as wide) on the baseline of a full-size one.
         let (em_h, em_w) = match fixed {
             Some(_) => (height as f32 * FIXED_EM_H, width as f32 * FIXED_EM_W),
             None => (height as f32, width as f32),
@@ -2141,13 +2141,13 @@ mod tests {
             ("^FO30,30^BD4^FDABC1234567890123XYZ^FS", (30, 31, 229, 222)),
             ("^FT550,1180^BD4^FDFT MAXI^FS", (550, 986, 749, 1177)),
         ]);
-        // PDF417 the same way, its rows h times the module tall (B7.md; Labelary: h dots).
+        // PDF417 the same way, its rows h dots tall.
         assert_boxes(
             &[
-                ("^BY2^FT100,450^B7N,4,0,2,6^FDPDF FT^FS", (100, 402, 305, 449)),
-                ("^BY2^FT500,450^B7I,4,0,2,6^FDPDF FT^FS", (294, 450, 499, 497)),
-                ("^BY2^FT100,900^B7R,4,0,2,6^FDPDF FT^FS", (100, 900, 147, 1105)),
-                ("^BY2^FT400,900^B7B,4,0,2,6^FDPDF FT^FS", (352, 694, 399, 899)),
+                ("^BY2^FT100,450^B7N,4,0,2,6^FDPDF FT^FS", (100, 426, 305, 449)),
+                ("^BY2^FT500,450^B7I,4,0,2,6^FDPDF FT^FS", (294, 450, 499, 473)),
+                ("^BY2^FT100,900^B7R,4,0,2,6^FDPDF FT^FS", (100, 900, 123, 1105)),
+                ("^BY2^FT400,900^B7B,4,0,2,6^FDPDF FT^FS", (376, 694, 399, 899)),
             ],
             "spec",
         );

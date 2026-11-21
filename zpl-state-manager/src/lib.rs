@@ -113,8 +113,7 @@ pub enum DrawInstruction {
         y: u32,
         data: String,
         orientation: Orientation,
-        /// Row height in dots: ^B7 h times the module width (docs/commands/zpl/B7.md);
-        /// `None` means rows share `symbol_height`.
+        /// Row height in dots (^B7 h); `None` means rows share `symbol_height`.
         row_height: Option<u32>,
         module_width: u32,
         symbol_height: u32,
@@ -839,6 +838,9 @@ impl StateManager {
 
             Command::FieldOrientation { orientation, justification } => {
                 self.default_orientation = orientation;
+                // A ^FW after the field's ^A replaces that ^A's rotation: `^A0N,20^FWB^FD...`
+                // prints rotated.
+                self.current_font_orientation = None;
                 if let Some(j) = justification {
                     self.default_justification = j;
                 }
@@ -1365,7 +1367,8 @@ impl StateManager {
                     y,
                     data,
                     orientation,
-                    row_height: row_height.map(|h| h * self.barcode_module_width),
+                    // In dots, not module multiples: see compat/SPEC_DECISIONS.md.
+                    row_height,
                     module_width: self.barcode_module_width,
                     symbol_height: self.barcode_height,
                     security,
@@ -1527,6 +1530,20 @@ mod tests {
     fn field_orientation_default() {
         let ins = run("^XA^FWR^FO1,1^A0,20^FDa^FS^XZ");
         assert!(matches!(ins[0], DrawInstruction::DrawText { orientation: Orientation::Rotated90, .. }));
+    }
+
+    #[test]
+    fn field_orientation_after_font_replaces_its_rotation() {
+        // The later of ^A's rotation and ^FW wins; a barcode keeps its own rotation.
+        let ins = run("^XA^FO1,1^A0N,20^FWB^FDa^FS^FO1,1^FWR^A0N,20^FDb^FS^FO1,1^A0N,20^FDc^FWI^FS^FO1,1^BCN,20,N^FWB^FD1^FS^XZ");
+        let orientations: Vec<_> = ins
+            .iter()
+            .map(|i| match i {
+                DrawInstruction::DrawText { orientation, .. } | DrawInstruction::DrawBarcode { orientation, .. } => *orientation,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(orientations, [Orientation::Rotated270, Orientation::Normal, Orientation::Rotated180, Orientation::Normal]);
     }
 
     #[test]
@@ -1812,11 +1829,10 @@ mod tests {
     }
 
     #[test]
-    fn pdf417_row_height_is_a_module_multiple() {
-        // docs/commands/zpl/B7.md: "This number multiplied by the module equals the height of
-        // the individual rows in dots."
+    fn pdf417_row_height_is_in_dots() {
+        // docs/commands/zpl/B7.md: h is the "bar code height for individual rows (in dots)".
         let ins = run("^XA^BY3^FO1,1^B7N,4^FDAB^FS^FO1,200^B7N^FDAB^FS^XZ");
-        assert!(matches!(ins[0], DrawInstruction::DrawPdf417 { row_height: Some(12), module_width: 3, .. }));
+        assert!(matches!(ins[0], DrawInstruction::DrawPdf417 { row_height: Some(4), module_width: 3, .. }));
         assert!(matches!(ins[1], DrawInstruction::DrawPdf417 { row_height: None, .. }));
     }
 

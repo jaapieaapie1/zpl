@@ -1231,19 +1231,29 @@ impl PngRenderer {
         // Ink box of what was copied: text and symbol images carry white padding.
         #[cfg(feature = "source-map")]
         let mut ink = [i64::MAX, i64::MAX, i64::MIN, i64::MIN];
-        for (src_x, src_y, pixel) in source.enumerate_pixels() {
-            let target_x = x + src_x as i64;
-            let target_y = y + src_y as i64;
-
-            if target_x >= 0
-                && target_y >= 0
-                && target_x < target.width() as i64
-                && target_y < target.height() as i64
-                && (pixel[0] < 250 || pixel[1] < 250 || pixel[2] < 250)
-            {
-                target.put_pixel(target_x as u32, target_y as u32, *pixel);
-                #[cfg(feature = "source-map")]
-                {
+        let (source_w, target_w) = (source.width() as i64, target.width() as i64);
+        let (x0, x1) = ((-x).max(0), (target_w - x).min(source_w));
+        let (y0, y1) = ((-y).max(0), (target.height() as i64 - y).min(source.height() as i64));
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let row_len = (x1 - x0) as usize * 3;
+        let (src, dst) = (source.as_raw(), &mut **target);
+        for src_y in y0..y1 {
+            let from = (src_y * source_w + x0) as usize * 3;
+            let to = ((y + src_y) * target_w + x + x0) as usize * 3;
+            let (src_row, dst_row) = (&src[from..from + row_len], &mut dst[to..to + row_len]);
+            // Branch-free so it vectorises: white (>= 250 in every channel) leaves the target.
+            for (s, d) in src_row.chunks_exact(3).zip(dst_row.chunks_exact_mut(3)) {
+                let keep = s[0].min(s[1]).min(s[2]) >= 250;
+                for c in 0..3 {
+                    d[c] = if keep { d[c] } else { s[c] };
+                }
+            }
+            #[cfg(feature = "source-map")]
+            for (i, s) in src_row.chunks_exact(3).enumerate() {
+                if s[0].min(s[1]).min(s[2]) < 250 {
+                    let (target_x, target_y) = (x + x0 + i as i64, y + src_y);
                     ink = [ink[0].min(target_x), ink[1].min(target_y), ink[2].max(target_x), ink[3].max(target_y)];
                 }
             }

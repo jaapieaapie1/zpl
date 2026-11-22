@@ -56,7 +56,7 @@ dm_orientations 0.00
 dm_rectangular 0.00
 dm_sizes 0.00
 fb_bitmap_font 22.04
-fb_center 17.59
+fb_center 17.60
 fb_ft 1.44
 fb_hanging_indent 0.00
 fb_justified 0.03
@@ -73,7 +73,7 @@ fo_justification 0.07
 fo_right_symbols 32.52
 font_0_dashes 0.04
 font_0_orientations 0.02
-font_0_sizes 0.65
+font_0_sizes 0.66
 font_0_widths 1.50
 font_a 0.52
 font_a_orientations 0.00
@@ -90,7 +90,7 @@ font_eh_6dpmm 0.00
 font_f 1.10
 font_g 9.05
 font_h 0.00
-font_p 8.58
+font_p 8.57
 font_q 0.28
 font_r 0.36
 font_s 1.29
@@ -128,7 +128,7 @@ lr_label_reverse 0.07
 ls_label_shift 0.00
 lt_label_top 0.00
 maxicode 0.08
-mu_inches 44.81
+mu_inches 44.80
 mu_millimetres 4.16
 pdf417_auto_columns 0.00
 pdf417_auto_grid 0.00

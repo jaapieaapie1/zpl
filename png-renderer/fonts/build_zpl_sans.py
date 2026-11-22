@@ -148,10 +148,7 @@ def shape(draw, bounds, ink, sweep, trim):
     outline = Path()
     union([copy(0, 0)], outline.getPen())
     if sweep > 0:
-        # Copies close enough together that their union is the swept outline.
-        steps = 1 + math.ceil(sweep / 30)
-        outline = Path()
-        union([copy(sweep * i / steps, 0) for i in range(steps + 1)], outline.getPen())
+        outline = swept(outline, sweep)
     elif sweep < 0:
         outline = op(outline, copy(-sweep, 0), PathOp.INTERSECTION)
     if trim > 0:
@@ -159,6 +156,76 @@ def shape(draw, bounds, ink, sweep, trim):
         outline.draw(TransformPen(lowered.getPen(), (1, 0, 0, 1, 0, -trim)))
         outline = op(outline, lowered, PathOp.INTERSECTION)
     return outline
+
+
+def y_turns(c):
+    """The t in (0, 1) where cubic `c` turns vertically."""
+    a = -c[0].imag + 3 * c[1].imag - 3 * c[2].imag + c[3].imag
+    b = 2 * (c[0].imag - 2 * c[1].imag + c[2].imag)
+    k = c[1].imag - c[0].imag
+    if abs(a) < 1e-12:
+        roots = [-k / b] if abs(b) > 1e-12 else []
+    else:
+        disc = b * b - 4 * a * k
+        roots = [] if disc < 0 else [(-b + s * math.sqrt(disc)) / (2 * a) for s in (1, -1)]
+    return sorted(t for t in roots if 1e-6 < t < 1 - 1e-6)
+
+
+def split(c, t):
+    ab, bc, cd = c[0] + (c[1] - c[0]) * t, c[1] + (c[2] - c[1]) * t, c[2] + (c[3] - c[2]) * t
+    abc, bcd = ab + (bc - ab) * t, bc + (cd - bc) * t
+    mid = abc + (bcd - abc) * t
+    return (c[0], ab, abc, mid), (mid, bcd, cd, c[3])
+
+
+def y_monotone(segment):
+    if len(segment) == 2:
+        return [segment]
+    pieces, rest, done = [], segment, 0.0
+    for t in y_turns(segment):
+        head, rest = split(rest, (t - done) / (1 - done))
+        pieces.append(head)
+        done = t
+    return pieces + [rest]
+
+
+def follow(pen, points):
+    if len(points) == 3:
+        pen.curveTo(*points)
+    else:
+        pen.lineTo(points[0])
+
+
+def swept(outline, distance):
+    """`outline` swept `distance` units to the right: its union with the band each y-monotone
+    piece of it covers on the way, bounded by the piece and its shifted copy."""
+    collected = SegmentPen()
+    outline.draw(collected)
+    shifted = Path()
+    outline.draw(TransformPen(shifted.getPen(), (1, 0, 0, 1, distance, 0)))
+    bands = []
+    for contour in collected.contours:
+        for segment in contour:
+            for piece in y_monotone(segment):
+                if abs(piece[-1].imag - piece[0].imag) < 1e-9:
+                    continue
+                forth = [(p.real, p.imag) for p in piece]
+                back = [(x + distance, y) for x, y in forth[::-1]]
+                band = Path()
+                pen = band.getPen()
+                pen.moveTo(forth[0])
+                follow(pen, forth[1:])
+                pen.lineTo(back[0])
+                follow(pen, back[1:])
+                pen.closePath()
+                if band.clockwise:
+                    band.reverse()
+                bands.append(band)
+    # `union` fills all its contours as one path, so it only merges bands turning the same
+    # way; the outlines, which have holes, are merged with real boolean operations.
+    covered = Path()
+    union(bands, covered.getPen())
+    return op(op(outline, shifted, PathOp.UNION), covered, PathOp.UNION)
 
 
 def fit(draw, bounds, ink, letter):
@@ -335,11 +402,7 @@ def draw_simplified(outline, pen):
         if len(simplified[-1]) == 2:
             simplified.pop()
         for segment in simplified:
-            points = [(p.real, p.imag) for p in segment[1:]]
-            if len(points) == 1:
-                pen.lineTo(points[0])
-            else:
-                pen.curveTo(*points)
+            follow(pen, [(p.real, p.imag) for p in segment[1:]])
         pen.closePath()
 
 

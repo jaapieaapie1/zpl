@@ -903,6 +903,10 @@ fn pdf_dimensions(needed: u32, columns: u32, rows: u32) -> Option<(u32, u32)> {
 
 /// PDF417 high-level encoding (text / byte / numeric compaction), after zxing's
 /// `PDF417HighLevelEncoder` in auto mode, with Zebra's choice between text and numeric runs.
+/// Where bytes are involved the choices differ from zxing's as well: text after a shifted byte
+/// (913) is latched again with 900, a byte run also ends at four digits or at two or more
+/// text characters closing the message, and one or two text characters between numbers or
+/// bytes and a byte are encoded as bytes.
 pub(crate) fn pdf_high_level(msg: &[u8], out: &mut Vec<u16>) {
     const TEXT: u8 = 0;
     const BYTE: u8 = 1;
@@ -913,7 +917,7 @@ pub(crate) fn pdf_high_level(msg: &[u8], out: &mut Vec<u16>) {
     let mut p = 0;
     while p < len {
         let n = consecutive_digits(msg, p);
-        if numeric_run(msg, p, n) {
+        if numeric_run(msg, p, n, mode == TEXT) {
             out.push(902);
             mode = NUMERIC;
             sub = SUB_ALPHA;
@@ -924,7 +928,9 @@ pub(crate) fn pdf_high_level(msg: &[u8], out: &mut Vec<u16>) {
         let t = consecutive_text(msg, p);
         // Any text run stays text (zxing switches to bytes for runs under 5; Zebra and
         // Labelary encode e.g. "AB" as one text codeword).
-        if t > 0 {
+        // One or two text characters between numbers or bytes and a byte go with the bytes.
+        let short = t <= 2 && mode != TEXT && msg.get(p + t).is_some_and(|&c| !is_pdf_text(c));
+        if t > 0 && !short {
             if mode != TEXT {
                 out.push(900);
                 mode = TEXT;
@@ -938,6 +944,8 @@ pub(crate) fn pdf_high_level(msg: &[u8], out: &mut Vec<u16>) {
         if b == 1 && mode == TEXT {
             out.push(913);
             out.push(u16::from(msg[p]));
+            // Text after a shifted byte is latched again (900, alpha submode).
+            mode = BYTE;
         } else {
             pdf_bytes(&msg[p..p + b], out);
             mode = BYTE;
@@ -951,16 +959,23 @@ pub(crate) fn pdf_high_level(msg: &[u8], out: &mut Vec<u16>) {
 /// counting half a codeword per text value (the digits plus the latches into and out of
 /// mixed) against 902, the numeric codewords and the 900 back to text. A message of digits
 /// only is always numeric.
-fn numeric_run(msg: &[u8], start: usize, digits: usize) -> bool {
+///
+/// `in_text` is false when the digits follow bytes or numbers: with no text after them
+/// either, text would cost its own 900 latch, so numeric wins sooner (always, in practice).
+fn numeric_run(msg: &[u8], start: usize, digits: usize, in_text: bool) -> bool {
     if digits == 0 {
         return false;
     }
     if digits >= 13 || digits == msg.len() {
         return true;
     }
-    let more = usize::from(start + digits < msg.len());
+    // Only text after the digits needs the latches back; a byte starts its own mode.
+    let more = usize::from(msg.get(start + digits).is_some_and(|&c| is_pdf_text(c)));
     // Base-900 codewords for "1" followed by the digits: about 2.95 digits per codeword.
     let numeric = 1 + (digits as f32 / 900f32.log10()) as usize + 1 + more;
+    if !in_text {
+        return more == 0 || digits >= 4;
+    }
     2 * numeric <= 1 + digits + more
 }
 
@@ -979,7 +994,7 @@ fn consecutive_text(msg: &[u8], start: usize) -> usize {
     let mut idx = start;
     while idx < msg.len() {
         let digits = consecutive_digits(msg, idx);
-        if idx > start && numeric_run(msg, idx, digits) {
+        if idx > start && numeric_run(msg, idx, digits, true) {
             break;
         }
         if digits > 0 {
@@ -994,13 +1009,25 @@ fn consecutive_text(msg: &[u8], start: usize) -> usize {
     idx - start
 }
 
+/// Text characters from `start`, digits included: five of them end a byte run, even when
+/// the text itself then switches to numeric.
+fn text_ahead(msg: &[u8], start: usize) -> usize {
+    msg[start..].iter().take_while(|&&c| is_pdf_text(c)).count()
+}
+
 fn consecutive_binary(msg: &[u8], start: usize) -> usize {
     let mut idx = start;
     while idx < msg.len() {
-        if numeric_run(msg, idx, consecutive_digits(msg, idx)) {
+        let digits = consecutive_digits(msg, idx);
+        // Four digits take fewer numeric codewords (902 included) than bytes.
+        if numeric_run(msg, idx, digits, true) || digits >= 4 {
             break;
         }
-        if idx > start && consecutive_text(msg, idx) >= 5 {
+        if idx > start && text_ahead(msg, idx) >= 5 {
+            break;
+        }
+        // Two or more text characters closing the message leave byte compaction too.
+        if idx > start && msg.len() - idx >= 2 && msg[idx..].iter().all(|&c| is_pdf_text(c)) {
             break;
         }
         idx += 1;
@@ -1077,6 +1104,27 @@ fn pdf_punct(c: u8) -> Option<u16> {
     PDF_PUNCT_RAW.iter().position(|&m| m == c).map(|p| p as u16)
 }
 
+/// The submode a character that is no letter latches to from alpha or lower, or `None` to
+/// shift it as punctuation. Measured on reference symbols (zxing latches to mixed whenever it
+/// can and shifts every other character): two punctuation characters in a row latch to
+/// punctuation, and a character of both sets (`,` `.` `-` ...) is only worth mixed before
+/// another mixed one.
+fn leave_letters(msg: &[u8], idx: usize) -> Option<u8> {
+    let ch = msg[idx];
+    if pdf_punct(ch).is_some() {
+        if punct_follows(msg, idx) {
+            return Some(SUB_PUNCT);
+        }
+        let mixed_next = msg.get(idx + 1).is_some_and(|&n| pdf_mixed(n).is_some());
+        return (pdf_mixed(ch).is_some() && mixed_next).then_some(SUB_MIXED);
+    }
+    pdf_mixed(ch).map(|_| SUB_MIXED)
+}
+
+fn punct_follows(msg: &[u8], idx: usize) -> bool {
+    msg.get(idx + 1).is_some_and(|&n| pdf_punct(n).is_some())
+}
+
 pub(crate) fn pdf_text(msg: &[u8], mut sub: u8, out: &mut Vec<u16>) -> u8 {
     let upper = |c: u8| c == b' ' || c.is_ascii_uppercase();
     let lower = |c: u8| c == b' ' || c.is_ascii_lowercase();
@@ -1092,9 +1140,12 @@ pub(crate) fn pdf_text(msg: &[u8], mut sub: u8, out: &mut Vec<u16>) -> u8 {
                     sub = SUB_LOWER;
                     tmp.push(27);
                     continue;
-                } else if pdf_mixed(ch).is_some() {
-                    sub = SUB_MIXED;
+                } else if let Some(latch) = leave_letters(msg, idx) {
+                    sub = latch;
                     tmp.push(28);
+                    if latch == SUB_PUNCT {
+                        tmp.push(25);
+                    }
                     continue;
                 } else {
                     tmp.push(29);
@@ -1105,11 +1156,22 @@ pub(crate) fn pdf_text(msg: &[u8], mut sub: u8, out: &mut Vec<u16>) -> u8 {
                 if lower(ch) {
                     tmp.push(if ch == b' ' { 26 } else { u16::from(ch - b'a') });
                 } else if upper(ch) {
+                    // A capital before another capital or a space latches to alpha (through
+                    // mixed); a lone one is shifted.
+                    if msg.get(idx + 1).is_some_and(|&n| upper(n)) {
+                        sub = SUB_ALPHA;
+                        tmp.push(28);
+                        tmp.push(28);
+                        continue;
+                    }
                     tmp.push(27);
                     tmp.push(u16::from(ch - b'A'));
-                } else if pdf_mixed(ch).is_some() {
-                    sub = SUB_MIXED;
+                } else if let Some(latch) = leave_letters(msg, idx) {
+                    sub = latch;
                     tmp.push(28);
+                    if latch == SUB_PUNCT {
+                        tmp.push(25);
+                    }
                     continue;
                 } else {
                     tmp.push(29);
@@ -1127,7 +1189,7 @@ pub(crate) fn pdf_text(msg: &[u8], mut sub: u8, out: &mut Vec<u16>) -> u8 {
                     sub = SUB_LOWER;
                     tmp.push(27);
                     continue;
-                } else if msg.get(idx + 1).is_some_and(|&n| pdf_punct(n).is_some()) {
+                } else if punct_follows(msg, idx) {
                     sub = SUB_PUNCT;
                     tmp.push(25);
                     continue;
@@ -1142,6 +1204,11 @@ pub(crate) fn pdf_text(msg: &[u8], mut sub: u8, out: &mut Vec<u16>) -> u8 {
                 } else {
                     sub = SUB_ALPHA;
                     tmp.push(29);
+                    // A space that lowercase follows comes after the latch to lower.
+                    if ch == b' ' && msg.get(idx + 1).is_some_and(|n| n.is_ascii_lowercase()) {
+                        sub = SUB_LOWER;
+                        tmp.push(27);
+                    }
                     continue;
                 }
             }
@@ -2486,6 +2553,39 @@ mod tests {
             let mut cws = Vec::new();
             pdf_high_level(data.as_bytes(), &mut cws);
             assert_eq!(cws, want, "{data}");
+        }
+    }
+
+    #[test]
+    fn pdf417_compaction_around_bytes() {
+        // As above, for data with control characters (GS and RS separators)
+        // and runs of punctuation.
+        let cases: [(&str, &[u16]); 20] = [
+            ("[)>\x1e01\x1d0275001\x1d250", &[865, 144, 89, 901, 30, 48, 49, 29, 902, 12, 616, 601, 901, 29, 902, 1, 350]),
+            ("ab[)>cd", &[810, 58, 754, 722, 897, 63]),
+            ("ABCDE\x1d12Z3249432390\x1dXY", &[1, 63, 149, 913, 29, 900, 841, 88, 779, 902, 18, 157, 291, 490, 901, 29, 900, 714]),
+            ("A;;B", &[28, 750, 29, 59]),
+            ("AB\x1d\x1d25", &[1, 901, 29, 29, 902, 125]),
+            ("AB\x1d\x1dXY", &[1, 901, 29, 29, 900, 714]),
+            ("\x1d\x1d250\x1dAB", &[924, 48, 711, 141, 437, 313, 900, 1]),
+            ("ABC\x1d\x1d\x1dDEFGH12345\x1d12\x1d123456\x1dAB", &[1, 89, 901, 29, 29, 29, 900, 94, 156, 239, 902, 124, 745, 901, 29, 49, 50, 29, 902, 1, 348, 256, 901, 29, 900, 1]),
+            ("AB\x1d\x1d12345AB", &[1, 901, 29, 29, 902, 124, 745, 900, 1]),
+            ("AB\x1d\x1d1234A\x1d", &[1, 901, 29, 29, 902, 12, 434, 901, 65, 29]),
+            ("ABCDEF\x1d1234\x1dABCDEF", &[1, 63, 125, 913, 29, 902, 12, 434, 901, 29, 900, 1, 63, 125]),
+            ("AB\x1d\x1d123AB", &[1, 901, 29, 29, 900, 841, 63, 840, 59]),
+            ("12345678901234A\x1d", &[902, 171, 209, 269, 12, 434, 901, 65, 29]),
+            ("12345678901234\x1d31Z12345678901234", &[902, 171, 209, 269, 12, 434, 901, 29, 900, 843, 58, 779, 902, 171, 209, 269, 12, 434]),
+            ("ab,cd", &[810, 59, 392, 119]),
+            ("AB,CD", &[1, 883, 63]),
+            ("ab,;", &[810, 58, 763, 29]),
+            ("abA B", &[810, 58, 840, 781]),
+            ("ab A b", &[810, 56, 868, 26, 811]),
+            ("abAB cd EF gh", &[810, 58, 840, 56, 812, 116, 868, 125, 807, 187]),
+        ];
+        for (data, want) in cases {
+            let mut cws = Vec::new();
+            pdf_high_level(data.as_bytes(), &mut cws);
+            assert_eq!(cws, want, "{data:?}");
         }
     }
 

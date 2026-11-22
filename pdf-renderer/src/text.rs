@@ -49,7 +49,7 @@ const TEXT_BLOCK_PITCH: f32 = 1.26;
 const MIN_SCALABLE: u32 = 10;
 
 /// Fonts P–V: glyph height and width against the matrix (Labelary).
-const FIXED_EM: (f32, f32) = (0.82, 0.945);
+const FIXED_EM: (f32, f32) = (0.825, 0.95);
 
 /// Fonts P–V: fixed-size renditions of the scalable font 0 (H x W in dots at magnification 1).
 fn fixed_scalable(font: FontName) -> Option<(u32, u32)> {
@@ -1668,9 +1668,9 @@ mod tests {
     fn fonts_p_to_v_are_fixed_size_font_zero() {
         let tm = text_matrices(&content(&with_font("Hi", FontName::FontP, 0, 0)));
         // P is 20 x 18 (docs/commands/other/FONTS.md).
-        assert!(approx(tm[0][0], 18.0 * 0.945) && approx(tm[0][3], -20.0 * 0.82), "{tm:?}");
+        assert!(approx(tm[0][0], 18.0 * 0.95) && approx(tm[0][3], -20.0 * 0.825), "{tm:?}");
         let tm = text_matrices(&content(&with_font("Hi", FontName::FontQ, 56, 56)));
-        assert!(approx(tm[0][0], 48.0 * 0.945) && approx(tm[0][3], -56.0 * 0.82), "{tm:?}");
+        assert!(approx(tm[0][0], 48.0 * 0.95) && approx(tm[0][3], -56.0 * 0.825), "{tm:?}");
     }
 
     #[test]

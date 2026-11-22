@@ -5,8 +5,9 @@ available from CTAN: https://ctan.org/pkg/tex-gyre-heros
 
 This is NOT the original TeX Gyre Heros. It was renamed and changed by
 build_zpl_sans.py in this directory: the outlines are scaled to a 0.75 em cap height,
-the advance widths and line metrics are set to those of ZPL font 0, and the kerning is
-removed. TeX Gyre Heros, and so this font, is distributed under the GUST Font License:
+the advance widths and line metrics are set to those of ZPL font 0, the ASCII glyphs and
+the accented letters built on them are condensed and reweighted to the ink boxes, stems
+and bars of font 0, and the kerning is removed. TeX Gyre Heros, and so this font, is distributed under the GUST Font License:
 
 % This is a preliminary version (2006-09-30), barring acceptance from
 % the LaTeX Project Team and other feedback, of the GUST Font License.

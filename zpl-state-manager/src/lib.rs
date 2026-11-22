@@ -839,6 +839,9 @@ impl StateManager {
 
             Command::FieldOrientation { orientation, justification } => {
                 self.default_orientation = orientation;
+                // A ^FW after the field's ^A replaces that ^A's rotation: `^A0N,20^FWB^FD...`
+                // prints rotated.
+                self.current_font_orientation = None;
                 if let Some(j) = justification {
                     self.default_justification = j;
                 }
@@ -1526,6 +1529,20 @@ mod tests {
     fn field_orientation_default() {
         let ins = run("^XA^FWR^FO1,1^A0,20^FDa^FS^XZ");
         assert!(matches!(ins[0], DrawInstruction::DrawText { orientation: Orientation::Rotated90, .. }));
+    }
+
+    #[test]
+    fn field_orientation_after_font_replaces_its_rotation() {
+        // The later of ^A's rotation and ^FW wins; a barcode keeps its own rotation.
+        let ins = run("^XA^FO1,1^A0N,20^FWB^FDa^FS^FO1,1^FWR^A0N,20^FDb^FS^FO1,1^A0N,20^FDc^FWI^FS^FO1,1^BCN,20,N^FWB^FD1^FS^XZ");
+        let orientations: Vec<_> = ins
+            .iter()
+            .map(|i| match i {
+                DrawInstruction::DrawText { orientation, .. } | DrawInstruction::DrawBarcode { orientation, .. } => *orientation,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(orientations, [Orientation::Rotated270, Orientation::Normal, Orientation::Rotated180, Orientation::Normal]);
     }
 
     #[test]

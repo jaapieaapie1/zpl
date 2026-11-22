@@ -20,12 +20,13 @@ Usage (needs fonttools and skia-pathops):
     curl -LO https://mirrors.ctan.org/fonts/tex-gyre/opentype/texgyreheroscn-bold.otf
     python3 build_zpl_sans.py texgyreheroscn-bold.otf ZplSansCn-Bold.otf
 """
+import cmath
 import math
 import sys
 import unicodedata
 
+from fontTools.pens.basePen import BasePen
 from fontTools.pens.boundsPen import BoundsPen
-from fontTools.pens.qu2cuPen import Qu2CuPen
 from fontTools.pens.t2CharStringPen import T2CharStringPen
 from fontTools.pens.transformPen import TransformPen
 from fontTools.ttLib import TTFont
@@ -120,6 +121,8 @@ INK = {
 BAR, FONT_0_BAR = 132, 118
 # The widest stroke change tried, in 1/1000 em.
 MAX_SWEEP = 60
+# How far, in 1/1000 em, a simplified outline may stray from the swept one.
+TOLERANCE = 0.5
 
 
 def shape(draw, bounds, ink, sweep, trim):
@@ -180,6 +183,164 @@ def fit(draw, bounds, ink, letter):
         else:
             high = sweep
     return (low + high) / 2, trim
+
+
+class SegmentPen(BasePen):
+    """Collects each contour as lines (2 points) and cubics (4 points), as complex numbers."""
+
+    def __init__(self):
+        super().__init__(None)
+        self.contours = []
+
+    def _moveTo(self, p):
+        self.start = complex(*p)
+        self.contours.append([])
+
+    def _add(self, *points):
+        segment = (complex(*self._getCurrentPoint()), *(complex(*p) for p in points))
+        if any(abs(p - segment[0]) > 1e-9 for p in segment[1:]):
+            self.contours[-1].append(segment)
+
+    def _lineTo(self, p):
+        self._add(p)
+
+    def _curveToOne(self, p1, p2, p3):
+        self._add(p1, p2, p3)
+
+    def _closePath(self):
+        if abs(complex(*self._getCurrentPoint()) - self.start) > 1e-9:
+            self._add((self.start.real, self.start.imag))
+
+
+def bezier(c, t):
+    if len(c) == 2:
+        return c[0] + (c[1] - c[0]) * t
+    u = 1 - t
+    return u * u * u * c[0] + 3 * u * t * (u * c[1] + t * c[2]) + t * t * t * c[3]
+
+
+def derivatives(c, t):
+    u = 1 - t
+    d1 = 3 * (u * u * (c[1] - c[0]) + 2 * u * t * (c[2] - c[1]) + t * t * (c[3] - c[2]))
+    d2 = 6 * (u * (c[2] - 2 * c[1] + c[0]) + t * (c[3] - 2 * c[2] + c[1]))
+    return d1, d2
+
+
+def direction(points):
+    for p in points[1:]:
+        if abs(p - points[0]) > 1e-9:
+            return (p - points[0]) / abs(p - points[0])
+    return 0j
+
+
+def dot(a, b):
+    return a.real * b.real + a.imag * b.imag
+
+
+def fit_cubic(points, start, end, out_tangent, in_tangent):
+    """A cubic from `start` to `end` leaving and arriving along the given tangents, through
+    `points` within TOLERANCE, or None."""
+    chord = abs(end - start)
+    lengths = [0.0]
+    for a, b in zip([start] + points, points + [end]):
+        lengths.append(lengths[-1] + abs(b - a))
+    ts = [length / lengths[-1] for length in lengths[1:-1]]
+    back = -in_tangent
+    for _ in range(6):
+        c00 = c01 = c11 = x0 = x1 = 0.0
+        for p, t in zip(points, ts):
+            u = 1 - t
+            b0, b1, b2, b3 = u * u * u, 3 * u * u * t, 3 * u * t * t, t * t * t
+            a1, a2 = out_tangent * b1, back * b2
+            rest = p - start * (b0 + b1) - end * (b2 + b3)
+            c00, c01, c11 = c00 + dot(a1, a1), c01 + dot(a1, a2), c11 + dot(a2, a2)
+            x0, x1 = x0 + dot(a1, rest), x1 + dot(a2, rest)
+        det = c00 * c11 - c01 * c01
+        alpha1 = (x0 * c11 - x1 * c01) / det if abs(det) > 1e-12 else 0.0
+        alpha2 = (c00 * x1 - c01 * x0) / det if abs(det) > 1e-12 else 0.0
+        if alpha1 < 1e-3 * chord or alpha2 < 1e-3 * chord:
+            alpha1 = alpha2 = chord / 3
+        curve = (start, start + out_tangent * alpha1, end + back * alpha2, end)
+        error = 0.0
+        for i, (p, t) in enumerate(zip(points, ts)):
+            d1, d2 = derivatives(curve, t)
+            diff = bezier(curve, t) - p
+            denominator = dot(d1, d1) + dot(diff, d2)
+            if abs(denominator) > 1e-12:
+                t = min(max(t - dot(diff, d1) / denominator, 0.0), 1.0)
+            ts[i] = t
+            error = max(error, abs(bezier(curve, t) - p))
+        if error <= TOLERANCE:
+            return curve
+        if error > 8 * TOLERANCE:
+            return None
+    return None
+
+
+def fit_span(segments, samples):
+    """One line or cubic replacing `segments`, or None if none stays within TOLERANCE."""
+    start, end = segments[0][0], segments[-1][-1]
+    chord = abs(end - start)
+    if chord < 1e-9:
+        return None
+    along = (end - start) / chord
+    if all(abs(dot(p - start, along * 1j)) <= TOLERANCE
+           and -TOLERANCE <= dot(p - start, along) <= chord + TOLERANCE for p in samples):
+        return (start, end)
+    out_tangent = direction(segments[0])
+    in_tangent = -direction(segments[-1][::-1])
+    if not out_tangent or not in_tangent:
+        return None
+    return fit_cubic(samples, start, end, out_tangent, in_tangent)
+
+
+def simplify_contour(segments):
+    """The fewest lines and cubics, counted in points, that follow `segments` within TOLERANCE."""
+    turns = [abs(cmath.phase(direction(segments[i]) / -direction(segments[i - 1][::-1])))
+             for i in range(len(segments))]
+    first = max(range(len(segments)), key=lambda i: turns[i])
+    segments = segments[first:] + segments[:first]
+    samples = []
+    for segment in segments:
+        length = sum(abs(b - a) for a, b in zip(segment, segment[1:]))
+        count = max(1, math.ceil(length / 2))
+        samples.append([bezier(segment, i / count) for i in range(1, count)] + [segment[-1]])
+    best = [(0, None, None)]
+    for i in range(1, len(segments) + 1):
+        best.append((best[i - 1][0] + len(segments[i - 1]) - 1, i - 1, segments[i - 1]))
+        for j in range(i - 2, -1, -1):
+            points = [p for k in range(j, i) for p in samples[k]][:-1]
+            fitted = fit_span(segments[j:i], points)
+            if fitted is None:
+                break
+            cost = best[j][0] + len(fitted) - 1
+            if cost < best[i][0]:
+                best[i] = (cost, j, fitted)
+    result, i = [], len(segments)
+    while i:
+        _, j, fitted = best[i]
+        result.append(fitted)
+        i = j
+    return result[::-1]
+
+
+def draw_simplified(outline, pen):
+    collected = SegmentPen()
+    outline.draw(collected)
+    for contour in collected.contours:
+        if not contour:
+            continue
+        simplified = simplify_contour(contour)
+        pen.moveTo((simplified[0][0].real, simplified[0][0].imag))
+        if len(simplified[-1]) == 2:
+            simplified.pop()
+        for segment in simplified:
+            points = [(p.real, p.imag) for p in segment[1:]]
+            if len(points) == 1:
+                pen.lineTo(points[0])
+            else:
+                pen.curveTo(*points)
+        pen.closePath()
 
 
 def build(source, target):
@@ -243,7 +404,7 @@ def build(source, target):
             glyphs[name].draw(TransformPen(pen, place))
         else:
             outline = shape(drawer(name, place), *fitted)
-            outline.draw(Qu2CuPen(pen, 0.5, all_cubic=True))
+            draw_simplified(outline, pen)
         old = charstrings[name]
         charstring = pen.getCharString(private=old.private, globalSubrs=old.globalSubrs)
         rebuilt[name] = (charstring, new_advance)

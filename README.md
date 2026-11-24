@@ -35,6 +35,21 @@ Or use one of the client libraries:
 See [`clients/README.md`](clients/README.md) for their shared behaviour. Every client
 takes a base URL, so they work against a self-hosted server too.
 
+### gRPC
+
+For many labels over one long-lived connection, `caretly.dev:443` also serves gRPC:
+`zpl.v1.Renderer/Render` from [`renderer.proto`](http-api/proto/zpl/v1/renderer.proto),
+with the API key as `authorization: Bearer <key>` metadata. Keep one channel open and
+send requests concurrently over it; HTTP/2 multiplexes them. Raise the client's maximum
+receive message size (often 4 MiB by default) if you render large PDFs.
+
+```sh
+grpcurl -import-path http-api/proto -proto zpl/v1/renderer.proto \
+  -H "authorization: Bearer $CARETLY_API_KEY" \
+  -d "{\"zpl\": \"$(base64 -w0 label.zpl)\", \"format\": \"FORMAT_PDF\"}" \
+  caretly.dev:443 zpl.v1.Renderer/Render
+```
+
 ### CLI
 
 Requires a recent stable Rust toolchain (edition 2024).
@@ -116,6 +131,7 @@ curl -F file=@a.zpl -F file=@b.zpl 'http://localhost:3000/render?format=pdf' -o 
 | Variable                    | Default            | Purpose                                                   |
 |-----------------------------|--------------------|-----------------------------------------------------------|
 | `ZPL_API_ADDR`              | `127.0.0.1:3000` (`0.0.0.0:3000` in Docker) | Listen address                   |
+| `ZPL_GRPC_ADDR`             | unset (gRPC off)   | gRPC listen address (plain h2c, e.g. `0.0.0.0:50051`)     |
 | `ZPL_PLAYGROUND_DIR`        | unset (`/playground` in Docker) | Directory served at `/playground/`           |
 | `ZPL_RENDER_CONCURRENCY`    | CPUs available     | Renders running at once                                   |
 | `ZPL_RENDER_QUEUE`          | 4 per render slot  | Requests that may wait; beyond that `/render` returns 503 |
@@ -138,7 +154,7 @@ server.
 | [`pdf-renderer`](pdf-renderer)           | Vector PDF renderer                                             |
 | [`png-renderer`](png-renderer)           | Raster PNG renderer                                             |
 | [`cli`](cli)                             | `zpl-cli`, ZPL to PDF/PNG from the command line                 |
-| [`http-api`](http-api)                   | `zpl-server`, the REST API                                      |
+| [`http-api`](http-api)                   | `zpl-server`, the REST and gRPC API                             |
 | [`zpl-wasm`](zpl-wasm)                   | WebAssembly bindings and the `/playground` editor               |
 | [`zpl-anonymize`](zpl-anonymize)         | Replaces field data with random characters, for bug reports     |
 | [`compat`](compat)                       | Compatibility tests against Labelary reference renders          |

@@ -124,29 +124,32 @@ impl Billing {
         Arc::new(Billing { verifier, revoked: RwLock::default(), usage, rate_limit, console_url })
     }
 
-    /// Takes one request from the caller's rate limit. Gives the `RateLimit-Limit` and
+    /// Takes one request from the caller's rate limit: what is left of it (`None` without
+    /// a limit), or [`Denied::RateLimited`].
+    pub fn take_token(&self, caller: &Caller) -> Result<Option<Quota>, Denied> {
+        let Some(limiter) = &self.rate_limit else { return Ok(None) };
+        let limit = limiter.burst();
+        match limiter.check(caller.key_id) {
+            Decision::Allowed { remaining } => Ok(Some(Quota { limit, remaining })),
+            Decision::Limited { retry_after } => {
+                let per_second = limiter.per_second();
+                Err(Denied::RateLimited {
+                    message: format!(
+                        "Too many requests for this API key: the limit is {per_second} per second, with bursts of {limit}. \
+                         Retry after {retry_after} s."
+                    ),
+                    retry_after,
+                    limit,
+                })
+            }
+        }
+    }
+
+    /// [`take_token`](Self::take_token) for HTTP: the `RateLimit-Limit` and
     /// `RateLimit-Remaining` headers for the response (none without a limit), or the 429
     /// to send instead.
     pub fn rate_limit(&self, caller: &Caller) -> Result<HeaderMap, Response> {
-        let mut headers = HeaderMap::new();
-        let Some(limiter) = &self.rate_limit else { return Ok(headers) };
-        let decision = limiter.check(caller.key_id);
-        let remaining = match decision {
-            Decision::Allowed { remaining } => remaining,
-            Decision::Limited { .. } => 0,
-        };
-        headers.insert("ratelimit-limit", HeaderValue::from(limiter.burst()));
-        headers.insert("ratelimit-remaining", HeaderValue::from(remaining));
-        let Decision::Limited { retry_after } = decision else { return Ok(headers) };
-        let (per_second, burst) = (limiter.per_second(), limiter.burst());
-        let message = format!(
-            "Too many requests for this API key: the limit is {per_second} per second, with bursts of {burst}. \
-             Retry after {retry_after} s."
-        );
-        let mut response = (StatusCode::TOO_MANY_REQUESTS, message).into_response();
-        headers.insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
-        response.headers_mut().extend(headers);
-        Err(response)
+        self.take_token(caller).map(|quota| quota.map(Quota::headers).unwrap_or_default()).map_err(Denied::into_response)
     }
 
     /// Replaces the revocation list (from the console, or in tests).
@@ -160,9 +163,15 @@ impl Billing {
 
     /// The caller's key, or the error response to send instead.
     pub fn authenticate(&self, headers: &HeaderMap) -> Result<Caller, Response> {
+        self.check_key(headers).map_err(Denied::into_response)
+    }
+
+    /// The caller's key from `Authorization: Bearer` or `X-API-Key` (HTTP headers or gRPC
+    /// metadata), or why it is turned away.
+    pub fn check_key(&self, headers: &HeaderMap) -> Result<Caller, Denied> {
         let console = &self.console_url;
         let Some(token) = api_key(headers) else {
-            return Err(unauthorized(format!(
+            return Err(Denied::Unauthorized(format!(
                 "An API key is required. Create one at {console}/keys and send it as \
                  `Authorization: Bearer <key>`."
             )));
@@ -173,27 +182,23 @@ impl Billing {
         let claims = match self.verifier.verify(token, now) {
             Ok(claims) => claims,
             Err(TokenError::Expired) => {
-                return Err(unauthorized(format!("This API key has expired. Renew it at {console}/keys.")))
+                return Err(Denied::Unauthorized(format!("This API key has expired. Renew it at {console}/keys.")))
             }
             Err(_) => {
-                return Err(unauthorized(format!(
+                return Err(Denied::Unauthorized(format!(
                     "This API key is not valid. Check that it was copied completely, or create a new one at {console}/keys."
                 )))
             }
         };
         let revoked = self.revoked.read().expect("revocation lock");
         if revoked.keys.contains(&claims.sub) {
-            return Err(unauthorized(format!("This API key was revoked. Create a new one at {console}/keys.")));
+            return Err(Denied::Unauthorized(format!("This API key was revoked. Create a new one at {console}/keys.")));
         }
         if claims.env == KeyEnv::Live && revoked.orgs.contains(&claims.org) {
-            return Err((
-                StatusCode::PAYMENT_REQUIRED,
-                format!(
-                    "Billing for this account is not active, so live keys are paused. Update it at {console}/billing; \
-                     test keys keep working."
-                ),
-            )
-                .into_response());
+            return Err(Denied::PaymentRequired(format!(
+                "Billing for this account is not active, so live keys are paused. Update it at {console}/billing; \
+                 test keys keep working."
+            )));
         }
         let idempotency_key = headers
             .get("idempotency-key")
@@ -239,12 +244,54 @@ fn api_key(headers: &HeaderMap) -> Option<&str> {
     headers.get("x-api-key").and_then(|v| v.to_str().ok()).map(str::trim).filter(|k| !k.is_empty())
 }
 
-fn unauthorized(message: String) -> Response {
-    let mut response = (StatusCode::UNAUTHORIZED, message).into_response();
-    response
-        .headers_mut()
-        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer realm=\"zpl\""));
-    response
+/// Why a request is turned away before rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Denied {
+    /// No key, or an invalid, expired or revoked one.
+    Unauthorized(String),
+    /// A live key of an organisation whose billing is not active.
+    PaymentRequired(String),
+    /// Over the key's rate limit; `limit` is the burst.
+    RateLimited { message: String, retry_after: u64, limit: u32 },
+}
+
+impl Denied {
+    pub fn into_response(self) -> Response {
+        match self {
+            Denied::Unauthorized(message) => {
+                let mut response = (StatusCode::UNAUTHORIZED, message).into_response();
+                response
+                    .headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer realm=\"zpl\""));
+                response
+            }
+            Denied::PaymentRequired(message) => (StatusCode::PAYMENT_REQUIRED, message).into_response(),
+            Denied::RateLimited { message, retry_after, limit } => {
+                let mut response = (StatusCode::TOO_MANY_REQUESTS, message).into_response();
+                let headers = response.headers_mut();
+                headers.extend(Quota { limit, remaining: 0 }.headers());
+                headers.insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
+                response
+            }
+        }
+    }
+}
+
+/// A key's rate limit after a request: the burst and what is left of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quota {
+    pub limit: u32,
+    pub remaining: u32,
+}
+
+impl Quota {
+    /// `RateLimit-Limit` and `RateLimit-Remaining`.
+    pub fn headers(self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("ratelimit-limit", HeaderValue::from(self.limit));
+        headers.insert("ratelimit-remaining", HeaderValue::from(self.remaining));
+        headers
+    }
 }
 
 async fn poll_revocations(billing: std::sync::Weak<Billing>, url: String, token: String) {

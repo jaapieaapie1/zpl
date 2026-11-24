@@ -33,6 +33,8 @@
 //!   of requests wait for their turn ([`admission`]): when that line is full, or a request
 //!   has waited 5 s, `/render` answers 503 with `Retry-After: 1`. Shed requests are not
 //!   billed; with `timings`, their `Server-Timing` names the reason (`shed;desc=…`).
+//! - The same rendering is offered over gRPC ([`grpc`], `proto/zpl/v1/renderer.proto`),
+//!   for clients that keep a connection open and send many requests over it.
 //! - `GET /health` returns `ok`. It never waits for rendering, so it stays fast under load.
 //! - `GET /playground/` serves the live ZPL editor (`zpl-wasm/www`), which renders in the
 //!   browser with WebAssembly. Files come from `ZPL_PLAYGROUND_DIR`; a `.gz` next to a
@@ -41,6 +43,7 @@
 pub mod admission;
 pub mod billing;
 pub mod console;
+pub mod grpc;
 mod log_every;
 pub mod rate_limit;
 pub mod usage;
@@ -133,6 +136,21 @@ impl Format {
         match self {
             Format::Pdf => "application/pdf",
             Format::Png => "image/png",
+        }
+    }
+
+    /// Labels a response bills: a PNG is one page, whatever the input holds.
+    fn billed_labels(self, page_count: usize) -> usize {
+        match self {
+            Format::Pdf => page_count,
+            Format::Png => 1,
+        }
+    }
+
+    fn usage_kind(self) -> &'static str {
+        match self {
+            Format::Pdf => "pdf",
+            Format::Png => "png",
         }
     }
 }
@@ -305,6 +323,53 @@ impl Input {
     }
 }
 
+/// Why [`run_render`] produced nothing.
+enum Failed {
+    /// Turned away under load after waiting `queue`.
+    Shed { shed: Shed, queue: Duration },
+    Render(RenderError),
+    Task(String),
+}
+
+/// Waits for admission, then renders `input` on a blocking thread. Gives the time spent
+/// waiting, the result and, when `fingerprint_needed`, the input's [`Input::fingerprint`].
+async fn run_render(
+    admission: &Admission,
+    input: Input,
+    format: Format,
+    page: usize,
+    dpmm: u32,
+    watermark: Option<&'static str>,
+    fingerprint_needed: bool,
+) -> Result<(Duration, Rendered, Option<blake3::Hash>), Failed> {
+    // Rendering is CPU-bound (PNG takes milliseconds), so keep it off the async workers,
+    // a few at a time. `queue` includes waiting for the memory budget.
+    let queued = Instant::now();
+    let ticket = admission.admit(input.permits()).await.map_err(|shed| Failed::Shed { shed, queue: queued.elapsed() })?;
+    let queue = queued.elapsed();
+    // The ticket goes with the render: if the client hangs up, the render still holds its
+    // slot until it is done.
+    let result = tokio::task::spawn_blocking(move || {
+        let _ticket = ticket;
+        // Only requests with an Idempotency-Key need it; microseconds for a typical label.
+        let fingerprint = fingerprint_needed.then(|| input.fingerprint(format, page, dpmm));
+        let rendered = match &input {
+            Input::Label(zpl) => render_documents(&[(None, zpl)], format, page, dpmm, watermark),
+            Input::Files(files) => {
+                let documents: Vec<_> = files.iter().map(|(name, zpl)| (Some(name.as_str()), zpl.as_str())).collect();
+                render_documents(&documents, format, page, dpmm, watermark)
+            }
+        };
+        rendered.map(|rendered| (rendered, fingerprint))
+    })
+    .await;
+    match result {
+        Ok(Ok((rendered, fingerprint))) => Ok((queue, rendered, fingerprint)),
+        Ok(Err(e)) => Err(Failed::Render(e)),
+        Err(e) => Err(Failed::Task(e.to_string())),
+    }
+}
+
 fn is_multipart(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
@@ -433,45 +498,26 @@ async fn render(
     };
     let read = start.elapsed();
 
-    // Rendering is CPU-bound (PNG takes milliseconds), so keep it off the async workers,
-    // a few at a time. `queue` includes waiting for the memory budget.
-    let queued = Instant::now();
-    let ticket = match admission.admit(input.permits()).await {
-        Ok(ticket) => ticket,
-        Err(shed) => return overloaded(shed, timings_enabled.then(|| vec![("read", read), ("queue", queued.elapsed())]), start),
-    };
-    let queue = queued.elapsed();
     let fingerprint_needed = caller.as_ref().is_some_and(|c| c.idempotency_key.is_some());
-    // The ticket goes with the render: if the client hangs up, the render still holds its
-    // slot until it is done.
-    let result = tokio::task::spawn_blocking(move || {
-        let _ticket = ticket;
-        // Only requests with an Idempotency-Key need it; microseconds for a typical label.
-        let fingerprint = fingerprint_needed.then(|| input.fingerprint(format, page, dpmm));
-        let rendered = match &input {
-            Input::Label(zpl) => render_documents(&[(None, zpl)], format, page, dpmm, watermark),
-            Input::Files(files) => {
-                let documents: Vec<_> = files.iter().map(|(name, zpl)| (Some(name.as_str()), zpl.as_str())).collect();
-                render_documents(&documents, format, page, dpmm, watermark)
-            }
-        };
-        rendered.map(|rendered| (queue, rendered, matches!(input, Input::Files(_)), fingerprint))
-    })
-    .await;
-
-    let (queue, rendered, multipart, fingerprint) = match result {
-        Ok(Ok(ok)) => ok,
-        Ok(Err(RenderError::Parse { file: None, message })) => {
+    let multipart = matches!(input, Input::Files(_));
+    let (queue, rendered, fingerprint) = match run_render(&admission, input, format, page, dpmm, watermark, fingerprint_needed).await {
+        Ok(ok) => ok,
+        Err(Failed::Shed { shed, queue }) => {
+            return overloaded(shed, timings_enabled.then(|| vec![("read", read), ("queue", queue)]), start)
+        }
+        Err(Failed::Render(RenderError::Parse { file: None, message })) => {
             return error(StatusCode::BAD_REQUEST, format!("parse error: {message}"))
         }
-        Ok(Err(RenderError::Parse { file: Some(file), message })) => {
+        Err(Failed::Render(RenderError::Parse { file: Some(file), message })) => {
             return error(StatusCode::BAD_REQUEST, format!("parse error in {file}: {message}"))
         }
-        Ok(Err(RenderError::Encode(e))) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("encode error: {e}")),
-        Ok(Err(RenderError::NoSuchPage { page, page_count })) => {
+        Err(Failed::Render(RenderError::Encode(e))) => {
+            return error(StatusCode::INTERNAL_SERVER_ERROR, format!("encode error: {e}"))
+        }
+        Err(Failed::Render(RenderError::NoSuchPage { page, page_count })) => {
             return error(StatusCode::BAD_REQUEST, format!("page {page} out of range; the label has {page_count} page(s)"))
         }
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("render task failed: {e}")),
+        Err(Failed::Task(e)) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("render task failed: {e}")),
     };
 
     let mut response = (
@@ -482,12 +528,7 @@ async fn render(
     response.headers_mut().insert("x-page-count", HeaderValue::from(rendered.page_count));
     response.headers_mut().extend(limit_headers);
     if let (Some(billing), Some(caller)) = (&billing, &caller) {
-        // A PNG response is one page, whatever the input holds.
-        let (labels, kind) = match format {
-            Format::Pdf => (rendered.page_count, "pdf"),
-            Format::Png => (1, "png"),
-        };
-        let billed = billing.record(caller, labels, kind, fingerprint.as_ref());
+        let billed = billing.record(caller, format.billed_labels(rendered.page_count), format.usage_kind(), fingerprint.as_ref());
         response.headers_mut().insert("x-labels-billed", HeaderValue::from(billed));
     }
     if multipart {

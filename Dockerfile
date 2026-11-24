@@ -49,6 +49,6 @@ COPY --from=build /zpl-server /zpl-server
 COPY --from=wasm /playground /playground
 ENV ZPL_API_ADDR=0.0.0.0:3000
 ENV ZPL_PLAYGROUND_DIR=/playground
-EXPOSE 3000
+EXPOSE 3000 50051
 USER nonroot
 ENTRYPOINT ["/zpl-server"]

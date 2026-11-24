@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package zpl.v1;
+
+// Renders ZPL to PDF or PNG, like POST /render on the HTTP API.
+//
+// Authentication: metadata `authorization: Bearer <key>` (or `x-api-key: <key>`), with a
+// key from https://caretly.dev/console/keys. Optional `idempotency-key` metadata makes a
+// retry of the same request bill once.
+//
+// Response metadata: `ratelimit-limit` and `ratelimit-remaining`, as on HTTP.
+//
+// Errors:
+//   UNAUTHENTICATED     no key, or an invalid, expired or revoked one
+//   PERMISSION_DENIED   live key of an account whose billing is not active
+//   RESOURCE_EXHAUSTED  over the key's rate limit; `retry-after` metadata in seconds
+//   UNAVAILABLE         the renderer is busy; retry after a second
+//   INVALID_ARGUMENT    bad settings, parse error, or a page that does not exist
+//
+// Requests may be compressed (gzip or zstd); the decompressed message is capped at 100 MiB.
+// Keep one channel open and send many requests over it: HTTP/2 multiplexes them.
+service Renderer {
+  rpc Render(RenderRequest) returns (RenderResponse);
+}
+
+enum Format {
+  FORMAT_UNSPECIFIED = 0; // PDF
+  FORMAT_PDF = 1;
+  FORMAT_PNG = 2;
+}
+
+message ZplFile {
+  // Used in error messages.
+  string name = 1;
+  // UTF-8, or else a single-byte code page (one character per byte).
+  bytes zpl = 2;
+}
+
+message RenderRequest {
+  // One ZPL document. Set this or `files`, not both.
+  bytes zpl = 1;
+  // Several documents, each on a fresh printer, their pages one after the other.
+  repeated ZplFile files = 2;
+  Format format = 3;
+  // PNG only: the page to render, 1-based. 0 means 1.
+  uint32 page = 4;
+  // Printer resolution in dots per millimetre: 6, 8, 12 or 24. 0 means 8.
+  uint32 dpmm = 5;
+}
+
+message RenderResponse {
+  // The PDF (every page) or PNG (one page).
+  bytes data = 1;
+  // `application/pdf` or `image/png`.
+  string content_type = 2;
+  // Pages in the input, across all files.
+  uint32 page_count = 3;
+  // Pages from each file, in order (one entry for `zpl`).
+  repeated uint32 file_page_counts = 4;
+  // Pages billed: 0 for a test key (whose pages carry a watermark) or without API keys.
+  uint32 labels_billed = 5;
+}

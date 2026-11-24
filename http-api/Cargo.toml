@@ -25,6 +25,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+# gRPC (src/grpc.rs).
+prost = "0.14"
+tonic = { version = "0.14", features = ["gzip", "zstd"] }
+tonic-prost = "0.14"
 
 [target.'cfg(unix)'.dependencies]
 # Raising the open-files limit at startup (see main.rs).
@@ -36,3 +40,8 @@ futures-util = "0.3"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+# Compiles proto/ in pure Rust, so building needs no protoc.
+protox = "0.10"
+tonic-prost-build = "0.14"

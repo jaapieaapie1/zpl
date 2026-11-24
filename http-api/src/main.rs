@@ -1,5 +1,6 @@
 //! `zpl-server`: serves the rendering API. Listens on `ZPL_API_ADDR` (default
-//! `127.0.0.1:3000`). API keys and usage reporting: see `zpl_http_api::billing`; render
+//! `127.0.0.1:3000`), and serves gRPC on `ZPL_GRPC_ADDR` when set (see
+//! `zpl_http_api::grpc`); both share API keys, rate limits and render slots. API keys and usage reporting: see `zpl_http_api::billing`; render
 //! concurrency and load shedding: see `zpl_http_api::admission`.
 
 #[tokio::main]
@@ -30,26 +31,49 @@ async fn main() {
         admission.max_wait().as_millis()
     );
 
-    zpl_http_api::warm_up();
-
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| {
-        eprintln!("Failed to bind {addr}: {e}");
+    let grpc_addr = zpl_http_api::grpc::addr_from_env().unwrap_or_else(|e| {
+        eprintln!("{e}");
         std::process::exit(1);
     });
-    println!("Listening on http://{addr}");
 
-    let router =
-        zpl_http_api::router_with_admission(&zpl_http_api::playground_dir(), billing, std::sync::Arc::new(admission));
+    zpl_http_api::warm_up();
+
+    let listener = bind(&addr).await;
+    println!("Listening on http://{addr}");
+    let grpc_listener = match grpc_addr {
+        Some(grpc_addr) => {
+            let listener = bind(&grpc_addr.to_string()).await;
+            println!("Serving gRPC (h2c) on {grpc_addr}");
+            Some(listener)
+        }
+        None => None,
+    };
+
+    let admission = std::sync::Arc::new(admission);
+    let grpc = grpc_listener.map(|listener| {
+        tokio::spawn(zpl_http_api::grpc::serve(listener, billing.clone(), admission.clone(), shutdown_signal()))
+    });
+    let router = zpl_http_api::router_with_admission(&zpl_http_api::playground_dir(), billing, admission);
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server error");
+    if let Some(grpc) = grpc {
+        grpc.await.expect("gRPC server panicked").expect("gRPC server error");
+    }
 
     // Every request is done: publish the usage still adding up, within the shutdown grace
     // period (45 s in Kubernetes, 10 s of it in preStop).
     if let Some(publisher) = publisher {
         publisher.finish(std::time::Duration::from_secs(20)).await;
     }
+}
+
+async fn bind(addr: &str) -> tokio::net::TcpListener {
+    tokio::net::TcpListener::bind(addr).await.unwrap_or_else(|e| {
+        eprintln!("Failed to bind {addr}: {e}");
+        std::process::exit(1);
+    })
 }
 
 /// Resolves on Ctrl-C or, on Unix, SIGTERM (what Kubernetes and Docker send on stop).

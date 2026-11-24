@@ -1,8 +1,10 @@
 name: Docker
 
+# Image tags: every build gets the full commit SHA. main also gets `latest`, canary
+# `canary`, and a git tag `vX.Y.Z` gets `vX.Y.Z` (the tag as is) and `X.Y.Z`.
 on:
   push:
-    branches: [main]
+    branches: [main, canary]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -30,8 +32,10 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=sha,format=long,prefix=
+            type=ref,event=tag
             type=semver,pattern={{version}}
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=canary,enable=${{ github.ref == 'refs/heads/canary' }}
 
       - uses: docker/build-push-action@v6
         with:

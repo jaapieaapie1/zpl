@@ -25,6 +25,17 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+# Logging, and OpenTelemetry export when OTEL_EXPORTER_OTLP_ENDPOINT is set (telemetry.rs).
+# The exporter sends through the reqwest client above, so no second HTTP or TLS stack.
+async-trait = "0.1"
+opentelemetry = { version = "0.33", default-features = false, features = ["trace", "logs"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "logs"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "trace", "logs"] }
+opentelemetry-http = { version = "0.33", default-features = false }
+opentelemetry-appender-tracing = { version = "0.33", default-features = false }
+tracing = "0.1"
+tracing-opentelemetry = { version = "0.34", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "registry", "env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
 # Raising the open-files limit at startup (see main.rs).

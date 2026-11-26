@@ -1,29 +1,31 @@
 //! `zpl-server`: serves the rendering API. Listens on `ZPL_API_ADDR` (default
 //! `127.0.0.1:3000`). API keys and usage reporting: see `zpl_http_api::billing`; render
-//! concurrency and load shedding: see `zpl_http_api::admission`.
+//! concurrency and load shedding: see `zpl_http_api::admission`; logging and OpenTelemetry
+//! export: see `zpl_http_api::telemetry`.
 
 #[tokio::main]
 async fn main() {
+    let telemetry = zpl_http_api::telemetry::init();
     raise_open_files_limit();
     let addr = std::env::var("ZPL_API_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
 
     let billing = zpl_http_api::billing::Billing::from_env().unwrap_or_else(|e| {
-        eprintln!("{e}");
+        tracing::error!("{e}");
         std::process::exit(1);
     });
     let (billing, publisher) = match billing {
         Some((billing, publisher)) => (Some(billing), publisher),
         None => {
-            println!("API keys are off (ZPL_KEYS_PUBLIC_KEYS is not set)");
+            tracing::info!("API keys are off (ZPL_KEYS_PUBLIC_KEYS is not set)");
             (None, None)
         }
     };
 
     let admission = zpl_http_api::admission::Admission::from_env().unwrap_or_else(|e| {
-        eprintln!("{e}");
+        tracing::error!("{e}");
         std::process::exit(1);
     });
-    println!(
+    tracing::info!(
         "Rendering {} at once; up to {} requests wait, each at most {} ms",
         admission.concurrency(),
         admission.max_queue(),
@@ -33,13 +35,16 @@ async fn main() {
     zpl_http_api::warm_up();
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| {
-        eprintln!("Failed to bind {addr}: {e}");
+        tracing::error!("Failed to bind {addr}: {e}");
         std::process::exit(1);
     });
-    println!("Listening on http://{addr}");
+    tracing::info!("Listening on http://{addr}");
 
-    let router =
+    let mut router =
         zpl_http_api::router_with_admission(&zpl_http_api::playground_dir(), billing, std::sync::Arc::new(admission));
+    if telemetry.enabled() {
+        router = router.layer(axum::middleware::from_fn(zpl_http_api::telemetry::trace_request));
+    }
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -50,6 +55,7 @@ async fn main() {
     if let Some(publisher) = publisher {
         publisher.finish(std::time::Duration::from_secs(20)).await;
     }
+    telemetry.shutdown().await;
 }
 
 /// Resolves on Ctrl-C or, on Unix, SIGTERM (what Kubernetes and Docker send on stop).
@@ -85,7 +91,7 @@ fn raise_open_files_limit() {
     // SAFETY: getrlimit/setrlimit only read and write the struct passed in.
     unsafe {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
-            eprintln!("Could not read the open-files limit: {}", std::io::Error::last_os_error());
+            tracing::warn!("Could not read the open-files limit: {}", std::io::Error::last_os_error());
             return;
         }
         if limit.rlim_cur >= limit.rlim_max {
@@ -94,9 +100,9 @@ fn raise_open_files_limit() {
         let soft = limit.rlim_cur;
         limit.rlim_cur = limit.rlim_max;
         if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 {
-            println!("Open-files limit raised from {soft} to {}", limit.rlim_max);
+            tracing::info!("Open-files limit raised from {soft} to {}", limit.rlim_max);
         } else {
-            eprintln!("Could not raise the open-files limit from {soft}: {}", std::io::Error::last_os_error());
+            tracing::warn!("Could not raise the open-files limit from {soft}: {}", std::io::Error::last_os_error());
         }
     }
 }

@@ -143,7 +143,7 @@ impl Admission {
     /// Counts a shed request; logs the totals at most every [`LOG_INTERVAL`].
     fn note(&self, shed: Shed) {
         self.shed.add(&[(shed as usize, 1)], |[full, late]| {
-            eprintln!(
+            tracing::warn!(
                 "overloaded: answered {} render request(s) with 503 since the last report \
                  ({full} found {} already waiting, {late} waited {} ms); rendering {} at once",
                 full + late,

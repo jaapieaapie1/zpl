@@ -242,7 +242,7 @@ async fn run(url: String, usage: Arc<Usage>, window: Duration, mut stopped: ones
                 pending.extend(usage.cut().iter().map(Pending::new));
                 if !pending.is_empty() {
                     let labels: u64 = pending.iter().map(|p| p.labels).sum();
-                    eprintln!(
+                    tracing::error!(
                         "shutting down with {} usage message(s) of {labels} label(s) not published to RabbitMQ (lost)",
                         pending.len()
                     );
@@ -276,7 +276,7 @@ async fn run(url: String, usage: Arc<Usage>, window: Duration, mut stopped: ones
             match tokio::time::timeout(CONNECT_TIMEOUT, connect(&url)).await {
                 Ok(Ok(connected)) => {
                     if std::mem::take(&mut failing) {
-                        eprintln!("connected to RabbitMQ again, publishing usage");
+                        tracing::info!("connected to RabbitMQ again, publishing usage");
                     }
                     link = Some(connected);
                 }
@@ -316,7 +316,7 @@ async fn run(url: String, usage: Arc<Usage>, window: Duration, mut stopped: ones
 fn note_failure(failing: &mut bool, error: &str, pending: &[Pending]) {
     if !std::mem::replace(failing, true) {
         let labels: u64 = pending.iter().map(|p| p.labels).sum();
-        eprintln!(
+        tracing::warn!(
             "publishing usage failed, retrying every 2 s; {} message(s) of {labels} label(s) wait, and new usage \
              adds up in memory meanwhile: {error}",
             pending.len()

@@ -43,6 +43,7 @@ pub mod billing;
 pub mod console;
 mod log_every;
 pub mod rate_limit;
+pub mod telemetry;
 pub mod usage;
 
 use std::collections::HashMap;
@@ -442,6 +443,10 @@ async fn render(
     };
     let queue = queued.elapsed();
     let fingerprint_needed = caller.as_ref().is_some_and(|c| c.idempotency_key.is_some());
+    let file_count = match &input {
+        Input::Label(_) => 1,
+        Input::Files(files) => files.len(),
+    };
     // The ticket goes with the render: if the client hangs up, the render still holds its
     // slot until it is done.
     let result = tokio::task::spawn_blocking(move || {
@@ -473,6 +478,9 @@ async fn render(
         }
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("render task failed: {e}")),
     };
+
+    let render_time = rendered.timings.iter().map(|(_, d)| *d).sum();
+    telemetry::record_render(format, dpmm, file_count, rendered.page_count, queue, render_time);
 
     let mut response = (
         [(header::CONTENT_TYPE, HeaderValue::from_static(format.content_type()))],

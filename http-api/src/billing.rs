@@ -76,7 +76,7 @@ impl Billing {
         let console_url = var("ZPL_CONSOLE_URL").unwrap_or_else(|| "https://caretly.dev/console".into());
         let rate_limit = RateLimiter::from_env()?;
         if rate_limit.is_none() {
-            eprintln!("ZPL_RATE_LIMIT_PER_SECOND or ZPL_RATE_LIMIT_BURST is 0: API keys are not rate limited");
+            tracing::warn!("ZPL_RATE_LIMIT_PER_SECOND or ZPL_RATE_LIMIT_BURST is 0: API keys are not rate limited");
         }
 
         let window = match var("ZPL_USAGE_WINDOW_MS") {
@@ -95,7 +95,7 @@ impl Billing {
                 (Some(usage.clone()), Some(Publisher::start(url, usage, window)))
             }
             None => {
-                eprintln!("ZPL_AMQP_URL is not set: usage is not reported");
+                tracing::warn!("ZPL_AMQP_URL is not set: usage is not reported");
                 (None, None)
             }
         };
@@ -104,7 +104,7 @@ impl Billing {
             (Some(url), Some(token)) => {
                 tokio::spawn(poll_revocations(Arc::downgrade(&billing), url, token));
             }
-            _ => eprintln!("ZPL_CONSOLE_INTERNAL_URL / ZPL_CONSOLE_TOKEN not set: revoked keys keep working"),
+            _ => tracing::warn!("ZPL_CONSOLE_INTERNAL_URL / ZPL_CONSOLE_TOKEN not set: revoked keys keep working"),
         }
         Ok(Some((billing, publisher)))
     }
@@ -251,7 +251,7 @@ async fn poll_revocations(billing: std::sync::Weak<Billing>, url: String, token:
     let url = format!("{}/internal/revocations", url.trim_end_matches('/'));
     let http = match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
         Ok(http) => http,
-        Err(e) => return eprintln!("revocation client: {e}"),
+        Err(e) => return tracing::error!("revocation client: {e}"),
     };
     let mut tick = tokio::time::interval(REVOCATION_INTERVAL);
     let mut failing = false;
@@ -267,12 +267,12 @@ async fn poll_revocations(billing: std::sync::Weak<Billing>, url: String, token:
             Ok(list) => {
                 billing.set_revocations(&list);
                 if failing {
-                    eprintln!("revocation list available again");
+                    tracing::info!("revocation list available again");
                     failing = false;
                 }
             }
             Err(e) if !failing => {
-                eprintln!("fetching revocations failed, keeping the last list: {e}");
+                tracing::warn!("fetching revocations failed, keeping the last list: {e}");
                 failing = true;
             }
             Err(_) => {}

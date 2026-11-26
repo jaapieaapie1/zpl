@@ -120,12 +120,19 @@ curl -F file=@a.zpl -F file=@b.zpl 'http://localhost:3000/render?format=pdf' -o 
 | `ZPL_RENDER_CONCURRENCY`    | CPUs available     | Renders running at once                                   |
 | `ZPL_RENDER_QUEUE`          | 4 per render slot  | Requests that may wait; beyond that `/render` returns 503 |
 | `ZPL_RENDER_MAX_WAIT_MS`    | `5000`             | Longest wait before a 503                                 |
+| `RUST_LOG`                  | `warn,zpl_server=info,zpl_http_api=info` | Log filter for stdout (and OpenTelemetry logs) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset            | OpenTelemetry collector (OTLP over HTTP, e.g. `http://collector:4318`) for traces and logs; unset exports nothing |
 
 API keys, rate limiting and usage reporting (`ZPL_KEYS_PUBLIC_KEYS`,
 `ZPL_RATE_LIMIT_*`, `ZPL_CONSOLE_*`, `ZPL_AMQP_URL`) are for running alongside
 [zpl-console](https://github.com/jaapieaapie1/zpl-console), as caretly.dev does; see
 [`http-api/src/billing.rs`](http-api/src/billing.rs). Leave them unset for a private
 server.
+
+With `OTEL_EXPORTER_OTLP_ENDPOINT` set, the standard `OTEL_*` variables apply as well
+(`OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_TRACES_SAMPLER` and
+`OTEL_TRACES_SAMPLER_ARG`, `OTEL_EXPORTER_OTLP_HEADERS`, …); see
+[`http-api/src/telemetry.rs`](http-api/src/telemetry.rs).
 
 ## Structure
 
